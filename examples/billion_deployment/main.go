@@ -8,7 +8,7 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/oarkflow/lookupx/lookup"
+	lookup "github.com/oarkflow/lookupx/pkg"
 )
 
 func envUint(name string, def uint64) uint64 {

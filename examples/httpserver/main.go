@@ -1,9 +1,10 @@
 package main
 
 import (
-	"github.com/oarkflow/lookupx/lookup"
 	"log"
 	"net/http"
+
+	lookup "github.com/oarkflow/lookupx/pkg"
 )
 
 func main() {

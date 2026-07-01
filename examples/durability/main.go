@@ -2,9 +2,10 @@ package main
 
 import (
 	"fmt"
-	"github.com/oarkflow/lookupx/lookup"
 	"os"
 	"path/filepath"
+
+	lookup "github.com/oarkflow/lookupx/pkg"
 )
 
 func main() {

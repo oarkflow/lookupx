@@ -12,7 +12,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/oarkflow/lookupx/lookup"
+	lookup "github.com/oarkflow/lookupx/pkg"
 )
 
 const totalDatasetRows = 100_000

@@ -8,7 +8,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/oarkflow/lookupx/lookup"
+	lookup "github.com/oarkflow/lookupx/pkg"
 )
 
 func main() {

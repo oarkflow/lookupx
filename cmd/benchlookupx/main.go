@@ -10,7 +10,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/oarkflow/lookupx/lookup"
+	lookup "github.com/oarkflow/lookupx/pkg"
 )
 
 type row struct {
