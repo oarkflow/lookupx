@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"math/bits"
 	"net"
 	"os"
 	"sort"
@@ -392,13 +391,12 @@ func (ix *Index) countLiveLocked(bm *Bitmap) int {
 		return 0
 	}
 	n := 0
-	max := len(bm.words)
-	if len(ix.live.words) < max {
-		max = len(ix.live.words)
-	}
-	for i := 0; i < max; i++ {
-		n += bits.OnesCount64(bm.words[i] & ix.live.words[i])
-	}
+	bm.Each(func(id DocID) bool {
+		if ix.live.Has(id) {
+			n++
+		}
+		return true
+	})
 	return n
 }
 
@@ -683,13 +681,13 @@ func (ix *Index) indexDocLocked(id DocID, doc Document) {
 				if opt.Unique {
 					fi.unique[val] = id
 				} else if opt.Kind != FieldInt && opt.Kind != FieldFloat && opt.Kind != FieldTime {
-					addTerm(fi, val, id)
+					addTerm(fi, val, id, opt.Fuzzy)
 				}
 			}
 			if opt.Kind == FieldText || opt.Indexed {
 				ix.tokens = analyzeWith(opt, val, ix.tokens)
 				for pos, t := range ix.tokens {
-					addTerm(fi, t, id)
+					addTerm(fi, t, id, opt.Fuzzy)
 					addPos(fi, t, id, uint32(pos))
 					ix.indexDerivedLocked(fi, opt, t, id)
 				}
@@ -767,11 +765,11 @@ func postingClone(m map[string]*Bitmap, one map[string]DocID, term string, max D
 	return NewBitmap()
 }
 
-func addTerm(fi *fieldIndex, term string, id DocID) {
+func addTerm(fi *fieldIndex, term string, id DocID, fuzzy bool) {
 	if term == "" {
 		return
 	}
-	if fi.termOne[term] == 0 && fi.terms[term] == nil {
+	if fuzzy && fi.termOne[term] == 0 && fi.terms[term] == nil {
 		fi.fuzzyTerms[term[0]] = append(fi.fuzzyTerms[term[0]], term)
 	}
 	addPosting(fi.terms, fi.termOne, term, id, fi.capHint)
@@ -799,7 +797,11 @@ func addPosting(m map[string]*Bitmap, one map[string]DocID, term string, id DocI
 		if prev == id {
 			return
 		}
-		b := NewBitmapCap(capHint)
+		// Do not pre-size every promoted posting to the whole index capacity.
+		// High-cardinality sparse terms dominate charge-master style indexes; a
+		// dense cap-sized bitmap per repeated term can consume many GB. Let the
+		// bitmap grow only as far as the actual document ids it receives.
+		b := NewBitmap()
 		b.Add(prev)
 		b.Add(id)
 		m[term] = b
@@ -1540,45 +1542,14 @@ func (ix *Index) EachTerm(field, value string, fn func(id string, docID DocID) b
 	if b == nil {
 		return
 	}
-	// Inline bitmap iteration avoids the nested closure cost of Bitmap.Each on
-	// high-cardinality terms. This path is intentionally read-only and lock-held.
-	if !ix.hasTTL && !ix.hasDeletes {
-		for wi, w := range b.words {
-			for w != 0 {
-				tz := bits.TrailingZeros64(w)
-				id := DocID(wi*64 + tz)
-				if !fn(ix.docToExt[id], id) {
-					return
-				}
-				w &= w - 1
-			}
+	b.Each(func(id DocID) bool {
+		if !ix.isDeletedOrExpiredLocked(id) {
+			return fn(ix.docToExt[id], id)
 		}
-		return
-	}
-	if !ix.hasTTL {
-		for wi, w := range b.words {
-			for w != 0 {
-				tz := bits.TrailingZeros64(w)
-				id := DocID(wi*64 + tz)
-				if !ix.deleted.Has(id) && !fn(ix.docToExt[id], id) {
-					return
-				}
-				w &= w - 1
-			}
-		}
-		return
-	}
-	for wi, w := range b.words {
-		for w != 0 {
-			tz := bits.TrailingZeros64(w)
-			id := DocID(wi*64 + tz)
-			if !ix.isDeletedOrExpiredLocked(id) && !fn(ix.docToExt[id], id) {
-				return
-			}
-			w &= w - 1
-		}
-	}
+		return true
+	})
 }
+
 func (ix *Index) CollectTerm(field, value string, dst []string) []string {
 	dst = dst[:0]
 	ix.mu.RLock()
@@ -1605,38 +1576,11 @@ func (ix *Index) CollectTerm(field, value string, dst []string) []string {
 	if b == nil {
 		return dst
 	}
-	if !ix.hasTTL && !ix.hasDeletes {
-		for wi, w := range b.words {
-			for w != 0 {
-				tz := bits.TrailingZeros64(w)
-				dst = append(dst, ix.docToExt[DocID(wi*64+tz)])
-				w &= w - 1
-			}
+	b.Each(func(id DocID) bool {
+		if !ix.isDeletedOrExpiredLocked(id) {
+			dst = append(dst, ix.docToExt[id])
 		}
-		return dst
-	}
-	if !ix.hasTTL {
-		for wi, w := range b.words {
-			for w != 0 {
-				tz := bits.TrailingZeros64(w)
-				id := DocID(wi*64 + tz)
-				if !ix.deleted.Has(id) {
-					dst = append(dst, ix.docToExt[id])
-				}
-				w &= w - 1
-			}
-		}
-		return dst
-	}
-	for wi, w := range b.words {
-		for w != 0 {
-			tz := bits.TrailingZeros64(w)
-			id := DocID(wi*64 + tz)
-			if !ix.isDeletedOrExpiredLocked(id) {
-				dst = append(dst, ix.docToExt[id])
-			}
-			w &= w - 1
-		}
-	}
+		return true
+	})
 	return dst
 }

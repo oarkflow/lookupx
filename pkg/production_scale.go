@@ -87,10 +87,10 @@ func (ix *Index) IsFrozen() bool {
 // -----------------------------------------------------------------------------
 
 type TupleKey struct {
-	TermID     uint32
-	GroupID uint32
-	DateKey        uint32
-	SourceID   uint16
+	TermID   uint32
+	GroupID  uint32
+	DateKey  uint32
+	SourceID uint16
 }
 
 type TupleCompositeIndex struct {
@@ -294,10 +294,10 @@ func (ix *Index) TupleLookup(term string, groupID uint32, date_key string, limit
 // TupleCompositeQuery can be returned by ParseLookupQuery. It falls back to
 // generic bool filtering when a composite index has not been built yet.
 type TupleCompositeQuery struct {
-	Term       string
+	Term    string
 	GroupID uint32
-	DateKey        string
-	Source     string
+	DateKey string
+	Source  string
 }
 
 func (q TupleCompositeQuery) eval(ix *Index) *Bitmap {
@@ -555,15 +555,15 @@ func (ix *Index) persistentDump() (*persistentDump, error) {
 	cfg.Clock = nil
 	cfg.EnableWAL = false
 	cfg.WALPath = ""
-	d := &persistentDump{Config: cfg, NextDocID: ix.nextDocID, ExtToDoc: copyMapStringDoc(ix.extToDoc), DocToExt: append([]string(nil), ix.docToExt...), Deleted: append([]uint64(nil), ix.deleted.words...), Live: append([]uint64(nil), ix.live.words...), Expires: copyMapDocInt64(ix.expires), HasTTL: ix.hasTTL, HasDeletes: ix.hasDeletes, Fields: map[string]fieldDump{}, NumericDense: map[string][]float64{}, NumericExists: map[string][]uint64{}, Strings: map[string]map[DocID]string{}, IP4: map[string]map[DocID]uint32{}, Vectors: map[string]map[DocID][]float64{}}
+	d := &persistentDump{Config: cfg, NextDocID: ix.nextDocID, ExtToDoc: copyMapStringDoc(ix.extToDoc), DocToExt: append([]string(nil), ix.docToExt...), Deleted: ix.deleted.Words(ix.nextDocID), Live: ix.live.Words(ix.nextDocID), Expires: copyMapDocInt64(ix.expires), HasTTL: ix.hasTTL, HasDeletes: ix.hasDeletes, Fields: map[string]fieldDump{}, NumericDense: map[string][]float64{}, NumericExists: map[string][]uint64{}, Strings: map[string]map[DocID]string{}, IP4: map[string]map[DocID]uint32{}, Vectors: map[string]map[DocID][]float64{}}
 	for name, fi := range ix.fields {
-		d.Fields[name] = fieldDump{Terms: dumpBitmapMap(fi.terms), TermOne: copyMapStringDoc(fi.termOne), Prefix: dumpBitmapMap(fi.prefix), PrefixOne: copyMapStringDoc(fi.prefixOne), Suffix: dumpBitmapMap(fi.suffix), SuffixOne: copyMapStringDoc(fi.suffixOne), Ngram: dumpBitmapMap(fi.ngram), NgramOne: copyMapStringDoc(fi.ngramOne), Unique: copyMapStringDoc(fi.unique), Exists: append([]uint64(nil), fi.exists.words...)}
+		d.Fields[name] = fieldDump{Terms: dumpBitmapMap(fi.terms), TermOne: copyMapStringDoc(fi.termOne), Prefix: dumpBitmapMap(fi.prefix), PrefixOne: copyMapStringDoc(fi.prefixOne), Suffix: dumpBitmapMap(fi.suffix), SuffixOne: copyMapStringDoc(fi.suffixOne), Ngram: dumpBitmapMap(fi.ngram), NgramOne: copyMapStringDoc(fi.ngramOne), Unique: copyMapStringDoc(fi.unique), Exists: fi.exists.Words(ix.nextDocID)}
 	}
 	for k, v := range ix.numericDense {
 		d.NumericDense[k] = append([]float64(nil), v...)
 	}
 	for k, v := range ix.numericExists {
-		d.NumericExists[k] = append([]uint64(nil), v.words...)
+		d.NumericExists[k] = v.Words(ix.nextDocID)
 	}
 	for k, v := range ix.strings {
 		m := map[DocID]string{}
@@ -676,7 +676,7 @@ func dumpBitmapMap(in map[string]*Bitmap) map[string][]uint64 {
 	out := map[string][]uint64{}
 	for k, b := range in {
 		if b != nil {
-			out[k] = append([]uint64(nil), b.words...)
+			out[k] = b.Words(0)
 		}
 	}
 	return out
@@ -707,7 +707,7 @@ func dumpComposite(c *TupleCompositeIndex) *compositeDump {
 	defer c.mu.RUnlock()
 	p := map[TupleKey][]uint64{}
 	for k, b := range c.postings {
-		p[k] = append([]uint64(nil), b.words...)
+		p[k] = b.Words(0)
 	}
 	return &compositeDump{Terms: copyMapStringU32(c.terms), RevTerms: append([]string(nil), c.revTerms...), Sources: copyMapStringU16(c.sources), RevSource: append([]string(nil), c.revSource...), Postings: p, Singles: copyMapKeyDoc(c.singles)}
 }

@@ -1,7 +1,6 @@
 package pkg
 
 import (
-	"math/bits"
 	"sort"
 	"sync"
 )
@@ -188,41 +187,21 @@ func (ix *Index) searchTermIntoFast(q Term, req SearchRequest, dst []Hit, start 
 		return Result{Total: total, Hits: dst, Took: ix.elapsed(start)}, dst
 	}
 	if bm := fi.terms[val]; bm != nil {
-		if !ix.hasTTL && !ix.hasDeletes {
-			for wi, w := range bm.words {
-				for w != 0 {
-					tz := bits.TrailingZeros64(w)
-					id := DocID(wi*64 + tz)
-					total++
-					if skipped < req.Offset {
-						skipped++
-						w &= w - 1
-						continue
-					}
-					if len(dst) >= req.Limit {
-						return Result{Total: total, Hits: dst, Took: ix.elapsed(start)}, dst
-					}
-					dst = append(dst, Hit{ID: ix.docToExt[id], DocID: id, Score: 1})
-					w &= w - 1
-				}
-			}
-		} else {
-			bm.Each(func(id DocID) bool {
-				if ix.isDeletedOrExpiredLocked(id) {
-					return true
-				}
-				total++
-				if skipped < req.Offset {
-					skipped++
-					return true
-				}
-				if len(dst) >= req.Limit {
-					return false
-				}
-				dst = append(dst, Hit{ID: ix.docToExt[id], DocID: id, Score: 1})
+		bm.Each(func(id DocID) bool {
+			if ix.isDeletedOrExpiredLocked(id) {
 				return true
-			})
-		}
+			}
+			total++
+			if skipped < req.Offset {
+				skipped++
+				return true
+			}
+			if len(dst) >= req.Limit {
+				return false
+			}
+			dst = append(dst, Hit{ID: ix.docToExt[id], DocID: id, Score: 1})
+			return true
+		})
 	}
 	return Result{Total: total, Hits: dst, Took: ix.elapsed(start)}, dst
 }
@@ -616,41 +595,21 @@ func (ix *Index) collectPostingLocked(m map[string]*Bitmap, one map[string]DocID
 		return Result{Total: total, Hits: dst, Took: ix.elapsed(start)}, dst
 	}
 	if bm := m[term]; bm != nil {
-		if !ix.hasTTL && !ix.hasDeletes {
-			for wi, w := range bm.words {
-				for w != 0 {
-					tz := bits.TrailingZeros64(w)
-					id := DocID(wi*64 + tz)
-					total++
-					if skipped < req.Offset {
-						skipped++
-						w &= w - 1
-						continue
-					}
-					if len(dst) >= req.Limit {
-						return Result{Total: total, Hits: dst, Took: ix.elapsed(start)}, dst
-					}
-					dst = append(dst, Hit{ID: ix.docToExt[id], DocID: id, Score: 1})
-					w &= w - 1
-				}
-			}
-		} else {
-			bm.Each(func(id DocID) bool {
-				if ix.isDeletedOrExpiredLocked(id) {
-					return true
-				}
-				total++
-				if skipped < req.Offset {
-					skipped++
-					return true
-				}
-				if len(dst) >= req.Limit {
-					return false
-				}
-				dst = append(dst, Hit{ID: ix.docToExt[id], DocID: id, Score: 1})
+		bm.Each(func(id DocID) bool {
+			if ix.isDeletedOrExpiredLocked(id) {
 				return true
-			})
-		}
+			}
+			total++
+			if skipped < req.Offset {
+				skipped++
+				return true
+			}
+			if len(dst) >= req.Limit {
+				return false
+			}
+			dst = append(dst, Hit{ID: ix.docToExt[id], DocID: id, Score: 1})
+			return true
+		})
 	}
 	return Result{Total: total, Hits: dst, Took: ix.elapsed(start)}, dst
 }

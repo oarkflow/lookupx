@@ -104,7 +104,7 @@ func (w *RowWriter) keyword(fid FieldID, value string, normalized bool) {
 		}
 		sf.fi.unique[v] = w.did
 	} else {
-		addTerm(sf.fi, v, w.did)
+		addTerm(sf.fi, v, w.did, sf.opt.Fuzzy)
 	}
 	w.ix.indexDerivedLocked(sf.fi, sf.opt, v, w.did)
 }
@@ -130,7 +130,7 @@ func (w *RowWriter) text(fid FieldID, value string, normalized bool) {
 	}
 	w.ix.tokens = analyzeWith(sf.opt, v, w.ix.tokens)
 	for pos, t := range w.ix.tokens {
-		addTerm(sf.fi, t, w.did)
+		addTerm(sf.fi, t, w.did, sf.opt.Fuzzy)
 		if sf.opt.Phrase {
 			addPos(sf.fi, t, w.did, uint32(pos))
 		}
@@ -349,7 +349,7 @@ func (w *RowWriter) keywordH(h KeywordField, value string, normalized bool) {
 		}
 		h.sf.fi.unique[v] = w.did
 	} else {
-		addTerm(h.sf.fi, v, w.did)
+		addTerm(h.sf.fi, v, w.did, h.sf.opt.Fuzzy)
 	}
 	w.ix.indexDerivedLocked(h.sf.fi, h.sf.opt, v, w.did)
 }
@@ -370,7 +370,7 @@ func (w *RowWriter) textH(h KeywordField, value string, normalized bool) {
 	}
 	w.ix.tokens = analyzeWith(h.sf.opt, v, w.ix.tokens)
 	for pos, t := range w.ix.tokens {
-		addTerm(h.sf.fi, t, w.did)
+		addTerm(h.sf.fi, t, w.did, h.sf.opt.Fuzzy)
 		if h.sf.opt.Phrase {
 			addPos(h.sf.fi, t, w.did, uint32(pos))
 		}
