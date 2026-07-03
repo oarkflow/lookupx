@@ -80,7 +80,12 @@ type Config struct {
 	RateLimitQPS   int           `json:"rate_limit_qps,omitempty"`
 	// DisableSource skips storing/cloning original documents. It is the fastest/lowest-memory mode
 	// for pure lookup/search indexes where callers only need IDs and indexed columns.
-	DisableSource   bool  `json:"disable_source,omitempty"`
+	DisableSource bool `json:"disable_source,omitempty"`
+	// AppendOnly skips the external-id-to-doc-id map and duplicate/update checks.
+	// Use it for immutable bulk builds where each source row ID is unique. Search
+	// results still include IDs through the doc-id-to-external-id column, but Get,
+	// Delete, and repeated Upsert-by-ID are not available in this mode.
+	AppendOnly      bool  `json:"append_only,omitempty"`
 	InitialCapacity int   `json:"initial_capacity,omitempty"`
 	Clock           Clock `json:"-"`
 	CollectTook     bool  `json:"collect_took,omitempty"`

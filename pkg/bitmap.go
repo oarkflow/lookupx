@@ -7,6 +7,17 @@ import (
 
 const sparseBitmapLimit = 4096
 
+func shouldPromoteSparse(count int, max DocID) bool {
+	// Dense bitmaps are only smaller when the number of set bits is close to the
+	// number of uint64 words needed to cover max. A fixed 4096 threshold promoted
+	// medium-frequency text terms too early in million-row indexes.
+	words := int(max>>6) + 1
+	if words < sparseBitmapLimit {
+		words = sparseBitmapLimit
+	}
+	return count > words
+}
+
 // Bitmap is an adaptive posting container. Small/sparse postings stay as a
 // sorted DocID slice; large/dense postings are promoted to a classic bitset.
 // This avoids allocating a full max-doc bitmap for every repeated token in
@@ -18,10 +29,10 @@ type Bitmap struct {
 
 func NewBitmap() *Bitmap { return &Bitmap{} }
 func NewBitmapCap(max DocID) *Bitmap {
-	if max <= 0 {
+	if max == 0 {
 		return &Bitmap{}
 	}
-	return &Bitmap{words: make([]uint64, int((max+64)>>6))}
+	return &Bitmap{words: make([]uint64, int((max+63)>>6))}
 }
 func (b *Bitmap) isDense() bool { return len(b.words) != 0 }
 func (b *Bitmap) Reset() {
@@ -40,16 +51,21 @@ func (b *Bitmap) ensure(id DocID) {
 }
 func (b *Bitmap) promote(max DocID) {
 	if b.isDense() {
-		if max > 0 {
-			b.ensure(max)
-		}
+		b.ensure(max)
 		return
 	}
 	capTo := max
-	if capTo == 0 && len(b.sparse) > 0 {
-		capTo = b.sparse[len(b.sparse)-1]
+	if len(b.sparse) > 0 {
+		last := b.sparse[len(b.sparse)-1]
+		if last > capTo {
+			capTo = last
+		}
 	}
-	b.words = make([]uint64, int((capTo+64)>>6))
+	if capTo == 0 {
+		b.words = []uint64{0}
+	} else {
+		b.words = make([]uint64, int(capTo>>6)+1)
+	}
 	for _, id := range b.sparse {
 		b.words[id>>6] |= 1 << (id & 63)
 	}
@@ -80,7 +96,7 @@ func (b *Bitmap) Add(id DocID) {
 	} else {
 		b.sparse = append(b.sparse, id)
 	}
-	if len(b.sparse) > sparseBitmapLimit {
+	if shouldPromoteSparse(len(b.sparse), id) {
 		b.promote(id)
 	}
 }

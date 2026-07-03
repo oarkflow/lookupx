@@ -48,14 +48,18 @@ func (ix *Index) UpsertFast(id string, fn func(*RowWriter)) error {
 }
 
 func (ix *Index) reserveDocLocked(id string) DocID {
-	if old, ok := ix.extToDoc[id]; ok {
-		ix.deleted.Add(old)
-		ix.live.Remove(old)
-		ix.hasDeletes = true
+	if !ix.cfg.AppendOnly {
+		if old, ok := ix.extToDoc[id]; ok {
+			ix.deleted.Add(old)
+			ix.live.Remove(old)
+			ix.hasDeletes = true
+		}
 	}
 	did := ix.nextDocID
 	ix.nextDocID++
-	ix.extToDoc[id] = did
+	if !ix.cfg.AppendOnly {
+		ix.extToDoc[id] = did
+	}
 	ix.live.Add(did)
 	ix.docToExt = append(ix.docToExt, id)
 	ix.docs = append(ix.docs, nil)
@@ -486,14 +490,18 @@ func (ix *Index) BatchUpsertKeywordNumericFast(ids, skus []string, skuH, tenantH
 		if id == "" {
 			return errors.New("id required")
 		}
-		if old, ok := ix.extToDoc[id]; ok {
-			ix.deleted.Add(old)
-			ix.live.Remove(old)
-			ix.hasDeletes = true
+		if !ix.cfg.AppendOnly {
+			if old, ok := ix.extToDoc[id]; ok {
+				ix.deleted.Add(old)
+				ix.live.Remove(old)
+				ix.hasDeletes = true
+			}
 		}
 		did := ix.nextDocID
 		ix.nextDocID++
-		ix.extToDoc[id] = did
+		if !ix.cfg.AppendOnly {
+			ix.extToDoc[id] = did
+		}
 		ix.docToExt = append(ix.docToExt, id)
 		ix.docs = append(ix.docs, nil)
 		if int(did>>6) < len(ix.live.words) {

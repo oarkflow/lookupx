@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"runtime"
 	"time"
 
 	_ "github.com/go-sql-driver/mysql"
@@ -74,6 +75,7 @@ func main() {
 	ix, err := lookup.New(lookup.Config{
 		InitialCapacity: 1_600_000,
 		DisableSource:   true,
+		AppendOnly:      true,
 		Clock:           lookup.SystemClock{},
 		Schema: lookup.Schema{Fields: map[string]lookup.FieldOptions{
 			// Do NOT enable Prefix/Fuzzy on this long text field during ingest.
@@ -104,7 +106,7 @@ func main() {
 
 	src := lookup.PagedSQLQuerySource{
 		DB:       db,
-		PageSize: 50_000,
+		PageSize: 100_000,
 		Page: func(lastSeq uint64, limit int) (string, []any) {
 			return chargeMasterPageQuery, []any{lastSeq, limit}
 		},
@@ -124,7 +126,13 @@ func main() {
 	start := time.Now()
 	stats, err := ix.IndexFrom(context.Background(), src, lookup.BulkOptions{
 		Name:      "tbl_charge_master",
-		BatchSize: 16_384,
+		BatchSize: 65_536,
+		Progress: func(p lookup.BulkProgress) {
+			var m runtime.MemStats
+			runtime.ReadMemStats(&m)
+			fmt.Printf("seen=%d indexed=%d last_seq=%d took=%s heap=%.1fMB sys=%.1fMB\n",
+				p.Seen, p.Indexed, p.LastSeq, p.Took.Round(time.Second), float64(m.Alloc)/1024/1024, float64(m.Sys)/1024/1024)
+		},
 	})
 	if err != nil {
 		log.Fatalf("ingest failed: %v", err)

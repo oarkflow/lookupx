@@ -37,13 +37,11 @@ func newFieldIndex(capHint int, opt FieldOptions) *fieldIndex {
 	if opt.Unique {
 		uniqueCap = capHint
 	} else if opt.Lookup || opt.Kind == FieldKeyword || opt.Kind == FieldBool || opt.Kind == FieldText || opt.Indexed {
-		// Text fields usually have a small vocabulary in lookup workloads; keyword
-		// fields may be high-cardinality but singleton postings avoid bitmap allocs.
-		if opt.Kind == FieldKeyword {
-			termCap = capHint / 4
-		} else {
-			termCap = 64
-		}
+		// Do not preallocate keyword/text term maps from InitialCapacity. A 1.5M-row
+		// charge-master build with 6 keyword fields used to allocate hundreds of MB
+		// before the first page was indexed. Most lookup fields are low/medium
+		// cardinality and Go maps grow acceptably; unique fields still preallocate.
+		termCap = 64
 	}
 	if opt.Prefix {
 		prefixCap = 256
@@ -147,7 +145,10 @@ func New(cfg Config) (*Index, error) {
 	if capHint < 0 {
 		capHint = 0
 	}
-	ix := &Index{cfg: cfg, nextDocID: 1, extToDoc: make(map[string]DocID, capHint), deleted: NewBitmapCap(DocID(capHint + 1)), live: NewBitmapCap(DocID(capHint + 1)), expires: make(map[DocID]int64), fields: map[string]*fieldIndex{}, fieldIDs: map[string]FieldID{}, numeric: map[string]map[DocID]float64{}, numericDense: map[string][]float64{}, numericExists: map[string]*Bitmap{}, numSorted: map[string][]numPair{}, numDirty: map[string]bool{}, strings: map[string]map[DocID]string{}, vectors: map[string]map[DocID][]float64{}, anns: map[string]*VectorANN{}, ip4: map[string]map[DocID]uint32{}, ip4Sorted: map[string][]ipPair{}, ip4Dirty: map[string]bool{}, docToExt: make([]string, 1, capHint+1), docs: make([]Document, 1, capHint+1)}
+	ix := &Index{cfg: cfg, nextDocID: 1, deleted: NewBitmapCap(DocID(capHint + 1)), live: NewBitmapCap(DocID(capHint + 1)), expires: make(map[DocID]int64), fields: map[string]*fieldIndex{}, fieldIDs: map[string]FieldID{}, numeric: map[string]map[DocID]float64{}, numericDense: map[string][]float64{}, numericExists: map[string]*Bitmap{}, numSorted: map[string][]numPair{}, numDirty: map[string]bool{}, strings: map[string]map[DocID]string{}, vectors: map[string]map[DocID][]float64{}, anns: map[string]*VectorANN{}, ip4: map[string]map[DocID]uint32{}, ip4Sorted: map[string][]ipPair{}, ip4Dirty: map[string]bool{}, docToExt: make([]string, 1, capHint+1), docs: make([]Document, 1, capHint+1)}
+	if !cfg.AppendOnly {
+		ix.extToDoc = make(map[string]DocID, capHint)
+	}
 	if cfg.Clock != nil {
 		ix.clock = cfg.Clock
 	} else {
@@ -279,14 +280,18 @@ func (ix *Index) upsertLocked(id string, doc Document, log bool) error {
 			}
 		}
 	}
-	if old, ok := ix.extToDoc[id]; ok {
-		ix.deleted.Add(old)
-		ix.live.Remove(old)
-		ix.hasDeletes = true
+	if !ix.cfg.AppendOnly {
+		if old, ok := ix.extToDoc[id]; ok {
+			ix.deleted.Add(old)
+			ix.live.Remove(old)
+			ix.hasDeletes = true
+		}
 	}
 	did := ix.nextDocID
 	ix.nextDocID++
-	ix.extToDoc[id] = did
+	if !ix.cfg.AppendOnly {
+		ix.extToDoc[id] = did
+	}
 	ix.live.Add(did)
 	ix.docToExt = append(ix.docToExt, id)
 	if ix.cfg.DisableSource {
@@ -312,6 +317,9 @@ func (ix *Index) BatchDelete(ids []string) error {
 func (ix *Index) delete(id string, log bool) error {
 	ix.mu.Lock()
 	defer ix.mu.Unlock()
+	if ix.cfg.AppendOnly {
+		return errors.New("delete by external id is disabled in append-only indexes")
+	}
 	did, ok := ix.extToDoc[id]
 	if !ok {
 		return nil
@@ -329,6 +337,9 @@ func (ix *Index) delete(id string, log bool) error {
 func (ix *Index) Get(id string) (Document, bool) {
 	ix.mu.RLock()
 	defer ix.mu.RUnlock()
+	if ix.cfg.AppendOnly {
+		return nil, false
+	}
 	did, ok := ix.extToDoc[id]
 	if !ok || ix.isDeletedOrExpiredLocked(did) {
 		return nil, false

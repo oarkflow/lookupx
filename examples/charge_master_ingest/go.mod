@@ -4,7 +4,9 @@ go 1.26.3
 
 require (
 	github.com/go-sql-driver/mysql v1.10.0
-	github.com/oarkflow/lookupx v0.0.0-20260701035743-28379480eafd
+	github.com/oarkflow/lookupx v0.0.0
 )
 
 require filippo.io/edwards25519 v1.2.0 // indirect
+
+replace github.com/oarkflow/lookupx => ../../

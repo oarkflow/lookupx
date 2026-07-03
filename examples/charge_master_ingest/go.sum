@@ -2,5 +2,3 @@ filippo.io/edwards25519 v1.2.0 h1:crnVqOiS4jqYleHd9vaKZ+HKtHfllngJIiOpNpoJsjo=
 filippo.io/edwards25519 v1.2.0/go.mod h1:xzAOLCNug/yB62zG1bQ8uziwrIqIuxhctzJT18Q77mc=
 github.com/go-sql-driver/mysql v1.10.0 h1:Q+1LV8DkHJvSYAdR83XzuhDaTykuDx0l6fkXxoWCWfw=
 github.com/go-sql-driver/mysql v1.10.0/go.mod h1:M+cqaI7+xxXGG9swrdeUIoPG3Y3KCkF0pZej+SK+nWk=
-github.com/oarkflow/lookupx v0.0.0-20260701035743-28379480eafd h1:C+1qlr7IfkEjDvSEDfDjtzXfeKOEMDs6qo8A71IiUIc=
-github.com/oarkflow/lookupx v0.0.0-20260701035743-28379480eafd/go.mod h1:8BOmq7LrUYU6F40zAEFVc1mwU7TEFlE78sHgoDPBF4I=
