@@ -32,6 +32,11 @@ type FieldOptions struct {
 	Unique    bool      `json:"unique"`
 	MinGram   int       `json:"min_gram"`
 	MaxGram   int       `json:"max_gram"`
+	// MinPrefix/MaxPrefix bound prefix-index expansion. For large keyword
+	// fields, use MinPrefix=3 to avoid huge low-selectivity prefixes like
+	// "9" and "99". MaxPrefix<=0 means full length.
+	MinPrefix int       `json:"min_prefix,omitempty"`
+	MaxPrefix int       `json:"max_prefix,omitempty"`
 	TTLField  bool      `json:"ttl_field"`
 	Analyzer  string    `json:"analyzer,omitempty"`
 	Boost     float64   `json:"boost,omitempty"`

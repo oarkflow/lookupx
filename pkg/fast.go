@@ -62,7 +62,9 @@ func (ix *Index) reserveDocLocked(id string) DocID {
 	}
 	ix.live.Add(did)
 	ix.docToExt = append(ix.docToExt, id)
-	ix.docs = append(ix.docs, nil)
+	if !ix.cfg.DisableSource {
+		ix.docs = append(ix.docs, nil)
+	}
 	return did
 }
 

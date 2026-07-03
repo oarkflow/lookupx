@@ -145,7 +145,10 @@ func New(cfg Config) (*Index, error) {
 	if capHint < 0 {
 		capHint = 0
 	}
-	ix := &Index{cfg: cfg, nextDocID: 1, deleted: NewBitmapCap(DocID(capHint + 1)), live: NewBitmapCap(DocID(capHint + 1)), expires: make(map[DocID]int64), fields: map[string]*fieldIndex{}, fieldIDs: map[string]FieldID{}, numeric: map[string]map[DocID]float64{}, numericDense: map[string][]float64{}, numericExists: map[string]*Bitmap{}, numSorted: map[string][]numPair{}, numDirty: map[string]bool{}, strings: map[string]map[DocID]string{}, vectors: map[string]map[DocID][]float64{}, anns: map[string]*VectorANN{}, ip4: map[string]map[DocID]uint32{}, ip4Sorted: map[string][]ipPair{}, ip4Dirty: map[string]bool{}, docToExt: make([]string, 1, capHint+1), docs: make([]Document, 1, capHint+1)}
+	ix := &Index{cfg: cfg, nextDocID: 1, deleted: NewBitmapCap(DocID(capHint + 1)), live: NewBitmapCap(DocID(capHint + 1)), expires: make(map[DocID]int64), fields: map[string]*fieldIndex{}, fieldIDs: map[string]FieldID{}, numeric: map[string]map[DocID]float64{}, numericDense: map[string][]float64{}, numericExists: map[string]*Bitmap{}, numSorted: map[string][]numPair{}, numDirty: map[string]bool{}, strings: map[string]map[DocID]string{}, vectors: map[string]map[DocID][]float64{}, anns: map[string]*VectorANN{}, ip4: map[string]map[DocID]uint32{}, ip4Sorted: map[string][]ipPair{}, ip4Dirty: map[string]bool{}, docToExt: make([]string, 1, capHint+1)}
+	if !cfg.DisableSource {
+		ix.docs = make([]Document, 1, capHint+1)
+	}
 	if !cfg.AppendOnly {
 		ix.extToDoc = make(map[string]DocID, capHint)
 	}
@@ -294,9 +297,7 @@ func (ix *Index) upsertLocked(id string, doc Document, log bool) error {
 	}
 	ix.live.Add(did)
 	ix.docToExt = append(ix.docToExt, id)
-	if ix.cfg.DisableSource {
-		ix.docs = append(ix.docs, nil)
-	} else {
+	if !ix.cfg.DisableSource {
 		ix.docs = append(ix.docs, cloneDoc(doc))
 	}
 	ix.indexDocLocked(did, doc)
@@ -344,7 +345,7 @@ func (ix *Index) Get(id string) (Document, bool) {
 	if !ok || ix.isDeletedOrExpiredLocked(did) {
 		return nil, false
 	}
-	if ix.docs[did] == nil {
+	if int(did) >= len(ix.docs) || ix.docs[did] == nil {
 		return nil, true
 	}
 	return cloneDoc(ix.docs[did]), true
@@ -441,7 +442,7 @@ func (ix *Index) Search(req SearchRequest) Result {
 				return false
 			}
 			h := Hit{ID: ix.docToExt[id], DocID: id, Score: 1}
-			if req.WithDocs && ix.docs[id] != nil {
+			if req.WithDocs && int(id) < len(ix.docs) && ix.docs[id] != nil {
 				h.Doc = cloneDoc(ix.docs[id])
 			}
 			hits = append(hits, h)
@@ -474,7 +475,7 @@ func (ix *Index) Search(req SearchRequest) Result {
 	hits := make([]Hit, 0, to-from)
 	for _, id := range ids[from:to] {
 		h := Hit{ID: ix.docToExt[id], DocID: id, Score: 1}
-		if req.WithDocs && ix.docs[id] != nil {
+		if req.WithDocs && int(id) < len(ix.docs) && ix.docs[id] != nil {
 			h.Doc = cloneDoc(ix.docs[id])
 		}
 		hits = append(hits, h)
@@ -723,7 +724,7 @@ func (ix *Index) indexDocLocked(id DocID, doc Document) {
 }
 func (ix *Index) indexDerivedLocked(fi *fieldIndex, opt FieldOptions, val string, id DocID) {
 	if opt.Prefix {
-		ix.scratch = prefixes(val, ix.scratch)
+		ix.scratch = prefixesBounded(val, opt.MinPrefix, opt.MaxPrefix, ix.scratch)
 		for _, p := range ix.scratch {
 			addPosting(fi.prefix, fi.prefixOne, p, id, fi.capHint)
 		}

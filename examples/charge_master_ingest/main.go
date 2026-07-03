@@ -13,7 +13,6 @@ import (
 	"fmt"
 	"log"
 	"os"
-	"runtime"
 	"time"
 
 	_ "github.com/go-sql-driver/mysql"
@@ -83,7 +82,7 @@ func main() {
 			"ld": {Kind: lookup.FieldText, Indexed: true, Lowercase: true},
 
 			// Prefix is useful and cheap on short CPT/HCPCS codes.
-			"cpt_code":           {Kind: lookup.FieldKeyword, Lookup: true, Prefix: true, Lowercase: true},
+			"cpt_code":           {Kind: lookup.FieldKeyword, Lookup: true, Prefix: true, MinPrefix: 3, MaxPrefix: 5, Lowercase: true},
 			"effective_date":     {Kind: lookup.FieldKeyword, Lookup: true},
 			"end_effective_date": {Kind: lookup.FieldKeyword, Lookup: true},
 			"work_item":          {Kind: lookup.FieldKeyword, Lookup: true, Lowercase: true},
@@ -127,12 +126,6 @@ func main() {
 	stats, err := ix.IndexFrom(context.Background(), src, lookup.BulkOptions{
 		Name:      "tbl_charge_master",
 		BatchSize: 65_536,
-		Progress: func(p lookup.BulkProgress) {
-			var m runtime.MemStats
-			runtime.ReadMemStats(&m)
-			fmt.Printf("seen=%d indexed=%d last_seq=%d took=%s heap=%.1fMB sys=%.1fMB\n",
-				p.Seen, p.Indexed, p.LastSeq, p.Took.Round(time.Second), float64(m.Alloc)/1024/1024, float64(m.Sys)/1024/1024)
-		},
 	})
 	if err != nil {
 		log.Fatalf("ingest failed: %v", err)

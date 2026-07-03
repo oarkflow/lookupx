@@ -87,15 +87,36 @@ func grams(s string, min, max int, dst []string) []string {
 }
 
 func prefixes(s string, dst []string) []string {
+	return prefixesBounded(s, 1, 0, dst)
+}
+
+func prefixesBounded(s string, minLen, maxLen int, dst []string) []string {
 	dst = dst[:0]
+	if minLen <= 0 {
+		minLen = 1
+	}
 	if isASCII(s) {
-		for i := 1; i <= len(s); i++ {
+		n := len(s)
+		if maxLen <= 0 || maxLen > n {
+			maxLen = n
+		}
+		if minLen > maxLen {
+			return dst
+		}
+		for i := minLen; i <= maxLen; i++ {
 			dst = append(dst, s[:i])
 		}
 		return dst
 	}
 	r := []rune(s)
-	for i := 1; i <= len(r); i++ {
+	n := len(r)
+	if maxLen <= 0 || maxLen > n {
+		maxLen = n
+	}
+	if minLen > maxLen {
+		return dst
+	}
+	for i := minLen; i <= maxLen; i++ {
 		dst = append(dst, string(r[:i]))
 	}
 	return dst
