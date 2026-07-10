@@ -46,10 +46,10 @@ func buildDSN() string {
 	if dsn := os.Getenv("CM_MYSQL_DSN"); dsn != "" {
 		return dsn
 	}
-	host := env("CM_MYSQL_HOST", "192.168.18.29")
+	host := env("CM_MYSQL_HOST", "localhost")
 	port := env("CM_MYSQL_PORT", "3306")
 	user := env("CM_MYSQL_USER", "service")
-	pass := env("CM_MYSQL_PASS", "Password@123")
+	pass := env("CM_MYSQL_PASS", "")
 	dbName := env("CM_MYSQL_DB", "cleardb")
 	return fmt.Sprintf("%s:%s@tcp(%s:%s)/%s?charset=utf8mb4&timeout=10s&readTimeout=5m&writeTimeout=60s",
 		user, pass, host, port, dbName)

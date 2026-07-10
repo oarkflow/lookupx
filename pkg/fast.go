@@ -98,8 +98,8 @@ func (w *RowWriter) keyword(fid FieldID, value string, normalized bool) {
 	if v == "" {
 		return
 	}
-	sf.fi.exists.Add(w.did)
-	if col := w.ix.strings[sf.name]; col != nil {
+	sf.fi.exists.AddUnsafe(w.did)
+	if col := sf.stringsCol; col != nil {
 		col[w.did] = v
 	}
 	if sf.special == specialIP {
@@ -120,7 +120,9 @@ func (w *RowWriter) keyword(fid FieldID, value string, normalized bool) {
 	} else {
 		addTerm(sf.fi, v, w.did, sf.opt.Fuzzy)
 	}
-	w.ix.indexDerivedLocked(sf.fi, sf.opt, v, w.did)
+	if !sf.noDerived {
+		w.ix.indexDerivedLocked(sf.fi, sf.opt, v, w.did)
+	}
 }
 
 func (w *RowWriter) text(fid FieldID, value string, normalized bool) {
@@ -138,17 +140,23 @@ func (w *RowWriter) text(fid FieldID, value string, normalized bool) {
 	if v == "" {
 		return
 	}
-	sf.fi.exists.Add(w.did)
-	if col := w.ix.strings[sf.name]; col != nil {
+	sf.fi.exists.AddUnsafe(w.did)
+	if col := sf.stringsCol; col != nil {
 		col[w.did] = v
 	}
-	w.ix.tokens = analyzeWith(sf.opt, v, w.ix.tokens)
+	if sf.analyzeFn != nil && hasNoSynonyms() {
+		w.ix.tokens = sf.analyzeFn(v, w.ix.tokens)
+	} else {
+		w.ix.tokens = analyzeWith(sf.opt, v, w.ix.tokens)
+	}
 	for pos, t := range w.ix.tokens {
 		addTerm(sf.fi, t, w.did, sf.opt.Fuzzy)
 		if sf.opt.Phrase {
 			addPos(sf.fi, t, w.did, uint32(pos))
 		}
-		w.ix.indexDerivedLocked(sf.fi, sf.opt, t, w.did)
+		if !sf.noDerived {
+			w.ix.indexDerivedLocked(sf.fi, sf.opt, t, w.did)
+		}
 	}
 	if sf.opt.Phrase {
 		addPhrases(sf.fi, w.ix.tokens, w.did)
@@ -163,7 +171,7 @@ func (w *RowWriter) number(fid FieldID, value float64) {
 	if sf == nil {
 		return
 	}
-	sf.fi.exists.Add(w.did)
+	sf.fi.exists.AddUnsafe(w.did)
 	w.ix.setNumericLocked(sf.name, w.did, value)
 	if sf.opt.TTLField {
 		w.ix.expires[w.did] = int64(value)
@@ -343,7 +351,7 @@ func (w *RowWriter) keywordH(h KeywordField, value string, normalized bool) {
 	if v == "" {
 		return
 	}
-	h.sf.fi.exists.Add(w.did)
+	h.sf.fi.exists.AddUnsafe(w.did)
 	if h.col != nil {
 		h.col[w.did] = v
 	}
@@ -365,7 +373,9 @@ func (w *RowWriter) keywordH(h KeywordField, value string, normalized bool) {
 	} else {
 		addTerm(h.sf.fi, v, w.did, h.sf.opt.Fuzzy)
 	}
-	w.ix.indexDerivedLocked(h.sf.fi, h.sf.opt, v, w.did)
+	if !h.sf.noDerived {
+		w.ix.indexDerivedLocked(h.sf.fi, h.sf.opt, v, w.did)
+	}
 }
 func (w *RowWriter) textH(h KeywordField, value string, normalized bool) {
 	if w.err != nil || h.sf == nil || value == "" {
@@ -378,17 +388,23 @@ func (w *RowWriter) textH(h KeywordField, value string, normalized bool) {
 	if v == "" {
 		return
 	}
-	h.sf.fi.exists.Add(w.did)
+	h.sf.fi.exists.AddUnsafe(w.did)
 	if h.col != nil {
 		h.col[w.did] = v
 	}
-	w.ix.tokens = analyzeWith(h.sf.opt, v, w.ix.tokens)
+	if h.sf.analyzeFn != nil && hasNoSynonyms() {
+		w.ix.tokens = h.sf.analyzeFn(v, w.ix.tokens)
+	} else {
+		w.ix.tokens = analyzeWith(h.sf.opt, v, w.ix.tokens)
+	}
 	for pos, t := range w.ix.tokens {
 		addTerm(h.sf.fi, t, w.did, h.sf.opt.Fuzzy)
 		if h.sf.opt.Phrase {
 			addPos(h.sf.fi, t, w.did, uint32(pos))
 		}
-		w.ix.indexDerivedLocked(h.sf.fi, h.sf.opt, t, w.did)
+		if !h.sf.noDerived {
+			w.ix.indexDerivedLocked(h.sf.fi, h.sf.opt, t, w.did)
+		}
 	}
 	if h.sf.opt.Phrase {
 		addPhrases(h.sf.fi, w.ix.tokens, w.did)
@@ -398,7 +414,7 @@ func (w *RowWriter) numberH(h NumericField, value float64) {
 	if w.err != nil || h.sf == nil {
 		return
 	}
-	h.sf.fi.exists.Add(w.did)
+	h.sf.fi.exists.AddUnsafe(w.did)
 	if int(w.did) < len(h.vals) {
 		h.vals[w.did] = value
 		if h.exists != nil {
@@ -453,7 +469,7 @@ func (w *RowWriter) VectorH(h VectorField, value []float64) {
 			return
 		}
 	}
-	h.sf.fi.exists.Add(w.did)
+	h.sf.fi.exists.AddUnsafe(w.did)
 	w.ix.addVectorLocked(h.name, w.did, value)
 }
 

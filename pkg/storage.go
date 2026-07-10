@@ -336,7 +336,7 @@ func (ix *Index) indexSourceBatch(batch []SourceRecord, skipBad bool) (indexed, 
 			case ValueVector:
 				if int(v.Field) < len(ix.fieldList) {
 					name := ix.fieldList[v.Field].name
-					ix.fieldList[v.Field].fi.exists.Add(w.did)
+					ix.fieldList[v.Field].fi.exists.AddUnsafe(w.did)
 					ix.addVectorLocked(name, w.did, v.Vector)
 				}
 			}
@@ -382,7 +382,7 @@ func (ix *Index) indexSourceRecord(rec *SourceRecord) error {
 		case ValueVector:
 			if int(v.Field) < len(ix.fieldList) {
 				name := ix.fieldList[v.Field].name
-				ix.fieldList[v.Field].fi.exists.Add(w.did)
+				ix.fieldList[v.Field].fi.exists.AddUnsafe(w.did)
 				ix.addVectorLocked(name, w.did, v.Vector)
 			}
 		}

@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -73,11 +74,17 @@ const (
 )
 
 type schemaField struct {
-	id      FieldID
-	name    string
-	opt     FieldOptions
-	fi      *fieldIndex
-	special specialNormalizer
+	id           FieldID
+	name         string
+	opt          FieldOptions
+	fi           *fieldIndex
+	special      specialNormalizer
+	analyzeFn    func(text string, dst []string) []string
+	stringsCol   map[DocID]string
+	numericDense []float64
+	numericEx    *Bitmap
+	noDerived    bool
+	noLower      bool
 }
 
 func detectSpecial(field string) specialNormalizer {
@@ -171,7 +178,22 @@ func New(cfg Config) (*Index, error) {
 		sp := detectSpecial(name)
 		ix.fields[name] = fi
 		ix.fieldIDs[name] = fid
-		ix.fieldList = append(ix.fieldList, schemaField{id: fid, name: name, opt: opt, fi: fi, special: sp})
+		var analyzeFn func(text string, dst []string) []string
+		if opt.Kind == FieldText || opt.Indexed {
+			aname := opt.Analyzer
+			if aname == "" {
+				aname = "standard"
+			}
+			if a := analyzers[aname]; a != nil {
+				analyzeFn = a.Analyze
+			}
+		}
+		sf := schemaField{
+			id: fid, name: name, opt: opt, fi: fi, special: sp,
+			analyzeFn: analyzeFn,
+			noDerived: !opt.Prefix && !opt.Suffix && !opt.Ngram,
+		}
+		ix.fieldList = append(ix.fieldList, sf)
 		fid++
 		if opt.TTLField {
 			ix.hasTTL = true
@@ -191,6 +213,15 @@ func New(cfg Config) (*Index, error) {
 		if opt.Kind == FieldVector || opt.Dim > 0 {
 			ix.vectors[name] = make(map[DocID][]float64, capHint)
 			ix.anns[name] = newVectorANNWithOptions(opt, capHint)
+		}
+	}
+	for i, sf := range ix.fieldList {
+		if col, ok := ix.strings[sf.name]; ok {
+			ix.fieldList[i].stringsCol = col
+		}
+		if dense, ok := ix.numericDense[sf.name]; ok {
+			ix.fieldList[i].numericDense = dense
+			ix.fieldList[i].numericEx = ix.numericExists[sf.name]
 		}
 	}
 	if cfg.EnableWAL && cfg.WALPath != "" {
@@ -654,7 +685,7 @@ func (ix *Index) indexDocLocked(id DocID, doc Document) {
 		if !ok || v == nil {
 			continue
 		}
-		fi.exists.Add(id)
+		fi.exists.AddUnsafe(id)
 
 		// Numeric/time fields are stored in columnar maps directly. Avoid converting
 		// them to strings and indexing a unique term bitmap for every value; range
@@ -691,7 +722,7 @@ func (ix *Index) indexDocLocked(id DocID, doc Document) {
 				continue
 			}
 			if first {
-				if col := ix.strings[field]; col != nil {
+				if col := sf.stringsCol; col != nil {
 					col[id] = val
 				}
 				if sf.special == specialIP {
@@ -721,16 +752,22 @@ func (ix *Index) indexDocLocked(id DocID, doc Document) {
 				}
 			}
 			if opt.Kind == FieldText || opt.Indexed {
-				ix.tokens = analyzeWith(opt, val, ix.tokens)
+				if sf.analyzeFn != nil && atomic.LoadInt32(&noSynonyms) != 0 {
+					ix.tokens = sf.analyzeFn(val, ix.tokens)
+				} else {
+					ix.tokens = analyzeWith(opt, val, ix.tokens)
+				}
 				for pos, t := range ix.tokens {
 					addTerm(fi, t, id, opt.Fuzzy)
 					addPos(fi, t, id, uint32(pos))
-					ix.indexDerivedLocked(fi, opt, t, id)
+					if !sf.noDerived {
+						ix.indexDerivedLocked(fi, opt, t, id)
+					}
 				}
 				if opt.Phrase {
 					addPhrases(fi, ix.tokens, id)
 				}
-			} else {
+			} else if !sf.noDerived {
 				ix.indexDerivedLocked(fi, opt, val, id)
 			}
 		}

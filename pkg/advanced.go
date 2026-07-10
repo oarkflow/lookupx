@@ -11,6 +11,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -67,6 +68,9 @@ func (f AnalyzerFunc) Analyze(text string, dst []string) []string { return f(tex
 var analyzerMu sync.RWMutex
 var analyzers = map[string]Analyzer{}
 var synonyms = map[string][]string{}
+var noSynonyms = int32(1) // atomically checked on hot path; flipped to 0 on first synonym
+
+func hasNoSynonyms() bool { return atomic.LoadInt32(&noSynonyms) != 0 }
 
 func RegisterAnalyzer(name string, a Analyzer) {
 	analyzerMu.Lock()
@@ -77,6 +81,7 @@ func RegisterSynonym(term string, expansions ...string) {
 	analyzerMu.Lock()
 	synonyms[strings.ToLower(term)] = expansions
 	analyzerMu.Unlock()
+	noSynonyms = 0
 }
 
 func init() {
