@@ -2,11 +2,12 @@ package pkg
 
 import (
 	"context"
-	"database/sql"
 	"errors"
 	"fmt"
 	"os"
 	"strings"
+
+	"github.com/oarkflow/squealx"
 )
 
 // ---------------------------------------------------------------------------
@@ -95,15 +96,11 @@ func (d *SQLTableDatasource) Validate() error {
 }
 
 func (d *SQLTableDatasource) Open(ctx context.Context) (Cursor, error) {
-	db, err := sql.Open(d.driver, d.dsn)
+	db, err := squealx.Connect(squealxDriver(d.driver), d.dsn, "")
 	if err != nil {
 		return nil, fmt.Errorf("sql_table %s: open: %w", d.id, err)
 	}
-	if err := db.PingContext(ctx); err != nil {
-		db.Close()
-		return nil, fmt.Errorf("sql_table %s: ping: %w", d.id, err)
-	}
-	d.src.DB = db
+	d.src.DB = db.DB()
 	cur, err := d.src.Open(ctx)
 	if err != nil {
 		db.Close()
@@ -187,15 +184,11 @@ func (d *SQLViewDatasource) Validate() error {
 }
 
 func (d *SQLViewDatasource) Open(ctx context.Context) (Cursor, error) {
-	db, err := sql.Open(d.driver, d.dsn)
+	db, err := squealx.Connect(squealxDriver(d.driver), d.dsn, "")
 	if err != nil {
 		return nil, fmt.Errorf("sql_view %s: open: %w", d.id, err)
 	}
-	if err := db.PingContext(ctx); err != nil {
-		db.Close()
-		return nil, fmt.Errorf("sql_view %s: ping: %w", d.id, err)
-	}
-	d.src.DB = db
+	d.src.DB = db.DB()
 	cur, err := d.src.Open(ctx)
 	if err != nil {
 		db.Close()
@@ -285,15 +278,11 @@ func (d *SQLQueryDatasource) Validate() error {
 }
 
 func (d *SQLQueryDatasource) Open(ctx context.Context) (Cursor, error) {
-	db, err := sql.Open(d.driver, d.dsn)
+	db, err := squealx.Connect(squealxDriver(d.driver), d.dsn, "")
 	if err != nil {
 		return nil, fmt.Errorf("sql_query %s: open: %w", d.id, err)
 	}
-	if err := db.PingContext(ctx); err != nil {
-		db.Close()
-		return nil, fmt.Errorf("sql_query %s: ping: %w", d.id, err)
-	}
-	d.src.DB = db
+	d.src.DB = db.DB()
 	cur, err := d.src.Open(ctx)
 	if err != nil {
 		db.Close()
@@ -383,13 +372,9 @@ func (d *SQLFileDatasource) Open(ctx context.Context) (Cursor, error) {
 	}
 	query := interpolateParams(string(b), d.params)
 
-	db, err := sql.Open(d.driver, d.dsn)
+	db, err := squealx.Connect(squealxDriver(d.driver), d.dsn, "")
 	if err != nil {
 		return nil, fmt.Errorf("sql_file %s: open: %w", d.id, err)
-	}
-	if err := db.PingContext(ctx); err != nil {
-		db.Close()
-		return nil, fmt.Errorf("sql_file %s: ping: %w", d.id, err)
 	}
 
 	src := SQLSource{
@@ -399,6 +384,7 @@ func (d *SQLFileDatasource) Open(ctx context.Context) (Cursor, error) {
 		SeqColumn: d.seqCol,
 		Columns:   d.columns,
 	}
+	src.DB = db.DB()
 	cur, err := src.Open(ctx)
 	if err != nil {
 		db.Close()
@@ -411,10 +397,10 @@ func (d *SQLFileDatasource) Open(ctx context.Context) (Cursor, error) {
 // Shared helpers
 // ---------------------------------------------------------------------------
 
-// dbClosingCursor wraps a Cursor and closes the underlying *sql.DB when done.
+// dbClosingCursor wraps a Cursor and closes the underlying *squealx.DB when done.
 type dbClosingCursor struct {
 	cur Cursor
-	db  *sql.DB
+	db  *squealx.DB
 }
 
 func (c *dbClosingCursor) Next(ctx context.Context, dst *SourceRecord) bool {
@@ -492,4 +478,16 @@ func ResolveSQLColumns(cols []SQLColumn, fieldResolver func(string) FieldID) []S
 		out[i].Field = fieldResolver(c.Column)
 	}
 	return out
+}
+
+// squealxDriver maps user-facing driver names to squealx driver identifiers.
+func squealxDriver(driver string) string {
+	switch strings.ToLower(driver) {
+	case "postgres", "postgresql":
+		return "pgx"
+	case "sqlite3":
+		return "sqlite"
+	default:
+		return driver
+	}
 }

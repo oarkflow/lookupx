@@ -2,7 +2,6 @@ package pkg
 
 import (
 	"context"
-	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -13,6 +12,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/oarkflow/squealx"
 )
 
 // SourceFactory builds a streaming source for a concrete index. The factory gets
@@ -486,13 +487,13 @@ func (s *MultiServer) reloadSQL(ctx context.Context, id string, r *http.Request)
 	if !ok {
 		return BulkStats{}, errors.New("index not found")
 	}
-	db, err := sql.Open(req.Driver, req.DSN)
+	db, err := squealx.Connect(squealxDriver(req.Driver), req.DSN, "")
 	if err != nil {
 		return BulkStats{}, err
 	}
 	defer db.Close()
 	cols := sqlColumnSpecs(ix, req.Columns)
-	src := SQLQuerySource{DB: db, Query: req.Query, Args: req.Args, IDColumn: req.IDColumn, SeqColumn: req.SeqColumn, Columns: cols}
+	src := SQLQuerySource{DB: db.DB(), Query: req.Query, Args: req.Args, IDColumn: req.IDColumn, SeqColumn: req.SeqColumn, Columns: cols}
 	opt := bulkFromSQLReq(id, req.BatchSize, req.CheckpointPath, req.Resume)
 	return s.Manager.ReloadFromSource(ctx, id, src, opt)
 }
@@ -506,13 +507,13 @@ func (s *MultiServer) reloadTable(ctx context.Context, id string, r *http.Reques
 	if !ok {
 		return BulkStats{}, errors.New("index not found")
 	}
-	db, err := sql.Open(req.Driver, req.DSN)
+	db, err := squealx.Connect(squealxDriver(req.Driver), req.DSN, "")
 	if err != nil {
 		return BulkStats{}, err
 	}
 	defer db.Close()
 	cols := sqlColumnSpecs(ix, req.Columns)
-	src := PagedSQLSource{DB: db, Table: req.Table, Columns: req.SelectColumns, Where: req.Where, OrderColumn: req.OrderColumn, PageSize: req.PageSize, IDColumn: req.IDColumn, SeqColumn: req.SeqColumn, ColumnBindings: cols}
+	src := PagedSQLSource{DB: db.DB(), Table: req.Table, Columns: req.SelectColumns, Where: req.Where, OrderColumn: req.OrderColumn, PageSize: req.PageSize, IDColumn: req.IDColumn, SeqColumn: req.SeqColumn, ColumnBindings: cols}
 	opt := bulkFromSQLReq(id, req.BatchSize, req.CheckpointPath, req.Resume)
 	return s.Manager.ReloadFromSource(ctx, id, src, opt)
 }

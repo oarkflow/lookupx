@@ -1,21 +1,28 @@
-// Command charge_master_ingest indexes tbl_charge_master from MySQL into a
+// Command charge_master_ingest indexes tbl_charge_master from MySQL (Linux) into a
 // lookupx index and runs example searches.
 //
-// This example is intentionally configured for the 1M+ charge-master workload:
-// it does not store source documents, does not build text-prefix/fuzzy indexes
-// for long descriptions, and reads MySQL with keyset pages instead of one huge
-// unbounded result set.
+// Build for Linux:
+//
+//	GOOS=linux GOARCH=amd64 go build -o charge_master_ingest .
+//
+// Environment variables:
+//
+//	CM_MYSQL_DSN   — full DSN (overrides host/port/user/pass/db)
+//	CM_MYSQL_HOST  — default localhost
+//	CM_MYSQL_PORT  — default 3306
+//	CM_MYSQL_USER  — default service
+//	CM_MYSQL_PASS  — default ""
+//	CM_MYSQL_DB    — default cleardb
 package main
 
 import (
 	"context"
-	"database/sql"
 	"fmt"
 	"log"
 	"os"
 	"time"
 
-	_ "github.com/go-sql-driver/mysql"
+	"github.com/oarkflow/squealx/drivers/mysql"
 	lookup "github.com/oarkflow/lookupx/pkg"
 )
 
@@ -56,20 +63,16 @@ func buildDSN() string {
 }
 
 func main() {
-	db, err := sql.Open("mysql", buildDSN())
+	db, err := mysql.Open(buildDSN(), "")
 	if err != nil {
 		log.Fatalf("open mysql: %v", err)
 	}
 	defer db.Close()
-	db.SetMaxOpenConns(2)
-	db.SetMaxIdleConns(1)
-	db.SetConnMaxLifetime(10 * time.Minute)
 
-	pingCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	if err := db.PingContext(pingCtx); err != nil {
-		log.Fatalf("mysql ping failed: %v", err)
-	}
+	rawDB := db.DB()
+	rawDB.SetMaxOpenConns(2)
+	rawDB.SetMaxIdleConns(1)
+	rawDB.SetConnMaxLifetime(10 * time.Minute)
 
 	ix, err := lookup.New(lookup.Config{
 		InitialCapacity: 1_600_000,
@@ -77,11 +80,7 @@ func main() {
 		AppendOnly:      true,
 		Clock:           lookup.SystemClock{},
 		Schema: lookup.Schema{Fields: map[string]lookup.FieldOptions{
-			// Do NOT enable Prefix/Fuzzy on this long text field during ingest.
-			// Prefix/fuzzy should be a query-time feature or a separate suggester index.
 			"ld": {Kind: lookup.FieldText, Indexed: true, Lowercase: true},
-
-			// Prefix is useful and cheap on short CPT/HCPCS codes.
 			"cpt_code":           {Kind: lookup.FieldKeyword, Lookup: true, Prefix: true, MinPrefix: 3, MaxPrefix: 5, Lowercase: true},
 			"effective_date":     {Kind: lookup.FieldKeyword, Lookup: true},
 			"end_effective_date": {Kind: lookup.FieldKeyword, Lookup: true},
@@ -104,7 +103,7 @@ func main() {
 	chargeType := ix.FieldID("charge_type")
 
 	src := lookup.PagedSQLQuerySource{
-		DB:       db,
+		DB:       db.DB(),
 		PageSize: 100_000,
 		Page: func(lastSeq uint64, limit int) (string, []any) {
 			return chargeMasterPageQuery, []any{lastSeq, limit}
