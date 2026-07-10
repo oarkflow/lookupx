@@ -49,8 +49,8 @@ func usage() {
 	fmt.Print(`lookupx CLI
 
 Commands:
-  serve   Start HTTP API with multiple index IDs: dataset_a, dataset_b, dataset_c
-  demo    Build demo Dataset/DatasetB/DatasetC indexes and print indexing/search latency
+  serve           Start HTTP API server (create indexes via API or web UI)
+  demo            Build demo indexes and print indexing/search latency
   search          Build one demo index and run a lookup query
   persist-demo    Build demo indexes, freeze, and persist them to disk
   restore-search  Load a persisted index from disk and run a lookup query
@@ -61,48 +61,46 @@ Commands:
   plan            Print a 1B-row partition/batch deployment plan
 
 Examples:
+  lookupx serve -addr :8089 -web ./web
   lookupx demo -rows 100000
-  lookupx search -index dataset_a -rows 100000 -q 'term=key-0013&group_id=4&date_key=2026-01-01'
-  lookupx serve -addr :8089 -demo -rows 100000
+  lookupx search -index my_index -rows 100000 -q 'term=key-0013&group_id=4&date_key=2026-01-01'
   lookupx persist-demo -rows 100000 -data ./data/indexes
-  lookupx restore-search -index dataset_a -data ./data/indexes -q 'term=key-0013&group_id=4&date_key=2026-01-01'
+  lookupx restore-search -index my_index -data ./data/indexes -q 'term=key-0013&group_id=4&date_key=2026-01-01'
 
-HTTP after serve:
-  GET  /v1/indexes
-  GET  /v1/indexes/dataset_a/stats
-  GET  /v1/indexes/dataset_a/lookup?term=key-0013&group_id=4&date_key=2026-01-01
-  POST /v1/indexes/dataset_a/search
-  POST /v1/indexes/dataset_a/reload
-  POST /v1/indexes/dataset_a/reload-sql
-  POST /v1/indexes/dataset_a/reload-table
+HTTP API:
+  GET  /v1/indexes                         List all indexes
+  POST /v1/indexes                         Create a new index
+  DELETE /v1/indexes                       Delete an index
+  GET  /v1/indexes/{id}/stats              Get index stats
+  GET  /v1/indexes/{id}/lookup?k=v&...     Lookup query
+  POST /v1/indexes/{id}/search             Search with JSON body
+  POST /v1/indexes/{id}/reload             Reload from registered source
+  POST /v1/indexes/{id}/reload-sql         Reload from SQL connection
+  POST /v1/indexes/{id}/reload-table       Reload from SQL table (paged)
+  GET  /v1/indexes/{id}/generations        List persisted generations
+  POST /v1/indexes/{id}/restore            Restore a generation
+  POST /v1/indexes/{id}/freeze             Freeze index for read acceleration
+  POST /v1/indexes/{id}/compact            Compact old generations
+  GET  /v1/indexes/{id}/validate           Validate persisted index
+  POST /v1/indexes/{id}/repair             Repair persisted index
+  /                                        Web frontend (when -web flag is set)
 `)
 }
 
 func serveCmd(args []string) {
 	fs := flag.NewFlagSet("serve", flag.ExitOnError)
 	addr := fs.String("addr", getenv("ADDR", ":8089"), "listen address")
-	demo := fs.Bool("demo", false, "load deterministic demo data into dataset_a/dataset_b/dataset_c")
-	rows := fs.Int("rows", 100000, "demo rows per index")
 	apiKey := fs.String("api-key", getenv("LOOKUPX_API_KEY", ""), "optional API key")
+	webDir := fs.String("web", getenv("LOOKUPX_WEB_DIR", ""), "directory for static web frontend files")
 	_ = fs.Parse(args)
 
 	mgr := lookup.NewMultiIndexManager()
-	if err := lookup.RegisterDemoIndexes(mgr, *rows); err != nil {
-		log.Fatal(err)
-	}
-	if *demo {
-		for _, id := range []string{"dataset_a", "dataset_b", "dataset_c"} {
-			if err := loadDemo(mgr, id, *rows); err != nil {
-				log.Fatal(err)
-			}
-		}
-	}
 	keys := []string{}
 	if *apiKey != "" {
 		keys = append(keys, *apiKey)
 	}
-	log.Printf("lookupx multi-index API listening on %s indexes=%v", *addr, []string{"dataset_a", "dataset_b", "dataset_c"})
-	log.Fatal(http.ListenAndServe(*addr, &lookup.MultiServer{Manager: mgr, APIKeys: keys}))
+	log.Printf("lookupx server listening on %s", *addr)
+	log.Fatal(http.ListenAndServe(*addr, &lookup.MultiServer{Manager: mgr, APIKeys: keys, WebDir: *webDir}))
 }
 
 func demoCmd(args []string) {
@@ -153,11 +151,14 @@ func persistDemoCmd(args []string) {
 
 func restoreSearchCmd(args []string) {
 	fs := flag.NewFlagSet("restore-search", flag.ExitOnError)
-	id := fs.String("index", "dataset_a", "index id")
+	id := fs.String("index", "", "index id (required)")
 	data := fs.String("data", "./data/indexes", "persistent index directory")
 	raw := fs.String("q", "term=key-0013&group_id=4&date_key=2026-01-01", "lookup query string")
 	limit := fs.Int("limit", 5, "limit")
 	_ = fs.Parse(args)
+	if *id == "" {
+		log.Fatal("-index flag is required")
+	}
 	ix, man, err := lookup.OpenPersistent(context.Background(), lookup.FileSegmentStore{Root: *data}, *id, lookup.Config{})
 	if err != nil {
 		log.Fatal(err)
@@ -173,11 +174,14 @@ func restoreSearchCmd(args []string) {
 
 func searchCmd(args []string) {
 	fs := flag.NewFlagSet("search", flag.ExitOnError)
-	id := fs.String("index", "dataset_a", "index id")
+	id := fs.String("index", "", "index id (required)")
 	rows := fs.Int("rows", 100000, "demo rows")
 	raw := fs.String("q", "term=key-0013&group_id=4&date_key=2026-01-01", "lookup query string")
 	limit := fs.Int("limit", 5, "limit")
 	_ = fs.Parse(args)
+	if *id == "" {
+		log.Fatal("-index flag is required")
+	}
 	mgr := lookup.NewMultiIndexManager()
 	if err := lookup.RegisterDemoIndexes(mgr, *rows); err != nil {
 		log.Fatal(err)
@@ -249,6 +253,7 @@ func codeFor(indexID string, i int) string {
 		return codes[i%len(codes)]
 	}
 }
+
 func firstTerm(indexID string) string {
 	if indexID == "dataset_b" {
 		return "E11.9"
@@ -258,9 +263,11 @@ func firstTerm(indexID string) string {
 	}
 	return "key-0013"
 }
+
 func sampleQuery(indexID string) string {
 	return "term=" + firstTerm(indexID) + "&group_id=4&date_key=2026-01-01"
 }
+
 func getenv(k, d string) string {
 	if v := os.Getenv(k); v != "" {
 		return v
@@ -270,9 +277,12 @@ func getenv(k, d string) string {
 
 func validateCmd(args []string) {
 	fs := flag.NewFlagSet("validate", flag.ExitOnError)
-	id := fs.String("index", "dataset_a", "index id")
+	id := fs.String("index", "", "index id (required)")
 	data := fs.String("data", "./data/indexes", "persistent index directory")
 	_ = fs.Parse(args)
+	if *id == "" {
+		log.Fatal("-index flag is required")
+	}
 	rep, err := lookup.ValidatePersistentIndex(context.Background(), lookup.FileSegmentStore{Root: *data}, *id, lookup.Config{})
 	if err != nil && len(rep.Issues) == 0 {
 		log.Fatal(err)
@@ -286,9 +296,12 @@ func validateCmd(args []string) {
 
 func repairCmd(args []string) {
 	fs := flag.NewFlagSet("repair", flag.ExitOnError)
-	id := fs.String("index", "dataset_a", "index id")
+	id := fs.String("index", "", "index id (required)")
 	data := fs.String("data", "./data/indexes", "persistent index directory")
 	_ = fs.Parse(args)
+	if *id == "" {
+		log.Fatal("-index flag is required")
+	}
 	man, rep, err := lookup.RepairPersistentIndex(context.Background(), lookup.FileSegmentStore{Root: *data}, *id, lookup.Config{})
 	if err != nil {
 		log.Fatal(err)
@@ -299,10 +312,13 @@ func repairCmd(args []string) {
 
 func compactCmd(args []string) {
 	fs := flag.NewFlagSet("compact", flag.ExitOnError)
-	id := fs.String("index", "dataset_a", "index id")
+	id := fs.String("index", "", "index id (required)")
 	data := fs.String("data", "./data/indexes", "persistent index directory")
 	keep := fs.Int("keep", 2, "generations to keep")
 	_ = fs.Parse(args)
+	if *id == "" {
+		log.Fatal("-index flag is required")
+	}
 	removed, err := lookup.CompactPersistentGenerations(context.Background(), lookup.FileSegmentStore{Root: *data}, *id, lookup.GenerationPolicy{KeepLast: *keep})
 	if err != nil {
 		log.Fatal(err)
@@ -313,9 +329,12 @@ func compactCmd(args []string) {
 
 func generationsCmd(args []string) {
 	fs := flag.NewFlagSet("generations", flag.ExitOnError)
-	id := fs.String("index", "dataset_a", "index id")
+	id := fs.String("index", "", "index id (required)")
 	data := fs.String("data", "./data/indexes", "persistent index directory")
 	_ = fs.Parse(args)
+	if *id == "" {
+		log.Fatal("-index flag is required")
+	}
 	gens, err := lookup.ListIndexGenerations(context.Background(), lookup.FileSegmentStore{Root: *data}, *id)
 	if err != nil {
 		log.Fatal(err)
@@ -326,9 +345,12 @@ func generationsCmd(args []string) {
 
 func planCmd(args []string) {
 	fs := flag.NewFlagSet("plan", flag.ExitOnError)
-	id := fs.String("index", "dataset_a", "index id")
+	id := fs.String("index", "", "index id (required)")
 	rows := fs.Int64("rows", 1_000_000_000, "estimated rows")
 	_ = fs.Parse(args)
+	if *id == "" {
+		log.Fatal("-index flag is required")
+	}
 	b, _ := jsonMarshalIndent(lookup.PlanBillionRowDeployment(*id, *rows, lookup.DefaultBillionRowBudget()))
 	fmt.Println(string(b))
 }

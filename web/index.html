@@ -1,0 +1,74 @@
+<!DOCTYPE html>
+<html lang="en" class="h-full">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>lookupx — Dashboard</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <link rel="stylesheet" href="styles.css" />
+  <script>
+    tailwind.config = {
+      theme: {
+        extend: {
+          colors: {
+            brand: { 50: '#eef2ff', 100: '#e0e7ff', 200: '#c7d2fe', 300: '#a5b4fc', 400: '#818cf8', 500: '#6366f1', 600: '#4f46e5', 700: '#4338ca', 800: '#3730a3', 900: '#312e81' },
+          }
+        }
+      }
+    }
+  </script>
+</head>
+<body class="h-full bg-gray-950 text-gray-100">
+  <div class="flex h-full">
+    <!-- Sidebar -->
+    <aside class="w-64 bg-gray-900 border-r border-gray-800 flex flex-col">
+      <div class="p-4 border-b border-gray-800">
+        <h1 class="text-xl font-bold text-brand-400">lookupx</h1>
+        <p class="text-xs text-gray-500 mt-1">Search Engine Dashboard</p>
+      </div>
+      <nav class="flex-1 p-2 space-y-1" id="sidebar-nav">
+        <button data-tab="dashboard" class="nav-btn active w-full text-left px-3 py-2 rounded text-sm font-medium">
+          <span class="mr-2">◉</span> Dashboard
+        </button>
+        <button data-tab="indexes" class="nav-btn w-full text-left px-3 py-2 rounded text-sm font-medium">
+          <span class="mr-2">⊞</span> Indexes
+        </button>
+        <button data-tab="search" class="nav-btn w-full text-left px-3 py-2 rounded text-sm font-medium">
+          <span class="mr-2">⌕</span> Search
+        </button>
+        <button data-tab="config" class="nav-btn w-full text-left px-3 py-2 rounded text-sm font-medium">
+          <span class="mr-2">⚙</span> Configuration
+        </button>
+        <button data-tab="datasources" class="nav-btn w-full text-left px-3 py-2 rounded text-sm font-medium">
+          <span class="mr-2">⬡</span> Datasources
+        </button>
+        <button data-tab="bulk" class="nav-btn w-full text-left px-3 py-2 rounded text-sm font-medium">
+          <span class="mr-2">⇄</span> Bulk Operations
+        </button>
+        <button data-tab="generations" class="nav-btn w-full text-left px-3 py-2 rounded text-sm font-medium">
+          <span class="mr-2">◷</span> Generations
+        </button>
+      </nav>
+      <div class="p-3 border-t border-gray-800 text-xs text-gray-600">
+        <span id="server-status" class="inline-flex items-center gap-1">
+          <span class="w-2 h-2 rounded-full bg-green-500"></span> Connected
+        </span>
+      </div>
+    </aside>
+
+    <!-- Main content -->
+    <main class="flex-1 overflow-auto">
+      <header class="border-b border-gray-800 px-6 py-4 flex items-center justify-between bg-gray-900/50">
+        <h2 id="page-title" class="text-lg font-semibold">Dashboard</h2>
+        <div class="flex items-center gap-3">
+          <input id="api-base" type="text" value="" placeholder="API base URL" class="bg-gray-800 border border-gray-700 rounded px-3 py-1.5 text-sm w-64 focus:outline-none focus:ring-2 focus:ring-brand-500" />
+          <button onclick="App.refresh()" class="px-3 py-1.5 bg-brand-600 hover:bg-brand-500 rounded text-sm font-medium transition">Refresh</button>
+        </div>
+      </header>
+      <div id="content" class="p-6"></div>
+    </main>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>

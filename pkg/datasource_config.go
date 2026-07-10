@@ -127,7 +127,7 @@ func (idx IndexDef) ToConfig() Config {
 
 func resolveSchema(name string) Schema {
 	switch strings.ToLower(strings.TrimSpace(name)) {
-	case "record", "dataset_a", "dataset_b", "dataset_c", "domain-specific", "":
+	case "record", "tuple", "lookup", "":
 		return TupleLookupSchema()
 	default:
 		return TupleLookupSchema()

@@ -111,6 +111,20 @@ func (m *MultiIndexManager) Get(id string) (*Index, bool) {
 	return mi.Index, true
 }
 
+func (m *MultiIndexManager) Remove(id string) bool {
+	id = cleanIndexID(id)
+	m.mu.Lock()
+	mi, ok := m.indexes[id]
+	if ok {
+		delete(m.indexes, id)
+	}
+	m.mu.Unlock()
+	if ok && mi != nil && mi.Index != nil {
+		_ = mi.Index.Close()
+	}
+	return ok
+}
+
 func (m *MultiIndexManager) Managed(id string) (*ManagedIndex, bool) {
 	m.mu.RLock()
 	mi := m.indexes[cleanIndexID(id)]
@@ -248,11 +262,11 @@ func cleanIndexID(id string) string {
 type MultiServer struct {
 	Manager  *MultiIndexManager
 	APIKeys  []string
+	WebDir   string // optional: directory to serve static frontend files
 	Requests uint64
 }
 
 func (s *MultiServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
 	if s.Manager == nil {
 		http.Error(w, "manager required", http.StatusInternalServerError)
 		return
@@ -269,6 +283,16 @@ func (s *MultiServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	path := strings.Trim(r.URL.Path, "/")
+	// Non-API paths: serve static web files if WebDir is set
+	if !strings.HasPrefix(path, "v1/") && path != "health" && path != "metrics" {
+		if s.WebDir != "" {
+			s.serveWebOrNotFound(w, r)
+			return
+		}
+		http.NotFound(w, r)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
 	if path == "health" || path == "v1/health" {
 		writeJSON(w, map[string]any{"ok": true, "indexes": len(s.Manager.List())})
 		return
@@ -284,7 +308,7 @@ func (s *MultiServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if path == "v1/indexes" && r.Method == http.MethodGet {
-		writeJSON(w, map[string]any{"indexes": s.Manager.List()})
+		writeJSON(w, s.Manager.List())
 		return
 	}
 	if path == "v1/indexes" && r.Method == http.MethodPost {
@@ -296,10 +320,10 @@ func (s *MultiServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		cfg := req.Config
 		if cfg.Schema.Fields == nil {
 			switch strings.ToLower(req.Schema) {
-			case "record", "dataset_a", "dataset_b", "dataset_c", "domain-specific":
+			case "record", "tuple", "lookup", "":
 				cfg.Schema = TupleLookupSchema()
 			default:
-				http.Error(w, "schema required", 400)
+				http.Error(w, "schema required (use schema: record or provide config.schema.fields)", 400)
 				return
 			}
 		}
@@ -308,6 +332,18 @@ func (s *MultiServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		writeJSON(w, map[string]any{"ok": true, "id": cleanIndexID(req.ID)})
+		return
+	}
+	if path == "v1/indexes" && r.Method == http.MethodDelete {
+		var req struct {
+			ID string `json:"id"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, err.Error(), 400)
+			return
+		}
+		s.Manager.Remove(cleanIndexID(req.ID))
+		writeJSON(w, map[string]any{"ok": true})
 		return
 	}
 	parts := strings.Split(path, "/")
@@ -414,8 +450,21 @@ func (s *MultiServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		_ = ix.Delete(parts[4])
 		writeJSON(w, map[string]any{"ok": true})
 	default:
-		http.NotFound(w, r)
+		s.serveWebOrNotFound(w, r)
 	}
+}
+
+func (s *MultiServer) serveWebOrNotFound(w http.ResponseWriter, r *http.Request) {
+	if s.WebDir == "" {
+		http.NotFound(w, r)
+		return
+	}
+	path := strings.TrimPrefix(r.URL.Path, "/")
+	if path == "" || path == "index.html" {
+		http.ServeFile(w, r, filepath.Join(s.WebDir, "index.html"))
+		return
+	}
+	http.FileServer(http.Dir(s.WebDir)).ServeHTTP(w, r)
 }
 
 func (s *MultiServer) authorized(r *http.Request) bool {
