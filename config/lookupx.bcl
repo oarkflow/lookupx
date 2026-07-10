@@ -1,0 +1,317 @@
+bcl {
+  version "1.0"
+}
+
+// ---------------------------------------------------------------------------
+// Server configuration
+// ---------------------------------------------------------------------------
+addr "0.0.0.0:8089"
+data_dir "./data"
+api_keys [env("LOOKUPX_API_KEY", "dev-key-123")]
+
+// ---------------------------------------------------------------------------
+// Datasources — each block defines a data source for an index.
+// ---------------------------------------------------------------------------
+
+// SQL Table datasource with keyset pagination for large tables.
+datasource "products" {
+  kind "sql_table"
+  driver "postgres"
+  dsn env("DATABASE_URL", "postgres://localhost:5432/lookupx?sslmode=disable")
+  table "products"
+  id_column "sku"
+  order_column "id"
+  page_size 50000
+  where "active = true"
+
+  column "sku" {
+    field "sku"
+    kind "keyword"
+  }
+  column "name" {
+    field "name"
+    kind "text"
+  }
+  column "price" {
+    field "price"
+    kind "number"
+  }
+  column "category" {
+    field "category"
+    kind "keyword"
+    normalized true
+  }
+  column "stock" {
+    field "stock"
+    kind "number"
+  }
+  column "updated_at" {
+    field "updated_at"
+    kind "time_unix"
+    layout "2006-01-02T15:04:05Z"
+  }
+
+  params {
+    batch_size 65536
+    checkpoint_every 10000
+  }
+}
+
+// SQL View datasource for pre-joined/read-optimized views.
+datasource "members" {
+  kind "sql_view"
+  driver "mysql"
+  dsn env("MYSQL_DSN", "root:password@tcp(localhost:3306)/members_db")
+  view "v_member_summary"
+  id_column "member_id"
+  where "status = 'active'"
+
+  column "member_id" {
+    field "member_id"
+    kind "keyword"
+  }
+  column "full_name" {
+    field "full_name"
+    kind "text"
+  }
+  column "email" {
+    field "email"
+    kind "keyword"
+  }
+  column "plan" {
+    field "plan"
+    kind "keyword"
+  }
+  column "created_at" {
+    field "created_at"
+    kind "time_unix"
+    layout "2006-01-02"
+  }
+}
+
+// SQL Query datasource for complex joins and CTEs.
+datasource "claims" {
+  kind "sql_query"
+  driver "postgres"
+  dsn env("DATABASE_URL")
+  query "SELECT c.claim_id, c.member_id, c.provider_name, c.service_date, c.amount, c.status, p.plan_name FROM claims c JOIN providers p ON c.provider_id = p.id WHERE c.service_date >= '${start_date}' AND c.service_date <= '${end_date}'"
+  id_column "claim_id"
+
+  column "claim_id" {
+    field "claim_id"
+    kind "keyword"
+  }
+  column "member_id" {
+    field "member_id"
+    kind "keyword"
+  }
+  column "provider_name" {
+    field "provider_name"
+    kind "text"
+  }
+  column "service_date" {
+    field "service_date"
+    kind "time_unix"
+    layout "2006-01-02"
+  }
+  column "amount" {
+    field "amount"
+    kind "number"
+  }
+  column "status" {
+    field "status"
+    kind "keyword"
+  }
+  column "plan_name" {
+    field "plan_name"
+    kind "keyword"
+  }
+
+  params {
+    start_date "2025-01-01"
+    end_date "2025-12-31"
+  }
+}
+
+// SQL File datasource — loads query from a .sql file with parameter substitution.
+datasource "analytics" {
+  kind "sql_file"
+  driver "sqlite3"
+  dsn "./data/analytics.db"
+  file "./queries/analytics.sql"
+  id_column "event_id"
+
+  column "event_id" {
+    field "event_id"
+    kind "keyword"
+  }
+  column "user_id" {
+    field "user_id"
+    kind "keyword"
+  }
+  column "event_type" {
+    field "event_type"
+    kind "keyword"
+  }
+  column "timestamp" {
+    field "timestamp"
+    kind "time_unix"
+  }
+  column "payload" {
+    field "payload"
+    kind "text"
+  }
+}
+
+// CSV file datasource for bulk imports.
+datasource "charge_master" {
+  kind "csv"
+  file "./data/charge_master.csv"
+  id_column "sku"
+
+  column "sku" {
+    field "sku"
+    kind "keyword"
+  }
+  column "description" {
+    field "description"
+    kind "text"
+  }
+  column "price" {
+    field "price"
+    kind "number"
+  }
+  column "category" {
+    field "category"
+    kind "keyword"
+  }
+
+  params {
+    batch_size 32768
+  }
+}
+
+// JSONL file datasource for log/event streaming.
+datasource "events" {
+  kind "jsonl"
+  file "./data/events.jsonl"
+  id_field "event_id"
+
+  column "event_id" {
+    field "event_id"
+    kind "keyword"
+  }
+  column "user_id" {
+    field "user_id"
+    kind "keyword"
+  }
+  column "action" {
+    field "action"
+    kind "keyword"
+  }
+  column "timestamp" {
+    field "timestamp"
+    kind "time_unix"
+  }
+  column "metadata" {
+    field "metadata"
+    kind "text"
+  }
+}
+
+// HTTP/REST API datasource for external integrations.
+datasource "inventory_api" {
+  kind "http"
+  url env("INVENTORY_API_URL", "https://api.example.com/v1/inventory")
+  method "GET"
+  auth env("INVENTORY_API_TOKEN", "")
+  id_field "product_id"
+  timeout_seconds 60
+  page_param "page"
+  limit_param 100
+
+  headers {
+    Accept "application/json"
+    X_Source "lookupx"
+  }
+
+  column "product_id" {
+    field "product_id"
+    kind "keyword"
+  }
+  column "sku" {
+    field "sku"
+    kind "keyword"
+  }
+  column "quantity" {
+    field "quantity"
+    kind "number"
+  }
+  column "warehouse" {
+    field "warehouse"
+    kind "keyword"
+  }
+  column "updated_at" {
+    field "updated_at"
+    kind "time_unix"
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Indexes — each block defines a search index bound to a datasource.
+// ---------------------------------------------------------------------------
+
+index "products" {
+  schema "record"
+  initial_capacity 500000
+  datasource "products"
+
+  bulk {
+    batch_size 65536
+    checkpoint_every 10000
+    checkpoint_path "./data/checkpoint_products.json"
+    resume true
+  }
+}
+
+index "members" {
+  schema "record"
+  initial_capacity 100000
+  datasource "members"
+}
+
+index "claims" {
+  schema "record"
+  datasource "claims"
+
+  bulk {
+    batch_size 32768
+    checkpoint_every 5000
+  }
+}
+
+index "analytics" {
+  schema "record"
+  datasource "analytics"
+}
+
+index "charge_master" {
+  schema "record"
+  initial_capacity 200000
+  datasource "charge_master"
+
+  bulk {
+    batch_size 32768
+  }
+}
+
+index "events" {
+  schema "record"
+  datasource "events"
+}
+
+index "inventory" {
+  schema "record"
+  initial_capacity 100000
+  datasource "inventory_api"
+}
