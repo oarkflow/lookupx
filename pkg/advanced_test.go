@@ -1,6 +1,9 @@
 package pkg
 
-import "testing"
+import (
+	"testing"
+	"time"
+)
 
 func advancedIndex(t *testing.T) *Index {
 	t.Helper()
@@ -56,5 +59,84 @@ func TestAnalyzerRegistryAndSynonym(t *testing.T) {
 	_ = ix.Upsert("1", Document{"body": "quick lookup"})
 	if got := ix.Count(Term{Field: "body", Value: "fast"}); got != 1 {
 		t.Fatalf("synonym=%d", got)
+	}
+}
+
+func TestVectorMetricsExactAndUpdate(t *testing.T) {
+	ix, err := New(Config{DisableSource: true, InitialCapacity: 8, Schema: Schema{Fields: map[string]FieldOptions{
+		"vec": {Kind: FieldVector, Dim: 2, VectorMetric: "cosine", VectorM: 8, VectorEFSearch: 32},
+	}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	v := ix.VectorField("vec")
+	w := ix.BeginFast("a")
+	w.VectorH(v, []float64{1, 0})
+	if err := w.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	w = ix.BeginFast("b")
+	w.VectorH(v, []float64{0, 1})
+	if err := w.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	w = ix.BeginFast("c")
+	w.VectorH(v, []float64{2, 0})
+	if err := w.Commit(); err != nil {
+		t.Fatal(err)
+	}
+
+	var hits []Hit
+	_, hits = ix.SearchInto(SearchRequest{Query: VectorQuery{Field: "vec", Vector: []float64{1, 0}, K: 3, Metric: "cosine", Exact: true}, Limit: 3}, hits)
+	if len(hits) != 3 || hits[0].ID != "a" && hits[0].ID != "c" {
+		t.Fatalf("unexpected cosine hits: %+v", hits)
+	}
+	_, hits = ix.SearchInto(SearchRequest{Query: VectorQuery{Field: "vec", Vector: []float64{1, 0}, K: 3, Metric: "dot", Exact: true}, Limit: 3}, hits[:0])
+	if len(hits) == 0 || hits[0].ID != "c" {
+		t.Fatalf("dot metric override ignored: %+v", hits)
+	}
+	_, hits = ix.SearchInto(SearchRequest{Query: VectorQuery{Field: "vec", Vector: []float64{0, 1}, K: 1, Metric: "l2", Exact: true}, Limit: 1}, hits[:0])
+	if len(hits) != 1 || hits[0].ID != "b" {
+		t.Fatalf("unexpected l2 hit: %+v", hits)
+	}
+}
+
+func TestVectorRangeFilterDoesNotDeadlock(t *testing.T) {
+	ix, err := New(Config{InitialCapacity: 4, Schema: Schema{Fields: map[string]FieldOptions{
+		"vec":   {Kind: FieldVector, Dim: 2, VectorMetric: "cosine", VectorEFSearch: 8},
+		"price": {Kind: FieldFloat, Sortable: true},
+	}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ix.Upsert("cheap", Document{"vec": []float64{1, 0}, "price": 5}); err != nil {
+		t.Fatal(err)
+	}
+	if err := ix.Upsert("target", Document{"vec": []float64{0, 1}, "price": 15}); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan []Hit, 1)
+	go func() {
+		_, hits := ix.SearchInto(SearchRequest{Query: VectorQuery{Field: "vec", Vector: []float64{0, 1}, K: 2, Filter: Range{Field: "price", GTE: 10, LTE: 20}}, Limit: 1}, nil)
+		done <- hits
+	}()
+	select {
+	case hits := <-done:
+		if len(hits) != 1 || hits[0].ID != "target" {
+			t.Fatalf("unexpected filtered vector hits: %+v", hits)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("filtered vector search deadlocked")
+	}
+}
+
+func TestWireVectorFilter(t *testing.T) {
+	q := WireQuery{Type: "vector", Field: "vec", Vector: []float64{1, 0}, K: 10, Filter: []WireQuery{{Type: "term", Field: "tenant", Value: "orgware"}}}.ToQuery()
+	vq, ok := q.(VectorQuery)
+	if !ok {
+		t.Fatalf("expected VectorQuery, got %T", q)
+	}
+	if vq.Filter == nil {
+		t.Fatal("wire vector filter was not preserved")
 	}
 }

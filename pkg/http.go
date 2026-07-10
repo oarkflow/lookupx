@@ -1,8 +1,10 @@
 package pkg
 
 import (
+	"crypto/subtle"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"strconv"
 	"strings"
@@ -11,11 +13,13 @@ import (
 )
 
 type Server struct {
-	Index       *Index
-	Requests    uint64
-	SlowQueries uint64
-	lastSecond  int64
-	secondCount int64
+	Index          *Index
+	Requests       uint64
+	SlowQueries    uint64
+	Errors         uint64
+	LatencyBuckets [6]uint64
+	lastSecond     int64
+	secondCount    int64
 }
 
 func (s *Server) authorized(w http.ResponseWriter, r *http.Request) bool {
@@ -39,11 +43,11 @@ func (s *Server) authorized(w http.ResponseWriter, r *http.Request) bool {
 		key = strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
 	}
 	for _, k := range s.Index.cfg.APIKeys {
-		if k == key {
+		if constantTimeStringEqual(k, key) {
 			return true
 		}
 	}
-	http.Error(w, "unauthorized", http.StatusUnauthorized)
+	writeError(w, http.StatusUnauthorized, "unauthorized")
 	return false
 }
 
@@ -56,12 +60,19 @@ func (s *Server) audit(r *http.Request, status string) {
 
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
+	if s.Index == nil {
+		writeError(w, http.StatusServiceUnavailable, "index not configured")
+		return
+	}
 	if !s.authorized(w, r) {
 		return
 	}
 	started := time.Now()
+	r.Body = http.MaxBytesReader(w, r.Body, s.maxRequestBytes())
 	defer func() {
-		if s.Index != nil && s.Index.cfg.SlowQueryNanos > 0 && time.Since(started).Nanoseconds() > s.Index.cfg.SlowQueryNanos {
+		dur := time.Since(started)
+		s.observeLatency(dur)
+		if s.Index != nil && s.Index.cfg.SlowQueryNanos > 0 && dur.Nanoseconds() > s.Index.cfg.SlowQueryNanos {
 			atomic.AddUint64(&s.SlowQueries, 1)
 		}
 		s.audit(r, "ok")
@@ -73,40 +84,45 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		json.NewEncoder(w).Encode(s.Index.Stats())
 	case r.Method == "GET" && r.URL.Path == "/metrics":
 		w.Header().Set("Content-Type", "text/plain; version=0.0.4")
-		fmt.Fprintf(w, "lookupx_requests_total %d\nlookupx_slow_queries_total %d\nlookupx_live_docs %d\n", atomic.LoadUint64(&s.Requests), atomic.LoadUint64(&s.SlowQueries), s.Index.Stats().LiveDocs)
+		stats := s.Index.Stats()
+		fmt.Fprintf(w, "lookupx_requests_total %d\nlookupx_errors_total %d\nlookupx_slow_queries_total %d\nlookupx_live_docs %d\nlookupx_vector_nodes %d\nlookupx_vector_tombstones %d\n", atomic.LoadUint64(&s.Requests), atomic.LoadUint64(&s.Errors), atomic.LoadUint64(&s.SlowQueries), stats.LiveDocs, stats.VectorNodes, stats.VectorTombstones)
+		for i, le := range []string{"1000000", "5000000", "10000000", "50000000", "100000000", "+Inf"} {
+			fmt.Fprintf(w, "lookupx_request_duration_ns_bucket{le=\"%s\"} %d\n", le, atomic.LoadUint64(&s.LatencyBuckets[i]))
+		}
 	case r.Method == "GET" && r.URL.Path == "/health/index":
 		json.NewEncoder(w).Encode(map[string]any{"ok": true, "stats": s.Index.Stats()})
 	case r.Method == "POST" && r.URL.Path == "/analyze":
 		var body struct{ Field, Text string }
-		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-			http.Error(w, err.Error(), 400)
+		if err := decodeJSON(r.Body, &body); err != nil {
+			atomic.AddUint64(&s.Errors, 1)
+			writeError(w, http.StatusBadRequest, err.Error())
 			return
 		}
 		json.NewEncoder(w).Encode(map[string]any{"tokens": s.Index.Analyze(body.Field, body.Text)})
 	case r.Method == "PUT" && strings.HasPrefix(r.URL.Path, "/docs/"):
 		id := strings.TrimPrefix(r.URL.Path, "/docs/")
 		var d Document
-		dec := json.NewDecoder(r.Body)
-		dec.UseNumber()
-		if err := dec.Decode(&d); err != nil {
-			http.Error(w, err.Error(), 400)
+		if err := decodeJSON(r.Body, &d); err != nil {
+			atomic.AddUint64(&s.Errors, 1)
+			writeError(w, http.StatusBadRequest, err.Error())
 			return
 		}
 		if err := s.Index.Upsert(id, d); err != nil {
-			http.Error(w, err.Error(), 400)
+			atomic.AddUint64(&s.Errors, 1)
+			writeError(w, http.StatusBadRequest, err.Error())
 			return
 		}
 		json.NewEncoder(w).Encode(map[string]any{"ok": true, "id": id})
 	case r.Method == "POST" && r.URL.Path == "/docs/batch":
 		var body map[string]Document
-		dec := json.NewDecoder(r.Body)
-		dec.UseNumber()
-		if err := dec.Decode(&body); err != nil {
-			http.Error(w, err.Error(), 400)
+		if err := decodeJSON(r.Body, &body); err != nil {
+			atomic.AddUint64(&s.Errors, 1)
+			writeError(w, http.StatusBadRequest, err.Error())
 			return
 		}
 		if err := s.Index.BatchUpsert(body); err != nil {
-			http.Error(w, err.Error(), 400)
+			atomic.AddUint64(&s.Errors, 1)
+			writeError(w, http.StatusBadRequest, err.Error())
 			return
 		}
 		json.NewEncoder(w).Encode(map[string]any{"ok": true, "count": len(body)})
@@ -123,30 +139,26 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		json.NewEncoder(w).Encode(map[string]any{"ok": true})
 	case r.Method == "POST" && r.URL.Path == "/search":
 		var q WireQuery
-		dec := json.NewDecoder(r.Body)
-		dec.UseNumber()
-		if err := dec.Decode(&q); err != nil {
-			http.Error(w, err.Error(), 400)
+		if err := decodeJSON(r.Body, &q); err != nil {
+			atomic.AddUint64(&s.Errors, 1)
+			writeError(w, http.StatusBadRequest, err.Error())
 			return
 		}
-		limit := q.Limit
-		if limit <= 0 {
-			limit = 20
-		}
+		limit := s.sanitizeLimit(q.Limit)
 		res := s.Index.Search(SearchRequest{Query: q.ToQuery(), Limit: limit, Offset: q.Offset, WithDocs: q.WithDocs, Sort: q.Sort, Facets: q.Facets})
 		json.NewEncoder(w).Encode(res)
 	case r.Method == "POST" && r.URL.Path == "/count":
 		var q WireQuery
-		dec := json.NewDecoder(r.Body)
-		dec.UseNumber()
-		if err := dec.Decode(&q); err != nil {
-			http.Error(w, err.Error(), 400)
+		if err := decodeJSON(r.Body, &q); err != nil {
+			atomic.AddUint64(&s.Errors, 1)
+			writeError(w, http.StatusBadRequest, err.Error())
 			return
 		}
 		json.NewEncoder(w).Encode(map[string]any{"count": s.Index.Count(q.ToQuery())})
 	case r.Method == "POST" && r.URL.Path == "/truncate-wal":
 		if err := s.Index.TruncateWAL(); err != nil {
-			http.Error(w, err.Error(), 500)
+			atomic.AddUint64(&s.Errors, 1)
+			writeError(w, http.StatusInternalServerError, err.Error())
 			return
 		}
 		json.NewEncoder(w).Encode(map[string]any{"ok": true})
@@ -154,15 +166,23 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		var body struct {
 			Path string `json:"path"`
 		}
-		_ = json.NewDecoder(r.Body).Decode(&body)
+		_ = decodeJSON(r.Body, &body)
 		if body.Path == "" {
 			body.Path = s.Index.cfg.SnapshotPath
 		}
 		if err := s.Index.SaveSnapshot(body.Path); err != nil {
-			http.Error(w, err.Error(), 500)
+			atomic.AddUint64(&s.Errors, 1)
+			writeError(w, http.StatusInternalServerError, err.Error())
 			return
 		}
 		json.NewEncoder(w).Encode(map[string]any{"ok": true, "path": body.Path})
+	case r.Method == "POST" && r.URL.Path == "/compact":
+		if err := s.Index.Compact(); err != nil {
+			atomic.AddUint64(&s.Errors, 1)
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		json.NewEncoder(w).Encode(map[string]any{"ok": true, "stats": s.Index.Stats()})
 	default:
 		http.NotFound(w, r)
 	}
@@ -184,6 +204,9 @@ type WireQuery struct {
 	Metric         string      `json:"metric,omitempty"`
 	Vector         []float64   `json:"vector,omitempty"`
 	K              int         `json:"k,omitempty"`
+	EFSearch       int         `json:"ef_search,omitempty"`
+	Oversample     int         `json:"oversample,omitempty"`
+	Exact          bool        `json:"exact,omitempty"`
 	Fields         []string    `json:"fields,omitempty"`
 	Must           []WireQuery `json:"must,omitempty"`
 	Should         []WireQuery `json:"should,omitempty"`
@@ -228,7 +251,7 @@ func (w WireQuery) ToQuery() Query {
 	case "compound":
 		return Compound{Fields: w.Fields, Values: w.Values}
 	case "vector":
-		return VectorQuery{Field: w.Field, Vector: w.Vector, K: w.K, Metric: w.Metric}
+		return VectorQuery{Field: w.Field, Vector: w.Vector, K: w.K, Metric: w.Metric, Filter: w.vectorFilter(), EFSearch: w.EFSearch, Oversample: w.Oversample, Exact: w.Exact}
 	case "and":
 		return And(toQueries(w.Must))
 	case "or":
@@ -241,6 +264,13 @@ func (w WireQuery) ToQuery() Query {
 		return MatchAll{}
 	}
 }
+func (w WireQuery) vectorFilter() Query {
+	if len(w.Filter) == 0 {
+		return nil
+	}
+	return Bool{Filter: toQueries(w.Filter)}
+}
+
 func toQueries(ws []WireQuery) []Query {
 	qs := make([]Query, 0, len(ws))
 	for _, w := range ws {
@@ -255,4 +285,68 @@ func IntParam(r *http.Request, name string, def int) int {
 		}
 	}
 	return def
+}
+
+func constantTimeStringEqual(a, b string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	return subtle.ConstantTimeCompare([]byte(a), []byte(b)) == 1
+}
+
+func decodeJSON(r io.Reader, dst any) error {
+	dec := json.NewDecoder(r)
+	dec.UseNumber()
+	if err := dec.Decode(dst); err != nil {
+		return err
+	}
+	if err := dec.Decode(&struct{}{}); err != io.EOF {
+		return fmt.Errorf("request body must contain a single JSON value")
+	}
+	return nil
+}
+
+func writeError(w http.ResponseWriter, status int, message string) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(map[string]any{"ok": false, "error": message, "status": status})
+}
+
+func (s *Server) maxRequestBytes() int64 {
+	if s != nil && s.Index != nil && s.Index.cfg.MaxRequestBytes > 0 {
+		return s.Index.cfg.MaxRequestBytes
+	}
+	return 32 << 20
+}
+
+func (s *Server) sanitizeLimit(limit int) int {
+	if limit <= 0 {
+		limit = 20
+	}
+	max := 1000
+	if s != nil && s.Index != nil && s.Index.cfg.MaxSearchLimit > 0 {
+		max = s.Index.cfg.MaxSearchLimit
+	}
+	if limit > max {
+		limit = max
+	}
+	return limit
+}
+
+func (s *Server) observeLatency(d time.Duration) {
+	ns := d.Nanoseconds()
+	idx := 5
+	switch {
+	case ns <= int64(time.Millisecond):
+		idx = 0
+	case ns <= int64(5*time.Millisecond):
+		idx = 1
+	case ns <= int64(10*time.Millisecond):
+		idx = 2
+	case ns <= int64(50*time.Millisecond):
+		idx = 3
+	case ns <= int64(100*time.Millisecond):
+		idx = 4
+	}
+	atomic.AddUint64(&s.LatencyBuckets[idx], 1)
 }

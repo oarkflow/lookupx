@@ -1,0 +1,87 @@
+# Reference BCL-style configuration for the complete vector search example.
+# The runnable example builds the equivalent config in Go so it has no parser dependency.
+
+index "products_vector" {
+  initial_capacity 100000
+  collect_took true
+  enable_wal true
+  wal_path "./data/products.wal"
+  snapshot_path "./data/products.snapshot"
+  wal_sync_every_write false
+  strict_recovery true
+  max_request_bytes 8388608
+  max_search_limit 500
+
+  field "tenant" {
+    kind keyword
+    lookup true
+    lowercase true
+    facetable true
+  }
+
+  field "status" {
+    kind keyword
+    lookup true
+    lowercase true
+    facetable true
+  }
+
+  field "sku" {
+    kind keyword
+    lookup true
+    lowercase true
+    prefix true
+    unique true
+  }
+
+  field "brand" {
+    kind keyword
+    lookup true
+    lowercase true
+    facetable true
+  }
+
+  field "category" {
+    kind keyword
+    lookup true
+    lowercase true
+    prefix true
+    facetable true
+  }
+
+  field "title" {
+    kind text
+    indexed true
+    lookup true
+    lowercase true
+    prefix true
+    ngram true
+    fuzzy true
+    phrase true
+    min_gram 3
+    max_gram 4
+  }
+
+  field "description" {
+    kind text
+    indexed true
+    lookup true
+    lowercase true
+    phrase true
+  }
+
+  field "price" {
+    kind float
+    sortable true
+    facetable true
+  }
+
+  field "embedding" {
+    kind vector
+    dim 16
+    vector_metric cosine
+    vector_m 32
+    vector_ef_construction 256
+    vector_ef_search 128
+  }
+}

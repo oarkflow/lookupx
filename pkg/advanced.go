@@ -27,11 +27,14 @@ type Proximity struct {
 type CIDR struct{ Field, Value string }
 type DomainWildcard struct{ Field, Pattern string }
 type VectorQuery struct {
-	Field  string
-	Vector []float64
-	K      int
-	Metric string
-	Filter Query
+	Field      string
+	Vector     []float64
+	K          int
+	Metric     string
+	Filter     Query
+	EFSearch   int  // per-query recall/latency override; 0 uses field default
+	Oversample int  // candidates retained before filtering; 0 uses an adaptive default
+	Exact      bool // exhaustive search for deterministic 100% recall
 }
 type Compound struct {
 	Fields []string
@@ -568,6 +571,7 @@ func (ix *Index) TruncateWAL() error {
 		return err
 	}
 	ix.wal = f
+	ix.walSeq = 0
 	return nil
 }
 func openTrunc(path string) (*os.File, error) {

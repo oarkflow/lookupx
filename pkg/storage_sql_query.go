@@ -235,9 +235,9 @@ type TupleSQLQueryOptions struct {
 	Dialect     SQLDialect
 	Table       string
 	Columns     []string
-	PartitionID  any
-	GroupID  any
-	DateKey         any
+	PartitionID any
+	GroupID     any
+	DateKey     any
 	Term        any
 	OrderColumn string
 	Limit       int

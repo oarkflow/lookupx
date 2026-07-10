@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"hash/crc32"
 	"io"
 	"net"
 	"os"
@@ -135,6 +136,7 @@ type Index struct {
 	ip4Sorted     map[string][]ipPair
 	ip4Dirty      map[string]bool
 	wal           *os.File
+	walSeq        uint64
 	tokens        []string
 	scratch       []string
 	valScratch    []string
@@ -188,7 +190,7 @@ func New(cfg Config) (*Index, error) {
 		}
 		if opt.Kind == FieldVector || opt.Dim > 0 {
 			ix.vectors[name] = make(map[DocID][]float64, capHint)
-			ix.anns[name] = newVectorANN(opt.Dim, "dot", capHint)
+			ix.anns[name] = newVectorANNWithOptions(opt, capHint)
 		}
 	}
 	if cfg.EnableWAL && cfg.WALPath != "" {
@@ -210,10 +212,16 @@ func Open(cfg Config) (*Index, error) {
 		return nil, err
 	}
 	if cfg.SnapshotPath != "" {
-		_ = ix.LoadSnapshot(cfg.SnapshotPath)
+		if err := ix.LoadSnapshot(cfg.SnapshotPath); err != nil {
+			_ = ix.Close()
+			return nil, err
+		}
 	}
 	if cfg.EnableWAL && cfg.WALPath != "" {
-		_ = ix.ReplayWAL(cfg.WALPath)
+		if err := ix.ReplayWAL(cfg.WALPath); err != nil {
+			_ = ix.Close()
+			return nil, err
+		}
 	}
 	return ix, nil
 }
@@ -268,6 +276,9 @@ func (ix *Index) upsert(id string, doc Document, log bool) error {
 func (ix *Index) upsertLocked(id string, doc Document, log bool) error {
 	if id == "" {
 		return errors.New("id required")
+	}
+	if err := ix.validateDocumentLocked(doc); err != nil {
+		return err
 	}
 	for _, sf := range ix.fieldList {
 		if !sf.opt.Unique {
@@ -594,8 +605,21 @@ func (ix *Index) Stats() Stats {
 	s.LiveDocs = live
 	s.Segments = 1
 	s.Shards = 1
-	for _, v := range ix.vectors {
-		s.Vectors += len(v)
+	for name, v := range ix.vectors {
+		liveVectors := 0
+		for did := range v {
+			if !ix.isDeletedOrExpiredLocked(did) {
+				liveVectors++
+			}
+		}
+		s.Vectors += liveVectors
+		if ann := ix.anns[name]; ann != nil {
+			n := ann.NodeCount()
+			s.VectorNodes += n
+			if n > liveVectors {
+				s.VectorTombstones += n - liveVectors
+			}
+		}
 	}
 	for _, fi := range ix.fields {
 		s.Terms += len(fi.terms) + len(fi.termOne)
@@ -1224,6 +1248,12 @@ func toVector(v any) ([]float64, bool) {
 	case []float64:
 		out := append([]float64(nil), x...)
 		return out, true
+	case []float32:
+		out := make([]float64, len(x))
+		for i, n := range x {
+			out[i] = float64(n)
+		}
+		return out, true
 	case []any:
 		out := make([]float64, 0, len(x))
 		for _, e := range x {
@@ -1376,22 +1406,38 @@ func dir(p string) string {
 }
 
 type walRecord struct {
+	Seq uint64   `json:"seq,omitempty"`
 	Op  string   `json:"op"`
 	ID  string   `json:"id"`
 	Doc Document `json:"doc,omitempty"`
+	CRC uint32   `json:"crc,omitempty"`
 }
 
 func (ix *Index) appendWALLocked(r walRecord) error {
 	if ix.wal == nil {
 		return nil
 	}
+	ix.walSeq++
+	r.Seq = ix.walSeq
+	r.CRC = walCRC(r)
 	b, err := json.Marshal(r)
 	if err != nil {
 		return err
 	}
 	b = append(b, '\n')
-	_, err = ix.wal.Write(b)
-	return err
+	if _, err = ix.wal.Write(b); err != nil {
+		return err
+	}
+	if ix.cfg.WALSyncEveryWrite {
+		return ix.wal.Sync()
+	}
+	return nil
+}
+
+func walCRC(r walRecord) uint32 {
+	r.CRC = 0
+	b, _ := json.Marshal(r)
+	return crc32.ChecksumIEEE(b)
 }
 func (ix *Index) Flush() error {
 	ix.mu.Lock()
@@ -1404,20 +1450,41 @@ func (ix *Index) Flush() error {
 func (ix *Index) ReplayWAL(path string) error {
 	f, err := os.Open(path)
 	if err != nil {
-		return nil
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
 	}
 	defer f.Close()
 	rd := bufio.NewReader(f)
+	lineNo := 0
 	for {
 		line, err := rd.ReadBytes('\n')
 		if len(line) > 0 {
+			lineNo++
 			var r walRecord
-			if json.Unmarshal(line, &r) == nil {
+			if e := json.Unmarshal(line, &r); e != nil {
+				if ix.cfg.StrictRecovery {
+					return fmt.Errorf("wal replay %s:%d: malformed record: %w", path, lineNo, e)
+				}
+			} else if r.CRC != 0 && walCRC(r) != r.CRC {
+				if ix.cfg.StrictRecovery {
+					return fmt.Errorf("wal replay %s:%d: checksum mismatch", path, lineNo)
+				}
+			} else {
 				switch r.Op {
 				case "upsert":
-					_ = ix.upsert(r.ID, r.Doc, false)
+					if e := ix.upsert(r.ID, r.Doc, false); e != nil && ix.cfg.StrictRecovery {
+						return fmt.Errorf("wal replay %s:%d: upsert %q: %w", path, lineNo, r.ID, e)
+					}
 				case "delete":
-					_ = ix.delete(r.ID, false)
+					if e := ix.delete(r.ID, false); e != nil && ix.cfg.StrictRecovery {
+						return fmt.Errorf("wal replay %s:%d: delete %q: %w", path, lineNo, r.ID, e)
+					}
+				default:
+					if ix.cfg.StrictRecovery {
+						return fmt.Errorf("wal replay %s:%d: unknown op %q", path, lineNo, r.Op)
+					}
 				}
 			}
 		}
@@ -1432,18 +1499,22 @@ func (ix *Index) ReplayWAL(path string) error {
 }
 
 type snapshot struct {
-	Config Config              `json:"config"`
-	Docs   map[string]Document `json:"docs"`
+	Version int                 `json:"version,omitempty"`
+	Config  Config              `json:"config"`
+	Docs    map[string]Document `json:"docs,omitempty"`
+	Dump    *persistentDump     `json:"dump,omitempty"`
 }
 
 func (ix *Index) SaveSnapshot(path string) error {
+	dump, err := ix.persistentDump()
+	if err != nil {
+		return err
+	}
 	ix.mu.RLock()
-	snap := snapshot{Config: ix.cfg, Docs: map[string]Document{}}
+	snap := snapshot{Version: 2, Config: ix.cfg, Docs: map[string]Document{}, Dump: dump}
 	for id, did := range ix.extToDoc {
-		if !ix.isDeletedOrExpiredLocked(did) {
-			if ix.docs[did] != nil {
-				snap.Docs[id] = cloneDoc(ix.docs[did])
-			}
+		if !ix.isDeletedOrExpiredLocked(did) && int(did) < len(ix.docs) && ix.docs[did] != nil {
+			snap.Docs[id] = cloneDoc(ix.docs[did])
 		}
 	}
 	ix.mu.RUnlock()
@@ -1456,13 +1527,20 @@ func (ix *Index) SaveSnapshot(path string) error {
 		return err
 	}
 	err = json.NewEncoder(f).Encode(snap)
+	if err == nil {
+		err = f.Sync()
+	}
 	if cerr := f.Close(); err == nil {
 		err = cerr
 	}
 	if err != nil {
+		_ = os.Remove(tmp)
 		return err
 	}
-	return os.Rename(tmp, path)
+	if err := os.Rename(tmp, path); err != nil {
+		return err
+	}
+	return syncDir(dir(path))
 }
 func (ix *Index) LoadSnapshot(path string) error {
 	f, err := os.Open(path)
@@ -1475,6 +1553,24 @@ func (ix *Index) LoadSnapshot(path string) error {
 	dec.UseNumber()
 	if err := dec.Decode(&snap); err != nil {
 		return err
+	}
+	if snap.Dump != nil {
+		if err := ix.restorePersistentDump(snap.Dump); err != nil {
+			return err
+		}
+		if len(snap.Docs) > 0 {
+			ix.mu.Lock()
+			if len(ix.docs) < len(ix.docToExt) {
+				ix.docs = make([]Document, len(ix.docToExt))
+			}
+			for id, doc := range snap.Docs {
+				if did, ok := ix.extToDoc[id]; ok && int(did) < len(ix.docs) {
+					ix.docs[did] = cloneDoc(doc)
+				}
+			}
+			ix.mu.Unlock()
+		}
+		return nil
 	}
 	for id, doc := range snap.Docs {
 		_ = ix.upsert(id, doc, false)

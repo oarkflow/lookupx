@@ -16,9 +16,9 @@ import (
 type StreamingDatasetSource struct {
 	Rows          uint64
 	Term          FieldID
-	Group      FieldID
-	DateKey           FieldID
-	Partition      FieldID
+	Group         FieldID
+	DateKey       FieldID
+	Partition     FieldID
 	Source        FieldID
 	SourceName    string
 	IncludeSource bool

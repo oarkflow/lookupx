@@ -31,11 +31,11 @@ func TestSQLSelectBuildDialects(t *testing.T) {
 
 func TestTupleSQLQuery(t *testing.T) {
 	q, args, err := TupleSQLQuery(TupleSQLQueryOptions{
-		Dialect:    SQLDialectQuestion,
+		Dialect: SQLDialectQuestion,
 		GroupID: 4,
-		DateKey:        "2026-01-01",
-		Term:       "key-special",
-		Limit:      50,
+		DateKey: "2026-01-01",
+		Term:    "key-special",
+		Limit:   50,
 	})
 	if err != nil {
 		t.Fatal(err)

@@ -684,18 +684,23 @@ func (ix *Index) searchVectorIntoFast(q VectorQuery, req SearchRequest, dst []Hi
 	if k <= 0 {
 		k = 10
 	}
+	var allowed *Bitmap
+	if q.Filter != nil {
+		// Evaluate vector filters before taking the index read lock. Some filters,
+		// especially numeric ranges, may need a short write lock to refresh sorted
+		// columns. Holding RLock here would deadlock those filters. Clone the bitmap
+		// so ANN traversal sees a stable filter even if a writer arrives afterward.
+		allowed = q.Filter.eval(ix)
+		if allowed != nil {
+			allowed = allowed.Clone()
+		}
+	}
 	ix.mu.RLock()
 	defer ix.mu.RUnlock()
 	ann := ix.anns[q.Field]
 	if ann != nil {
-		var allowed *Bitmap
-		if q.Filter != nil {
-			// Common production path: tenant/status filters are term bitmaps and are
-			// shared immutable posting views, so this does not allocate.
-			allowed = q.Filter.eval(ix)
-		}
 		before := len(dst)
-		dst = ann.Search(q.Vector, k, allowed, ix, dst, req.Limit)
+		dst = ann.Search(q.Vector, k, q.Metric, q.EFSearch, q.Oversample, q.Exact, allowed, ix, dst, req.Limit)
 		return Result{Total: len(dst) - before, Hits: dst, Took: ix.elapsed(start)}, dst
 	}
 	if k > 64 {
@@ -715,7 +720,7 @@ func (ix *Index) searchVectorIntoFast(q VectorQuery, req SearchRequest, dst []Hi
 			continue
 		}
 		var sc float64
-		switch q.Metric {
+		switch normalizeVectorMetric(q.Metric) {
 		case "l2":
 			sc = l2(q.Vector, v)
 		case "dot":

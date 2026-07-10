@@ -35,12 +35,17 @@ type FieldOptions struct {
 	// MinPrefix/MaxPrefix bound prefix-index expansion. For large keyword
 	// fields, use MinPrefix=3 to avoid huge low-selectivity prefixes like
 	// "9" and "99". MaxPrefix<=0 means full length.
-	MinPrefix int       `json:"min_prefix,omitempty"`
-	MaxPrefix int       `json:"max_prefix,omitempty"`
-	TTLField  bool      `json:"ttl_field"`
-	Analyzer  string    `json:"analyzer,omitempty"`
-	Boost     float64   `json:"boost,omitempty"`
-	Dim       int       `json:"dim,omitempty"`
+	MinPrefix int     `json:"min_prefix,omitempty"`
+	MaxPrefix int     `json:"max_prefix,omitempty"`
+	TTLField  bool    `json:"ttl_field"`
+	Analyzer  string  `json:"analyzer,omitempty"`
+	Boost     float64 `json:"boost,omitempty"`
+	Dim       int     `json:"dim,omitempty"`
+	// Vector index tuning. Zero values use production-safe defaults.
+	VectorM              int    `json:"vector_m,omitempty"`
+	VectorEFConstruction int    `json:"vector_ef_construction,omitempty"`
+	VectorEFSearch       int    `json:"vector_ef_search,omitempty"`
+	VectorMetric         string `json:"vector_metric,omitempty"` // cosine, dot, l2
 }
 
 type Schema struct {
@@ -83,6 +88,19 @@ type Config struct {
 	AuditPath      string        `json:"audit_path,omitempty"`
 	SlowQueryNanos int64         `json:"slow_query_nanos,omitempty"`
 	RateLimitQPS   int           `json:"rate_limit_qps,omitempty"`
+	// WALSyncEveryWrite fsyncs the WAL after every mutation. It is slower but
+	// provides the strongest single-node durability guarantee for financial or
+	// critical workloads. Leave false for high-throughput ingestion and call Flush
+	// or SaveSnapshot at controlled boundaries.
+	WALSyncEveryWrite bool `json:"wal_sync_every_write,omitempty"`
+	// StrictRecovery makes WAL replay fail on malformed/corrupt records instead
+	// of skipping them. Enable it for production recovery validation.
+	StrictRecovery bool `json:"strict_recovery,omitempty"`
+	// MaxRequestBytes limits JSON request bodies served by Server. Zero uses a
+	// conservative default.
+	MaxRequestBytes int64 `json:"max_request_bytes,omitempty"`
+	// MaxSearchLimit caps API search limits. Zero uses a conservative default.
+	MaxSearchLimit int `json:"max_search_limit,omitempty"`
 	// DisableSource skips storing/cloning original documents. It is the fastest/lowest-memory mode
 	// for pure lookup/search indexes where callers only need IDs and indexed columns.
 	DisableSource bool `json:"disable_source,omitempty"`
@@ -97,21 +115,23 @@ type Config struct {
 }
 
 type Stats struct {
-	Docs        int   `json:"docs"`
-	LiveDocs    int   `json:"live_docs"`
-	DeletedDocs int   `json:"deleted_docs"`
-	Fields      int   `json:"fields"`
-	Terms       int   `json:"terms"`
-	Prefixes    int   `json:"prefixes"`
-	Suffixes    int   `json:"suffixes"`
-	Ngrams      int   `json:"ngrams"`
-	NumericCols int   `json:"numeric_cols"`
-	StringCols  int   `json:"string_cols"`
-	WALBytes    int64 `json:"wal_bytes"`
-	Snapshots   int   `json:"snapshots"`
-	Vectors     int   `json:"vectors"`
-	Segments    int   `json:"segments"`
-	Shards      int   `json:"shards"`
+	Docs             int   `json:"docs"`
+	LiveDocs         int   `json:"live_docs"`
+	DeletedDocs      int   `json:"deleted_docs"`
+	Fields           int   `json:"fields"`
+	Terms            int   `json:"terms"`
+	Prefixes         int   `json:"prefixes"`
+	Suffixes         int   `json:"suffixes"`
+	Ngrams           int   `json:"ngrams"`
+	NumericCols      int   `json:"numeric_cols"`
+	StringCols       int   `json:"string_cols"`
+	WALBytes         int64 `json:"wal_bytes"`
+	Snapshots        int   `json:"snapshots"`
+	Vectors          int   `json:"vectors"`
+	VectorNodes      int   `json:"vector_nodes"`
+	VectorTombstones int   `json:"vector_tombstones"`
+	Segments         int   `json:"segments"`
+	Shards           int   `json:"shards"`
 }
 
 type Hit struct {

@@ -649,18 +649,21 @@ func (ix *Index) restorePersistentDump(d *persistentDump) error {
 	ix.anns = map[string]*VectorANN{}
 	for k, v := range d.Vectors {
 		m := map[DocID][]float64{}
-		dim := 0
-		for a, b := range v {
-			if dim == 0 {
-				dim = len(b)
+		opt := ix.cfg.Schema.Fields[k]
+		if opt.Dim == 0 {
+			for _, b := range v {
+				opt.Dim = len(b)
+				break
 			}
+		}
+		ann := newVectorANNWithOptions(opt, len(v))
+		for a, b := range v {
 			m[a] = append([]float64(nil), b...)
+			if !ix.isDeletedOrExpiredLocked(a) {
+				ann.Add(a, b)
+			}
 		}
 		ix.vectors[k] = m
-		ann := newVectorANN(dim, "dot", len(m))
-		for id, vec := range m {
-			ann.Add(id, vec)
-		}
 		ix.anns[k] = ann
 	}
 	ex := extras(ix)

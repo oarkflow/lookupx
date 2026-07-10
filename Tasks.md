@@ -674,3 +674,46 @@ The architecture now supports 1B-row operation by routing data into many persist
 - [x] Updated the benchmark generator so arbitrary field names produce matching query manifests without hidden field-name assumptions.
 - [x] Verified `go test ./...` passes after cleanup.
 - [x] Verified generic benchmark generation and LookupX benchmark run with arbitrary field names.
+
+## Vector search hardening
+
+- [x] Concurrent ANN readers with pooled per-query workspaces
+- [x] Correct cosine, dot-product, and L2 metric handling
+- [x] Per-field M, EF construction, EF search, and metric configuration
+- [x] Per-query EF search, oversampling, and exact-search controls
+- [x] Filter-aware candidate expansion
+- [x] Dimension validation and duplicate-node-safe vector replacement
+- [x] HTTP query support for vector tuning controls
+- [x] Metric correctness and exact-search regression tests
+
+## Complete vector search example and reliability pass
+
+- [x] Added `examples/vector_search` as the full production-style vector search lifecycle demo.
+- [x] Added generated product workload with deterministic local embeddings and no external model dependency.
+- [x] Demonstrated batch vector indexing, ANN search, exact search, filtered vector search, hybrid text/range/vector retrieval, metric overrides, update/delete, snapshot reload, and concurrent query latency.
+- [x] Added ready-to-run generated HTTP query JSON files from the example.
+- [x] Added `examples/vector_search/config.bcl` documenting the equivalent BCL-style vector index configuration.
+- [x] Preserved vector `filter` in the HTTP wire query parser.
+- [x] Fixed vector filtered search deadlock when filters require numeric range sorting.
+- [x] Added reliable filtered-vector fallback over the allowed bitmap when a selective filter removes all ANN candidates.
+- [x] Replaced O(N) vector graph insertion with EFConstruction-bounded graph insertion for scalable batch indexing.
+- [x] Added regression tests for HTTP vector filters and range-filtered vector search.
+
+## Production hardening gap-closure pass
+
+- [x] Added strict vector mutation preflight: bad dimensions, empty vectors, non-numeric vectors, NaN and Inf are rejected before the index is mutated.
+- [x] Added `Compact()` / `RebuildVectorIndexes()` to rebuild vector ANN graphs from live documents and remove stale vector nodes after update/delete churn.
+- [x] Added `POST /compact` HTTP endpoint for operational vector compaction.
+- [x] Added vector-node and vector-tombstone stats/metrics to expose stale graph pressure.
+- [x] Added `WALSyncEveryWrite` for fsync-on-mutation durability when stronger single-node guarantees are required.
+- [x] Added WAL sequence and CRC checksums for newly appended WAL records.
+- [x] Added `StrictRecovery` so corrupt/malformed WAL records fail recovery instead of being silently skipped.
+- [x] Changed `Open` to surface snapshot/WAL recovery failures instead of swallowing them.
+- [x] Added atomic snapshot file fsync + directory sync before publishing the snapshot path.
+- [x] Upgraded snapshots to include the internal persistent dump as well as source documents, so snapshot/reload preserves low-level postings, numeric columns, vectors, and ANN rebuild inputs.
+- [x] Fixed persistent vector restore to retain each field's configured metric/M/EF tuning instead of restoring all vector graphs as dot-product indexes.
+- [x] Added constant-time API key comparison in the HTTP server.
+- [x] Added JSON error responses, body-size limiting, API search-limit capping, request error counter, latency buckets, vector metrics, and compact endpoint to the HTTP server.
+- [x] Added tests for vector dimension mutation safety, vector graph compaction, strict WAL corruption detection, and HTTP vector validation/compaction.
+- [x] Verified `go test ./...`, `go vet ./...`, and `go test -race ./pkg` with the local Go toolchain.
+

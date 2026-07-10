@@ -1263,3 +1263,104 @@ make benchdata ROWS=100000 FIELDS=field_a,field_b,field_c
 make bench-lookupx ROWS=100000 LOOPS=1000 FIELDS=field_a,field_b,field_c
 make bench-lucene ROWS=100000 LOOPS=1000 FIELDS=field_a,field_b,field_c
 ```
+
+## High-performance vector search
+
+Vector fields provide concurrent approximate-nearest-neighbor search with cosine, dot-product, and L2 scoring, optional bitmap pre-filtering, per-query recall tuning, and an exact mode for deterministic 100% recall.
+
+```go
+"embedding": {
+    Kind: lookup.FieldVector, Dim: 768,
+    VectorMetric: "cosine",
+    VectorM: 16, VectorEFConstruction: 128, VectorEFSearch: 64,
+}
+
+q := lookup.VectorQuery{
+    Field: "embedding", Vector: embedding, K: 20,
+    Metric: "cosine", EFSearch: 96, Oversample: 6,
+    Filter: lookup.Term{Field: "tenant", Value: "orgware"},
+}
+```
+
+Use `Exact: true` for validation, small collections, compliance-sensitive ranking, or recall measurement. Higher `EFSearch` and `Oversample` improve recall at the cost of latency. Vector updates replace the existing node payload instead of creating duplicate graph nodes, and vectors with incorrect dimensions are rejected.
+
+### Complete vector search example
+
+A full production-style vector search demo is available at `examples/vector_search`:
+
+```bash
+go run ./examples/vector_search
+# larger generated workload
+go run ./examples/vector_search -n 100000
+# start HTTP API and write ready-to-run query JSON files
+go run ./examples/vector_search -n 100000 -serve -addr :8090
+```
+
+The example covers batch indexing, filtered ANN, exact recall checks, hybrid text/range/vector filtering, metric overrides, live vector update/delete, snapshot reload, concurrent reader latency, generated HTTP query payloads, and BCL-style configuration.
+
+Vector HTTP filters are now preserved by the wire query parser, so payloads such as this apply tenant/status ACL filters during vector retrieval:
+
+```json
+{
+  "type": "vector",
+  "field": "embedding",
+  "vector": [0.1, 0.2, 0.3],
+  "k": 80,
+  "limit": 10,
+  "metric": "cosine",
+  "ef_search": 128,
+  "oversample": 8,
+  "filter": [
+    {"type": "term", "field": "tenant", "value": "orgware"},
+    {"type": "term", "field": "status", "value": "active"}
+  ]
+}
+```
+
+## Production hardening gap-closure pass
+
+This build includes an additional production-hardening pass focused on the gaps identified during review:
+
+- vector mutation preflight rejects empty, malformed, non-finite, and wrong-dimension vectors before any document mutation;
+- `Compact()` / `RebuildVectorIndexes()` rebuild ANN graphs from live vectors and remove stale nodes after heavy update/delete churn;
+- `/compact` exposes that maintenance operation through the HTTP API;
+- `Stats` and `/metrics` now expose live vector count, ANN node count, and vector tombstone pressure;
+- WAL records now include sequence numbers and CRC checksums for newly appended mutations;
+- `StrictRecovery` fails startup/replay on malformed or corrupt WAL entries;
+- `WALSyncEveryWrite` provides fsync-on-mutation durability for critical single-node workloads;
+- `Open` now returns snapshot/WAL recovery errors instead of silently ignoring them;
+- snapshots now include a low-level persistent dump plus source documents, preserving postings, numeric columns, vectors, and restore-time ANN rebuild inputs;
+- persistent vector restore keeps the field's configured metric and HNSW/ANN tuning;
+- HTTP authentication uses constant-time API key comparison;
+- HTTP JSON endpoints use request-body limits, structured error responses, limit capping, error counters, latency buckets, and vector metrics.
+
+Example production-oriented config fields:
+
+```go
+cfg := lookup.Config{
+    EnableWAL: true,
+    WALPath: "./data/index.wal",
+    SnapshotPath: "./data/index.snapshot",
+    WALSyncEveryWrite: true,   // strongest durability, slower ingestion
+    StrictRecovery: true,      // fail on corrupt WAL during replay
+    MaxRequestBytes: 8 << 20,  // HTTP JSON body cap
+    MaxSearchLimit: 500,       // API result cap
+    APIKeys: []string{"replace-with-secret"},
+    Schema: schema,
+}
+```
+
+Operational maintenance:
+
+```go
+_ = ix.Flush()          // fsync WAL
+_ = ix.SaveSnapshot(p)  // atomic snapshot + fsync
+_ = ix.Compact()        // rebuild vector graphs from live vectors
+```
+
+HTTP maintenance:
+
+```bash
+curl -X POST http://localhost:8090/compact -H 'X-API-Key: replace-with-secret'
+curl http://localhost:8090/metrics -H 'X-API-Key: replace-with-secret'
+```

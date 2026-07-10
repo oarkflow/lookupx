@@ -44,6 +44,14 @@ func (ix *Index) UpsertFast(id string, fn func(*RowWriter)) error {
 	did := ix.reserveDocLocked(id)
 	w := RowWriter{ix: ix, did: did}
 	fn(&w)
+	if w.err != nil {
+		ix.deleted.Add(did)
+		ix.live.Remove(did)
+		ix.hasDeletes = true
+		if !ix.cfg.AppendOnly && ix.extToDoc[id] == did {
+			delete(ix.extToDoc, id)
+		}
+	}
 	return w.err
 }
 
@@ -428,8 +436,22 @@ func (ix *Index) VectorField(name string) VectorField {
 }
 
 func (w *RowWriter) VectorH(h VectorField, value []float64) {
-	if w.err != nil || h.sf == nil || len(value) == 0 {
+	if w.err != nil || h.sf == nil {
 		return
+	}
+	if len(value) == 0 {
+		w.err = errors.New("vector value must not be empty")
+		return
+	}
+	if h.sf.opt.Dim > 0 && len(value) != h.sf.opt.Dim {
+		w.err = errors.New("vector dimension mismatch")
+		return
+	}
+	for _, x := range value {
+		if x != x {
+			w.err = errors.New("vector contains NaN")
+			return
+		}
 	}
 	h.sf.fi.exists.Add(w.did)
 	w.ix.addVectorLocked(h.name, w.did, value)
@@ -448,7 +470,7 @@ func (ix *Index) addVectorLocked(field string, did DocID, vec []float64) {
 				dim = d
 			}
 		}
-		ann = newVectorANN(dim, "dot", ix.cfg.InitialCapacity)
+		ann = newVectorANNWithOptions(FieldOptions{Dim: dim}, ix.cfg.InitialCapacity)
 		ix.anns[field] = ann
 	}
 	ann.Add(did, vec)

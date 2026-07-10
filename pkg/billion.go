@@ -241,22 +241,22 @@ func (b MemoryBudget) RecommendedPartitions(rows int64) int {
 
 type PartitionScheme struct {
 	IndexID         string `json:"index_id"`
-	GroupModulo  int    `json:"group_modulo,omitempty"`
+	GroupModulo     int    `json:"group_modulo,omitempty"`
 	MonthPartitions bool   `json:"month_partitions"`
-	PartitionModulo  int    `json:"partition_modulo,omitempty"`
+	PartitionModulo int    `json:"partition_modulo,omitempty"`
 	MaxRowsHint     int64  `json:"max_rows_hint,omitempty"`
 }
 
 type PartitionManifest struct {
-	IndexID     string    `json:"index_id"`
-	PartitionID string    `json:"partition_id"`
-	GroupID  uint32    `json:"group_id,omitempty"`
-	DateKeyMonth    string    `json:"date_key_month,omitempty"`
+	IndexID        string    `json:"index_id"`
+	PartitionID    string    `json:"partition_id"`
+	GroupID        uint32    `json:"group_id,omitempty"`
+	DateKeyMonth   string    `json:"date_key_month,omitempty"`
 	PartitionValue uint32    `json:"partition_value,omitempty"`
-	Rows        uint64    `json:"rows"`
-	Generation  uint64    `json:"generation,omitempty"`
-	Path        string    `json:"path,omitempty"`
-	CreatedAt   time.Time `json:"created_at"`
+	Rows           uint64    `json:"rows"`
+	Generation     uint64    `json:"generation,omitempty"`
+	Path           string    `json:"path,omitempty"`
+	CreatedAt      time.Time `json:"created_at"`
 }
 
 func (s PartitionScheme) TuplePartition(term string, groupID uint32, date_key string, partitionID uint32) string {

@@ -816,10 +816,10 @@ func (c *csvCursor) Close() error { return nil }
 func TupleLookupSchema() Schema {
 	return Schema{Fields: map[string]FieldOptions{
 		"term":         {Kind: FieldKeyword, Lookup: true, Lowercase: true, Prefix: true},
-		"group_id": {Kind: FieldKeyword, Lookup: true},
-		"date_key":          {Kind: FieldKeyword, Lookup: true},
-		"partition_id":  {Kind: FieldKeyword, Lookup: true},
-		"entity_id":   {Kind: FieldKeyword, Lookup: true},
+		"group_id":     {Kind: FieldKeyword, Lookup: true},
+		"date_key":     {Kind: FieldKeyword, Lookup: true},
+		"partition_id": {Kind: FieldKeyword, Lookup: true},
+		"entity_id":    {Kind: FieldKeyword, Lookup: true},
 	}}
 }
 
