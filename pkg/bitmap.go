@@ -44,7 +44,14 @@ func (b *Bitmap) Reset() {
 func (b *Bitmap) ensure(id DocID) {
 	idx := int(id >> 6)
 	if idx >= len(b.words) {
-		nw := make([]uint64, idx+1)
+		newLen := len(b.words) * 2
+		if newLen < idx+1 {
+			newLen = idx + 1
+		}
+		if newLen < 64 {
+			newLen = 64
+		}
+		nw := make([]uint64, newLen)
 		copy(nw, b.words)
 		b.words = nw
 	}
