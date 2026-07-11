@@ -22,8 +22,8 @@ import (
 	"os"
 	"time"
 
-	"github.com/oarkflow/squealx/drivers/mysql"
 	lookup "github.com/oarkflow/lookupx/pkg"
+	"github.com/oarkflow/squealx/drivers/mysql"
 )
 
 const chargeMasterPageQuery = `
@@ -74,52 +74,24 @@ func main() {
 	rawDB.SetMaxIdleConns(1)
 	rawDB.SetConnMaxLifetime(10 * time.Minute)
 
-	ix, err := lookup.New(lookup.Config{
+	// AutoPagedSQLQuery samples the first page of chargeMasterPageQuery to
+	// detect each column's type (text vs keyword vs number vs date) from
+	// driver column metadata and sampled values, builds the index schema from
+	// that, and resolves the SQLColumn bindings — no manual Schema.Fields map,
+	// ix.FieldID() calls, or Columns slice required.
+	page := func(lastSeq uint64, limit int) (string, []any) {
+		return chargeMasterPageQuery, []any{lastSeq, limit}
+	}
+	ix, src, err := lookup.AutoPagedSQLQuery(context.Background(), lookup.Config{
 		InitialCapacity: 1_600_000,
 		DisableSource:   true,
 		AppendOnly:      true,
 		Clock:           lookup.SystemClock{},
-		Schema: lookup.Schema{Fields: map[string]lookup.FieldOptions{
-			"ld": {Kind: lookup.FieldText, Indexed: true, Lowercase: true},
-			"cpt_code":           {Kind: lookup.FieldKeyword, Lookup: true, Prefix: true, MinPrefix: 3, MaxPrefix: 5, Lowercase: true},
-			"effective_date":     {Kind: lookup.FieldKeyword, Lookup: true},
-			"end_effective_date": {Kind: lookup.FieldKeyword, Lookup: true},
-			"work_item":          {Kind: lookup.FieldKeyword, Lookup: true, Lowercase: true},
-			"patient_status":     {Kind: lookup.FieldKeyword, Lookup: true, Lowercase: true},
-			"charge_type":        {Kind: lookup.FieldKeyword, Lookup: true, Lowercase: true},
-		}},
-	})
+	}, db.DB(), page, "id", "id", 100_000)
 	if err != nil {
 		log.Fatal(err)
 	}
 	defer ix.Close()
-
-	ld := ix.FieldID("ld")
-	cptCode := ix.FieldID("cpt_code")
-	effectiveDate := ix.FieldID("effective_date")
-	endEffectiveDate := ix.FieldID("end_effective_date")
-	workItem := ix.FieldID("work_item")
-	patientStatus := ix.FieldID("patient_status")
-	chargeType := ix.FieldID("charge_type")
-
-	src := lookup.PagedSQLQuerySource{
-		DB:       db.DB(),
-		PageSize: 100_000,
-		Page: func(lastSeq uint64, limit int) (string, []any) {
-			return chargeMasterPageQuery, []any{lastSeq, limit}
-		},
-		IDColumn:  "id",
-		SeqColumn: "id",
-		Columns: []lookup.SQLColumn{
-			{Column: "ld", Field: ld, Kind: lookup.ValueText},
-			{Column: "cpt_code", Field: cptCode, Kind: lookup.ValueKeyword},
-			{Column: "effective_date", Field: effectiveDate, Kind: lookup.ValueKeyword},
-			{Column: "end_effective_date", Field: endEffectiveDate, Kind: lookup.ValueKeyword},
-			{Column: "work_item", Field: workItem, Kind: lookup.ValueKeyword},
-			{Column: "patient_status", Field: patientStatus, Kind: lookup.ValueKeyword},
-			{Column: "charge_type", Field: chargeType, Kind: lookup.ValueKeyword},
-		},
-	}
 
 	start := time.Now()
 	stats, err := ix.IndexFrom(context.Background(), src, lookup.BulkOptions{

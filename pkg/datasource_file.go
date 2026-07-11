@@ -230,11 +230,13 @@ func parseJSONLBindings(config map[string]any) ([]JSONBinding, error) {
 		}
 		kind := ConfigStringOr(m, "kind", "keyword")
 		normalized, _ := ConfigBool(m, "normalized")
+		layout := ConfigStringOr(m, "layout", "")
 		out = append(out, JSONBinding{
 			FieldName:  fieldName,
 			Field:      FieldID(0), // resolved later
 			Kind:       parseValueKind(kind),
 			Normalized: normalized,
+			Layout:     layout,
 		})
 	}
 	return out, nil

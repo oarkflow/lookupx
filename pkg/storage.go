@@ -643,6 +643,7 @@ type JSONBinding struct {
 	Field      FieldID
 	Kind       ValueKind
 	Normalized bool
+	Layout     string // optional time layout for ValueTimeUnix; defaults to RFC3339Nano
 }
 
 func (s JSONLSource) Open(ctx context.Context) (Cursor, error) {
@@ -692,6 +693,19 @@ func (c *jsonlCursor) Next(ctx context.Context, dst *SourceRecord) bool {
 				if f, err := strconv.ParseFloat(x, 64); err == nil {
 					dst.AddNumber(b.Field, f)
 				}
+			}
+		case ValueTimeUnix:
+			switch x := v.(type) {
+			case string:
+				layout := b.Layout
+				if layout == "" {
+					layout = time.RFC3339Nano
+				}
+				if t, err := time.Parse(layout, x); err == nil {
+					dst.AddUnixTime(b.Field, t.Unix())
+				}
+			case float64:
+				dst.AddUnixTime(b.Field, int64(x))
 			}
 		}
 	}
