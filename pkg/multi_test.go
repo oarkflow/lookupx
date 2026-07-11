@@ -134,7 +134,7 @@ func TestLookupFiltersDatasourceTextAndNumericFields(t *testing.T) {
 
 func TestLookupDatasourceOperators(t *testing.T) {
 	ix, err := New(Config{Schema: Schema{Fields: map[string]FieldOptions{
-		"name":   {Kind: FieldKeyword, Indexed: true, Stored: true, Lowercase: true, Prefix: true, Suffix: true, Ngram: true, Fuzzy: true, MinGram: 3, MaxGram: 3},
+		"name":   {Kind: FieldKeyword, Indexed: true, Stored: true, Lowercase: true},
 		"amount": {Kind: FieldFloat, Indexed: true, Stored: true, Sortable: true},
 	}}})
 	if err != nil {
@@ -156,6 +156,7 @@ func TestLookupDatasourceOperators(t *testing.T) {
 		{"name__eq=Alpha+service", 1}, {"name__ne=Alpha+service", 3},
 		{"name__contains=service", 2}, {"name__not_contains=service", 2},
 		{"name__starts_with=beta", 1}, {"name__ends_with=plan", 1},
+		{"name__fuzzy=Gamma+plam", 1},
 		{"name__in=Alpha+service%2CGamma+plan", 2}, {"name__not_in=Alpha+service%2CGamma+plan", 2},
 		{"name__exists=", 3}, {"name__missing=", 1},
 		{"amount__not_zero=", 2}, {"amount__gt=37", 1}, {"amount__gte=37", 2},

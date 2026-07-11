@@ -1,6 +1,7 @@
 package pkg
 
 import (
+	"fmt"
 	"sort"
 	"strconv"
 	"strings"
@@ -44,6 +45,46 @@ func (q Suffix) eval(ix *Index) *Bitmap { return ix.suffixBitmap(q.Field, q.Valu
 type Contains struct{ Field, Value string }
 
 func (q Contains) eval(ix *Index) *Bitmap { return ix.ngramBitmap(q.Field, q.Value) }
+
+type sourceStringFilter struct {
+	Field, Value, Operator string
+}
+
+func (q sourceStringFilter) eval(ix *Index) *Bitmap {
+	ix.mu.RLock()
+	defer ix.mu.RUnlock()
+	opt, ok := ix.cfg.Schema.Fields[q.Field]
+	if !ok || ix.cfg.DisableSource {
+		return NewBitmap()
+	}
+	want := normalize(q.Value, opt.Lowercase)
+	out := NewBitmapCap(ix.nextDocID)
+	for id := DocID(1); id < ix.nextDocID; id++ {
+		if ix.isDeletedOrExpiredLocked(id) || int(id) >= len(ix.docs) || ix.docs[id] == nil {
+			continue
+		}
+		raw, exists := ix.docs[id][q.Field]
+		if !exists || raw == nil {
+			continue
+		}
+		got := normalize(fmt.Sprint(raw), opt.Lowercase)
+		match := false
+		switch q.Operator {
+		case "contains":
+			match = strings.Contains(got, want)
+		case "starts_with":
+			match = strings.HasPrefix(got, want)
+		case "ends_with":
+			match = strings.HasSuffix(got, want)
+		case "fuzzy":
+			match = levenshtein(got, want, 1) <= 1
+		}
+		if match {
+			out.Add(id)
+		}
+	}
+	return out
+}
 
 type Fuzzy struct {
 	Field, Value string

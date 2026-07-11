@@ -218,8 +218,8 @@ const App = (() => {
 
     // One column per field actually present across the returned docs, in
     // first-seen order, so the table shows real data instead of a raw blob.
-    const fieldOrder = [];
-    const seen = new Set();
+    const fieldOrder = Object.keys(searchSchema).filter(name => name !== 'id');
+    const seen = new Set(fieldOrder);
     let anyDoc = false;
     for (const h of hits) {
       if (!h.doc) continue;

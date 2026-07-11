@@ -370,13 +370,7 @@ func (ix *Index) indexSourceBatch(batch []SourceRecord, skipBad bool) (indexed, 
 // this, with_docs search/lookup would silently return nothing for any
 // bulk-ingested record even though the fields are indexed and searchable.
 func (ix *Index) sourceRecordDoc(rec *SourceRecord) Document {
-	doc := make(Document, len(ix.fieldList)+1)
-	doc["id"] = rec.ID
-	// Keep a stable result shape even when a datasource row contains NULL or
-	// empty values. The schema represents every inferred source column.
-	for i := range ix.fieldList {
-		doc[ix.fieldList[i].name] = nil
-	}
+	doc := make(Document, len(ix.fieldList))
 	for i := range rec.Values {
 		v := &rec.Values[i]
 		if int(v.Field) >= len(ix.fieldList) {
@@ -394,6 +388,14 @@ func (ix *Index) sourceRecordDoc(rec *SourceRecord) Document {
 			doc[name] = v.Number
 		case ValueVector:
 			doc[name] = v.Vector
+		}
+	}
+	// Preserve the SELECT shape without overwriting populated values. Sparse
+	// NULL columns cost one write; non-NULL columns are written only once.
+	for i := range ix.fieldList {
+		name := ix.fieldList[i].name
+		if _, exists := doc[name]; !exists {
+			doc[name] = nil
 		}
 	}
 	return doc
@@ -1043,25 +1045,29 @@ func compileDatasourceFilter(field, op, value string, opt FieldOptions) (Query, 
 		var q Query
 		switch op {
 		case "contains", "not_contains":
-			if !opt.Ngram {
-				return nil, fmt.Errorf("contains is not enabled for field %q; reload the datasource to rebuild its schema", field)
+			if opt.Ngram {
+				q = Contains{Field: field, Value: value}
+			} else {
+				q = sourceStringFilter{Field: field, Value: value, Operator: "contains"}
 			}
-			q = Contains{Field: field, Value: value}
 		case "starts_with":
-			if !opt.Prefix {
-				return nil, fmt.Errorf("starts_with is not enabled for field %q; reload the datasource to rebuild its schema", field)
+			if opt.Prefix {
+				q = Prefix{Field: field, Value: value}
+			} else {
+				q = sourceStringFilter{Field: field, Value: value, Operator: op}
 			}
-			q = Prefix{Field: field, Value: value}
 		case "ends_with":
-			if !opt.Suffix {
-				return nil, fmt.Errorf("ends_with is not enabled for field %q; reload the datasource to rebuild its schema", field)
+			if opt.Suffix {
+				q = Suffix{Field: field, Value: value}
+			} else {
+				q = sourceStringFilter{Field: field, Value: value, Operator: op}
 			}
-			q = Suffix{Field: field, Value: value}
 		case "fuzzy":
-			if !opt.Fuzzy {
-				return nil, fmt.Errorf("fuzzy is not enabled for field %q; reload the datasource to rebuild its schema", field)
+			if opt.Fuzzy {
+				q = Fuzzy{Field: field, Value: value, Distance: 1}
+			} else {
+				q = sourceStringFilter{Field: field, Value: value, Operator: op}
 			}
-			q = Fuzzy{Field: field, Value: value, Distance: 1}
 		}
 		if op == "not_contains" {
 			return Not{Q: q}, nil

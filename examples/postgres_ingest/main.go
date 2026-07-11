@@ -108,7 +108,7 @@ func main() {
 	}
 	fmt.Printf("indexed=%d skipped=%d in %s stats=%+v\n", stats.Indexed, stats.Skipped, time.Since(start), ix.Stats())
 
-	_, hits := ix.SearchInto(lookup.SearchRequest{Query: lookup.Term{Field: "cpt_code", Value: "99213"}, Limit: 20, WithDocs: true}, nil)
+	_, hits := ix.SearchInto(lookup.SearchRequest{Query: lookup.Term{Field: "cpt_code", Value: "99213"}, Limit: 20}, nil)
 	fmt.Println("cpt_code=99213 hits:", len(hits))
 
 	_, hits = ix.SearchInto(lookup.SearchRequest{Query: lookup.Bool{Must: []lookup.Query{lookup.Simple("ld", "office visit")}, Filter: []lookup.Query{lookup.Term{Field: "charge_type", Value: "professional"}}}, Limit: 20}, nil)
