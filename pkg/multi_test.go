@@ -3,9 +3,11 @@ package pkg
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -65,7 +67,7 @@ func TestHTTPReloadPersistsForServerRestart(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	server := &MultiServer{Manager: mgr, DataDir: root}
+	server := &MultiServer{Manager: mgr, DataDir: root, Storage: "disk"}
 	req := httptest.NewRequest(http.MethodPost, "/v1/indexes/products/reload", nil)
 	res := httptest.NewRecorder()
 	server.ServeHTTP(res, req)
@@ -88,6 +90,31 @@ func TestHTTPReloadPersistsForServerRestart(t *testing.T) {
 	_, hits := ix.SearchInto(SearchRequest{Query: q, Limit: 1, WithDocs: true}, nil)
 	if len(hits) != 1 || hits[0].Doc["sku"] != "SKU-1" {
 		t.Fatalf("restored hits=%#v", hits)
+	}
+}
+
+func TestHTTPReloadDefaultsToMemoryWithoutPersistence(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "indexes")
+	mgr := NewMultiIndexManager()
+	_, err := mgr.Register(IndexDefinition{
+		ID: "products",
+		Config: Config{Schema: Schema{Fields: map[string]FieldOptions{
+			"sku": {Kind: FieldKeyword, Indexed: true, Lookup: true},
+		}}},
+		Source: func(ix *Index) (Source, error) {
+			return SliceSource{Records: []SourceRecord{{ID: "p-1", Values: []SourceValue{{Field: ix.FieldID("sku"), Kind: ValueKeyword, String: "SKU-1"}}}}}, nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	res := httptest.NewRecorder()
+	(&MultiServer{Manager: mgr, DataDir: root}).ServeHTTP(res, httptest.NewRequest(http.MethodPost, "/v1/indexes/products/reload", nil))
+	if res.Code != http.StatusOK {
+		t.Fatalf("reload status=%d body=%s", res.Code, res.Body.String())
+	}
+	if _, err := os.Stat(root); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("memory reload unexpectedly wrote persistence directory: %v", err)
 	}
 }
 

@@ -100,18 +100,25 @@ func serveCmd(args []string) {
 	apiKey := fs.String("api-key", getenv("LOOKUPX_API_KEY", ""), "optional API key")
 	webDir := fs.String("web", getenv("LOOKUPX_WEB_DIR", ""), "directory for static web frontend files")
 	dataDir := fs.String("data", getenv("LOOKUPX_DATA_DIR", "./data/indexes"), "persistent index directory")
+	storage := fs.String("storage", getenv("LOOKUPX_STORAGE", "memory"), "index storage: memory or disk")
 	_ = fs.Parse(args)
+	*storage = strings.ToLower(strings.TrimSpace(*storage))
+	if *storage != "memory" && *storage != "disk" {
+		log.Fatal("-storage must be memory or disk")
+	}
 
 	mgr := lookup.NewMultiIndexManager()
-	if err := mgr.RestorePersistent(context.Background(), lookup.FileSegmentStore{Root: *dataDir}); err != nil {
-		log.Fatalf("restore persistent indexes: %v", err)
+	if *storage == "disk" {
+		if err := mgr.RestorePersistent(context.Background(), lookup.FileSegmentStore{Root: *dataDir}); err != nil {
+			log.Fatalf("restore persistent indexes: %v", err)
+		}
 	}
 	keys := []string{}
 	if *apiKey != "" {
 		keys = append(keys, *apiKey)
 	}
-	log.Printf("lookupx server listening on %s", *addr)
-	log.Fatal(http.ListenAndServe(*addr, &lookup.MultiServer{Manager: mgr, APIKeys: keys, WebDir: *webDir, DataDir: *dataDir}))
+	log.Printf("lookupx server listening on %s (storage=%s)", *addr, *storage)
+	log.Fatal(http.ListenAndServe(*addr, &lookup.MultiServer{Manager: mgr, APIKeys: keys, WebDir: *webDir, DataDir: *dataDir, Storage: *storage}))
 }
 
 func demoCmd(args []string) {

@@ -26,6 +26,21 @@ import (
 	"github.com/oarkflow/squealx/drivers/mysql"
 )
 
+const chargeMasterPageQuery1 = `
+select tbl_charge_master.charge_master_uid AS id,
+       tbl_charge_master.client_proc_desc AS ld,
+       tbl_charge_master.cpt_hcpcs_code AS cpt_code,
+       tbl_charge_master.effective_date AS effective_date,
+       tbl_charge_master.end_effective_date AS end_effective_date,
+       tbl_charge_master.work_item_uid AS work_item,
+       tbl_charge_master.patient_status_uid AS patient_status,
+       tbl_charge_master.charge_type AS charge_type
+from tbl_charge_master
+where tbl_charge_master.cpt_hcpcs_code not in
+      ('99281', '99282', '99283', '99284', '99285', '99291')
+order by tbl_charge_master.charge_master_uid asc
+`
+
 const chargeMasterPageQuery = `
 select tbl_charge_master.charge_master_uid AS id,
        tbl_charge_master.client_proc_desc AS ld,
@@ -58,6 +73,8 @@ func buildDSN() string {
 	user := env("CM_MYSQL_USER", "service")
 	pass := env("CM_MYSQL_PASS", "")
 	dbName := env("CM_MYSQL_DB", "cleardb")
+
+	// service:@tcp(localhost:3306)/cleardb?charset=utf8mb4&timeout=10s&readTimeout=5m&writeTimeout=60s
 	return fmt.Sprintf("%s:%s@tcp(%s:%s)/%s?charset=utf8mb4&timeout=10s&readTimeout=5m&writeTimeout=60s",
 		user, pass, host, port, dbName)
 }

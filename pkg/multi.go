@@ -314,7 +314,26 @@ type MultiServer struct {
 	APIKeys  []string
 	WebDir   string // optional: directory to serve static frontend files
 	DataDir  string // persistent index root; defaults to LOOKUPX_DATA_DIR or data/indexes
+	Storage  string // "memory" (default) or "disk"; disk persists after reload
 	Requests uint64
+}
+
+func (s *MultiServer) diskStorageEnabled() bool {
+	return strings.EqualFold(strings.TrimSpace(s.Storage), "disk")
+}
+
+func (s *MultiServer) writeReloadResult(w http.ResponseWriter, ctx context.Context, id string, stats BulkStats) {
+	result := map[string]any{"ok": true, "stats": stats, "storage": "memory"}
+	if s.diskStorageEnabled() {
+		man, err := s.persistManagedIndex(ctx, id)
+		if err != nil {
+			http.Error(w, "indexed but persistence failed: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+		result["storage"] = "disk"
+		result["manifest"] = man
+	}
+	writeJSON(w, result)
 }
 
 func (s *MultiServer) persistentStore() FileSegmentStore {
@@ -507,36 +526,21 @@ func (s *MultiServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, err.Error(), 500)
 			return
 		}
-		man, err := s.persistManagedIndex(r.Context(), id)
-		if err != nil {
-			http.Error(w, "indexed but persistence failed: "+err.Error(), 500)
-			return
-		}
-		writeJSON(w, map[string]any{"ok": true, "stats": stats, "manifest": man})
+		s.writeReloadResult(w, r.Context(), id, stats)
 	case r.Method == http.MethodPost && action == "reload-sql":
 		stats, err := s.reloadSQL(r.Context(), id, r)
 		if err != nil {
 			http.Error(w, err.Error(), 500)
 			return
 		}
-		man, err := s.persistManagedIndex(r.Context(), id)
-		if err != nil {
-			http.Error(w, "indexed but persistence failed: "+err.Error(), 500)
-			return
-		}
-		writeJSON(w, map[string]any{"ok": true, "stats": stats, "manifest": man})
+		s.writeReloadResult(w, r.Context(), id, stats)
 	case r.Method == http.MethodPost && action == "reload-table":
 		stats, err := s.reloadTable(r.Context(), id, r)
 		if err != nil {
 			http.Error(w, err.Error(), 500)
 			return
 		}
-		man, err := s.persistManagedIndex(r.Context(), id)
-		if err != nil {
-			http.Error(w, "indexed but persistence failed: "+err.Error(), 500)
-			return
-		}
-		writeJSON(w, map[string]any{"ok": true, "stats": stats, "manifest": man})
+		s.writeReloadResult(w, r.Context(), id, stats)
 	case r.Method == http.MethodPost && action == "snapshot":
 		var body struct {
 			Path string `json:"path"`
