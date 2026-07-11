@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -34,6 +35,7 @@ type SourceValue struct {
 	String     string
 	Number     float64
 	Vector     []float64
+	Source     any // original datasource-facing value used in returned documents
 	Normalized bool
 }
 
@@ -351,12 +353,50 @@ func (ix *Index) indexSourceBatch(batch []SourceRecord, skipBad bool) (indexed, 
 			}
 			continue
 		}
+		if !ix.cfg.DisableSource {
+			ix.docs[did] = ix.sourceRecordDoc(rec)
+		}
 		ix.updateTupleCompositeFromSource(rec, did)
 		ix.updateGenericCompositesFromSource(rec, did)
 		indexed++
 		lastSeq = rec.Seq
 	}
 	return indexed, skipped, lastSeq, nil
+}
+
+// sourceRecordDoc reconstructs a best-effort Document from a SourceRecord's
+// typed values, keyed by schema field name. Bulk sources (SQL/CSV/JSONL/
+// slice) emit typed SourceValue cells rather than a Document map, so without
+// this, with_docs search/lookup would silently return nothing for any
+// bulk-ingested record even though the fields are indexed and searchable.
+func (ix *Index) sourceRecordDoc(rec *SourceRecord) Document {
+	doc := make(Document, len(ix.fieldList)+1)
+	doc["id"] = rec.ID
+	// Keep a stable result shape even when a datasource row contains NULL or
+	// empty values. The schema represents every inferred source column.
+	for i := range ix.fieldList {
+		doc[ix.fieldList[i].name] = nil
+	}
+	for i := range rec.Values {
+		v := &rec.Values[i]
+		if int(v.Field) >= len(ix.fieldList) {
+			continue
+		}
+		name := ix.fieldList[v.Field].name
+		if v.Source != nil {
+			doc[name] = v.Source
+			continue
+		}
+		switch v.Kind {
+		case ValueKeyword, ValueText:
+			doc[name] = v.String
+		case ValueNumber, ValueTimeUnix:
+			doc[name] = v.Number
+		case ValueVector:
+			doc[name] = v.Vector
+		}
+	}
+	return doc
 }
 
 func (ix *Index) indexSourceRecord(rec *SourceRecord) error {
@@ -386,6 +426,9 @@ func (ix *Index) indexSourceRecord(rec *SourceRecord) error {
 				ix.addVectorLocked(name, w.did, v.Vector)
 			}
 		}
+	}
+	if w.err == nil && !ix.cfg.DisableSource {
+		ix.docs[did] = ix.sourceRecordDoc(rec)
 	}
 	err := w.Commit()
 	if err == nil {
@@ -554,6 +597,7 @@ func (c *sqlCursor) Next(ctx context.Context, dst *SourceRecord) bool {
 		if !v.Valid || v.String == "" {
 			continue
 		}
+		before := len(dst.Values)
 		switch b.col.Kind {
 		case ValueKeyword:
 			dst.AddKeyword(b.col.Field, v.String, b.col.Normalized)
@@ -567,21 +611,15 @@ func (c *sqlCursor) Next(ctx context.Context, dst *SourceRecord) bool {
 			}
 			dst.AddNumber(b.col.Field, f)
 		case ValueTimeUnix:
-			if b.col.Layout != "" {
-				t, err := time.Parse(b.col.Layout, v.String)
-				if err != nil {
-					c.err = err
-					return false
-				}
-				dst.AddUnixTime(b.col.Field, t.Unix())
-			} else {
-				f, err := strconv.ParseFloat(v.String, 64)
-				if err != nil {
-					c.err = err
-					return false
-				}
-				dst.AddNumber(b.col.Field, f)
+			unix, err := parseSourceTime(v.String, b.col.Layout)
+			if err != nil {
+				c.err = fmt.Errorf("column %q: %w", b.col.Column, err)
+				return false
 			}
+			dst.AddUnixTime(b.col.Field, unix)
+		}
+		if len(dst.Values) > before {
+			dst.Values[len(dst.Values)-1].Source = v.String
 		}
 	}
 	return true
@@ -678,6 +716,7 @@ func (c *jsonlCursor) Next(ctx context.Context, dst *SourceRecord) bool {
 		if !ok || v == nil {
 			continue
 		}
+		before := len(dst.Values)
 		switch b.Kind {
 		case ValueKeyword:
 			dst.AddKeyword(b.Field, fmt.Sprint(v), b.Normalized)
@@ -697,16 +736,18 @@ func (c *jsonlCursor) Next(ctx context.Context, dst *SourceRecord) bool {
 		case ValueTimeUnix:
 			switch x := v.(type) {
 			case string:
-				layout := b.Layout
-				if layout == "" {
-					layout = time.RFC3339Nano
+				unix, err := parseSourceTime(x, b.Layout)
+				if err != nil {
+					c.err = fmt.Errorf("field %q: %w", b.FieldName, err)
+					return false
 				}
-				if t, err := time.Parse(layout, x); err == nil {
-					dst.AddUnixTime(b.Field, t.Unix())
-				}
+				dst.AddUnixTime(b.Field, unix)
 			case float64:
 				dst.AddUnixTime(b.Field, int64(x))
 			}
+		}
+		if len(dst.Values) > before {
+			dst.Values[len(dst.Values)-1].Source = v
 		}
 	}
 	return true
@@ -790,6 +831,7 @@ func (c *csvCursor) Next(ctx context.Context, dst *SourceRecord) bool {
 			continue
 		}
 		v := row[b.idx]
+		before := len(dst.Values)
 		switch b.b.Kind {
 		case ValueKeyword:
 			dst.AddKeyword(b.b.Field, v, b.b.Normalized)
@@ -803,27 +845,41 @@ func (c *csvCursor) Next(ctx context.Context, dst *SourceRecord) bool {
 			}
 			dst.AddNumber(b.b.Field, f)
 		case ValueTimeUnix:
-			if b.b.Layout != "" {
-				t, err := time.Parse(b.b.Layout, v)
-				if err != nil {
-					c.err = err
-					return false
-				}
-				dst.AddUnixTime(b.b.Field, t.Unix())
-			} else {
-				f, err := strconv.ParseFloat(v, 64)
-				if err != nil {
-					c.err = err
-					return false
-				}
-				dst.AddNumber(b.b.Field, f)
+			unix, err := parseSourceTime(v, b.b.Layout)
+			if err != nil {
+				c.err = fmt.Errorf("column %q: %w", b.b.Column, err)
+				return false
 			}
+			dst.AddUnixTime(b.b.Field, unix)
+		}
+		if len(dst.Values) > before {
+			dst.Values[len(dst.Values)-1].Source = v
 		}
 	}
 	return true
 }
 func (c *csvCursor) Err() error   { return c.err }
 func (c *csvCursor) Close() error { return nil }
+
+func parseSourceTime(value, layout string) (int64, error) {
+	value = strings.TrimSpace(value)
+	if layout != "" {
+		t, err := time.Parse(layout, value)
+		if err != nil {
+			return 0, fmt.Errorf("parse time %q with layout %q: %w", value, layout, err)
+		}
+		return t.Unix(), nil
+	}
+	if f, err := strconv.ParseFloat(value, 64); err == nil {
+		return int64(f), nil
+	}
+	for _, candidate := range autoTimeLayouts {
+		if t, err := time.Parse(candidate, value); err == nil {
+			return t.Unix(), nil
+		}
+	}
+	return 0, fmt.Errorf("parse time %q: expected Unix timestamp or a supported date/time format", value)
+}
 
 // TupleLookupSchema is optimized for domain-specific/group style lookup with
 // exact term + group + date-of-service filters.
@@ -861,6 +917,55 @@ func TupleQuery(term, groupID, date_key string) Query {
 // generic boolean intersection. If no composite accelerator exists, the query
 // falls back automatically to the generic TupleQuery path.
 func ParseLookupQuery(raw string) Query { return ParseLookupQueryFast(raw) }
+
+// CompileLookupQuery validates URL-style field=value filters against the
+// active schema and compiles each value using the field's storage type.
+func (ix *Index) CompileDatasourceLookup(raw string) (Query, error) {
+	vals, err := url.ParseQuery(strings.TrimPrefix(raw, "?"))
+	if err != nil {
+		return nil, fmt.Errorf("invalid lookup query: %w", err)
+	}
+	filters := make([]Query, 0, len(vals))
+	for field, values := range vals {
+		if field == "limit" || field == "offset" {
+			continue
+		}
+		opt, ok := ix.cfg.Schema.Fields[field]
+		if !ok {
+			return nil, fmt.Errorf("unknown filter field %q", field)
+		}
+		for _, value := range values {
+			value = strings.TrimSpace(value)
+			if value == "" {
+				continue
+			}
+			switch opt.Kind {
+			case FieldInt, FieldFloat:
+				n, err := strconv.ParseFloat(value, 64)
+				if err != nil {
+					return nil, fmt.Errorf("filter %q requires a number: %w", field, err)
+				}
+				filters = append(filters, Range{Field: field, GTE: n, LTE: n})
+			case FieldTime:
+				unix, err := parseSourceTime(value, "")
+				if err != nil {
+					return nil, fmt.Errorf("filter %q: %w", field, err)
+				}
+				filters = append(filters, Range{Field: field, GTE: unix, LTE: unix})
+			case FieldText:
+				filters = append(filters, Simple(field, value))
+			case FieldVector:
+				return nil, fmt.Errorf("field %q requires vector search, not lookup filtering", field)
+			default:
+				filters = append(filters, Term{Field: field, Value: value})
+			}
+		}
+	}
+	if len(filters) == 0 {
+		return MatchAll{}, nil
+	}
+	return Bool{Filter: filters}, nil
+}
 
 // PagedSQLSource streams very large database tables with keyset pagination.
 // It repeatedly executes SELECT ... WHERE order_column > last ORDER BY order_column LIMIT page_size.

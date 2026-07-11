@@ -89,7 +89,7 @@ func main() {
 	}
 	ix, src, err := lookup.AutoPagedSQLQuery(context.Background(), lookup.Config{
 		InitialCapacity: 1_600_000,
-		DisableSource:   true,
+		DisableSource:   false,
 		AppendOnly:      true,
 		Clock:           lookup.SystemClock{},
 	}, db.DB(), page, "id", "id", 100_000)
@@ -108,7 +108,7 @@ func main() {
 	}
 	fmt.Printf("indexed=%d skipped=%d in %s stats=%+v\n", stats.Indexed, stats.Skipped, time.Since(start), ix.Stats())
 
-	_, hits := ix.SearchInto(lookup.SearchRequest{Query: lookup.Term{Field: "cpt_code", Value: "99213"}, Limit: 20}, nil)
+	_, hits := ix.SearchInto(lookup.SearchRequest{Query: lookup.Term{Field: "cpt_code", Value: "99213"}, Limit: 20, WithDocs: true}, nil)
 	fmt.Println("cpt_code=99213 hits:", len(hits))
 
 	_, hits = ix.SearchInto(lookup.SearchRequest{Query: lookup.Bool{Must: []lookup.Query{lookup.Simple("ld", "office visit")}, Filter: []lookup.Query{lookup.Term{Field: "charge_type", Value: "professional"}}}, Limit: 20}, nil)
@@ -116,4 +116,15 @@ func main() {
 
 	_, hits = ix.SearchInto(lookup.SearchRequest{Query: lookup.Prefix{Field: "cpt_code", Value: "992"}, Limit: 50}, nil)
 	fmt.Println("cpt_code prefix '992' hits:", len(hits))
+
+	filter := env("LOOKUP_FILTER", "work_item=37")
+	q, err := ix.CompileDatasourceLookup(filter)
+	if err != nil {
+		log.Fatalf("invalid lookup filter %q: %v", filter, err)
+	}
+	_, hits = ix.SearchInto(lookup.SearchRequest{Query: q, Limit: 20, WithDocs: true}, nil)
+	fmt.Printf("lookup %q hits=%d\n", filter, len(hits))
+	for _, hit := range hits {
+		fmt.Printf("id=%s record=%v\n", hit.ID, hit.Doc)
+	}
 }

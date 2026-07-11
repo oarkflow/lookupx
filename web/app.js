@@ -3,6 +3,13 @@ const App = (() => {
   const $$ = (sel) => document.querySelectorAll(sel);
   const content = () => $('#content');
 
+  // Numeric FieldKind values from pkg/types.go — FieldOptions.Kind is encoded
+  // as a plain integer over the wire (no string enum on the Go side).
+  const FIELD_KINDS = [
+    ['0', 'keyword'], ['1', 'text'], ['2', 'int'],
+    ['3', 'float'], ['4', 'bool'], ['5', 'time'], ['6', 'vector'],
+  ];
+
   function apiBase() {
     return ($('#api-base').value || '').replace(/\/+$/, '');
   }
@@ -13,19 +20,16 @@ const App = (() => {
       opts.headers['Content-Type'] = 'application/json';
       opts.body = JSON.stringify(body);
     }
-    const url = apiBase() + path;
-    const res = await fetch(url, opts);
+    const res = await fetch(apiBase() + path, opts);
     const text = await res.text();
     if (!res.ok) throw new Error(`${res.status} ${text}`);
     try { return JSON.parse(text); } catch { return text; }
   }
 
-  async function fetchIndexIDs() {
+  async function fetchIndexes() {
     try {
       const data = await api('GET', '/v1/indexes');
-      if (Array.isArray(data)) return data.map(i => i.id || i);
-      if (data && Array.isArray(data.indexes)) return data.indexes.map(i => i.id || i);
-      return [];
+      return Array.isArray(data) ? data : [];
     } catch { return []; }
   }
 
@@ -50,10 +54,6 @@ const App = (() => {
     return Number(n).toLocaleString();
   }
 
-  function badge(text, color) {
-    return `<span class="badge badge-${color}">${escHtml(text)}</span>`;
-  }
-
   function loading() {
     return '<div class="empty-state"><div class="spinner"></div><p class="mt-2">Loading…</p></div>';
   }
@@ -62,41 +62,37 @@ const App = (() => {
     return `<div class="empty-state"><p>${escHtml(msg)}</p></div>`;
   }
 
-  function fieldInput(name, value, opts = {}) {
+  function field(name, opts = {}) {
     const typ = opts.type || 'text';
     const lbl = opts.label || name;
     const ph = opts.placeholder || '';
-    const cls = opts.class || '';
-    const val = value !== undefined ? value : (opts.default || '');
+    const val = opts.default || '';
     return `
       <div class="space-y-1">
         <label class="text-xs font-medium text-gray-400">${escHtml(lbl)}</label>
-        <input type="${typ}" name="${name}" value="${escHtml(String(val))}" placeholder="${escHtml(ph)}" class="${cls}" />
+        <input id="${name}" type="${typ}" name="${name}" value="${escHtml(val)}" placeholder="${escHtml(ph)}" />
       </div>`;
   }
 
-  function indexSelect(inputId, selected) {
-    return `<select id="${inputId}" class="w-full"><option value="">Loading…</option></select>`;
+  function indexSelect(inputId) {
+    return `<select id="${inputId}"><option value="">Loading…</option></select>`;
   }
 
   async function populateIndexSelect(inputId, selected) {
-    const ids = await fetchIndexIDs();
+    const list = await fetchIndexes();
     const el = $(`#${inputId}`);
     if (!el) return;
-    el.innerHTML = ids.length
-      ? ids.map(id => `<option value="${escHtml(id)}" ${id === selected ? 'selected' : ''}>${escHtml(id)}</option>`).join('')
+    el.innerHTML = list.length
+      ? list.map(i => `<option value="${escHtml(i.id)}" ${i.id === selected ? 'selected' : ''}>${escHtml(i.id)}</option>`).join('')
       : '<option value="">— no indexes —</option>';
   }
 
-  let currentTab = 'dashboard';
+  let currentTab = 'search';
 
   function switchTab(tab) {
     currentTab = tab;
     $$('.nav-btn').forEach(b => b.classList.toggle('active', b.dataset.tab === tab));
-    const titles = {
-      dashboard: 'Dashboard', indexes: 'Indexes', search: 'Search',
-      config: 'Configuration', datasources: 'Datasources', bulk: 'Bulk Operations', generations: 'Generations'
-    };
+    const titles = { search: 'Search', indexes: 'Indexes', integrations: 'Integrations' };
     $('#page-title').textContent = titles[tab] || tab;
     render();
   }
@@ -104,172 +100,277 @@ const App = (() => {
   async function render() {
     content().innerHTML = loading();
     try {
-      switch (currentTab) {
-        case 'dashboard': await renderDashboard(); break;
-        case 'indexes': await renderIndexes(); break;
-        case 'search': await renderSearch(); break;
-        case 'config': await renderConfig(); break;
-        case 'datasources': await renderDatasources(); break;
-        case 'bulk': await renderBulk(); break;
-        case 'generations': await renderGenerations(); break;
-      }
+      if (currentTab === 'search') await renderSearch();
+      else if (currentTab === 'indexes') await renderIndexes();
+      else if (currentTab === 'integrations') await renderIntegrations();
     } catch (e) {
       content().innerHTML = empty('Error: ' + e.message);
     }
   }
 
-  // ── Dashboard ──────────────────────────────────────────────────────────────
+  // ── Search ─────────────────────────────────────────────────────────────────
+  // GET  /v1/indexes/{id}/lookup?k=v&...    quick key=value lookup
+  // POST /v1/indexes/{id}/search            full query DSL (WireQuery)
 
-  async function renderDashboard() {
-    let indexes = [];
-    try { indexes = await api('GET', '/v1/indexes'); } catch { content().innerHTML = empty('Cannot reach server. Check API base URL.'); return; }
-    const list = Array.isArray(indexes) ? indexes : (indexes.indexes || []);
-    if (!list.length) {
-      content().innerHTML = `
-        <div class="empty-state">
-          <p class="text-lg mb-2">No indexes registered</p>
-          <p class="text-sm text-gray-600 mb-4">Create one from the Configuration tab, or use the API:</p>
-          <pre class="json text-left inline-block">POST /v1/indexes
-{
-  "id": "my_index",
-  "schema": "record"
-}</pre>
-        </div>`;
-      return;
-    }
-
-    const cards = [];
-    let totalDocs = 0;
-    for (const item of list) {
-      const id = item.id || item;
-      try {
-        const st = await api('GET', `/v1/indexes/${id}/stats`);
-        totalDocs += (st.stats ? st.stats.docs : st.docs) || 0;
-        cards.push({ id, ...st });
-      } catch {
-        cards.push({ id, error: true });
-      }
-    }
-
-    let html = `
-      <div class="grid-3 mb-6">
-        <div class="card"><div class="card-header">Total Indexes</div><div class="text-3xl font-bold">${fmtNum(list.length)}</div></div>
-        <div class="card"><div class="card-header">Total Documents</div><div class="text-3xl font-bold">${fmtNum(totalDocs)}</div></div>
-        <div class="card"><div class="card-header">Server</div><div class="text-sm text-green-400 mt-1">Connected</div></div>
+  async function renderSearch() {
+    content().innerHTML = `
+      <form class="search-bar" onsubmit="event.preventDefault(); App.doLookup()">
+        <div class="search-index">${indexSelect('lookup-index')}</div>
+        <input id="lookup-query" type="search" autocomplete="off" placeholder="field=value &amp; status=active" aria-label="Search filters" />
+        <input id="lookup-limit" type="number" min="1" max="500" value="25" aria-label="Result limit" />
+        <button class="btn btn-primary" type="submit">Search</button>
+      </form>
+      <div id="search-fields" class="field-list"></div>
+      <div id="search-results" class="mt-4">
+        <div class="empty-state"><p>Select an index and enter filters.</p></div>
       </div>
-      <div class="grid-2">`;
+    `;
+    await populateIndexSelect('lookup-index');
+    $('#lookup-index').addEventListener('change', loadSearchFields);
+    await loadSearchFields();
+  }
 
-    for (const c of cards) {
-      if (c.error) {
-        html += `<div class="card"><div class="card-header">${escHtml(c.id)}</div><p class="text-red-400 text-sm">Failed to load stats</p></div>`;
-        continue;
+  async function loadSearchFields() {
+    const id = $('#lookup-index') && $('#lookup-index').value;
+    const host = $('#search-fields');
+    if (!id || !host) return;
+    try {
+      const data = await api('GET', `/v1/indexes/${encodeURIComponent(id)}/schema`);
+      host.innerHTML = Object.keys(data.fields || {}).map(name =>
+        `<button type="button" class="field-chip" onclick="App.addSearchField(decodeURIComponent('${encodeURIComponent(name)}'))">${escHtml(name)}</button>`).join('');
+    } catch { host.innerHTML = ''; }
+  }
+
+  function addSearchField(name) {
+    const input = $('#lookup-query');
+    const separator = input.value.trim() ? '&' : '';
+    input.value += `${separator}${name}=`;
+    input.focus();
+  }
+
+  function fmtCell(v) {
+    if (v === undefined || v === null || v === '') return '<span class="text-gray-600">—</span>';
+    if (typeof v === 'object') return escHtml(JSON.stringify(v));
+    return escHtml(String(v));
+  }
+
+  function renderHits(hits) {
+    if (!hits || !hits.length) return empty('No results.');
+
+    // One column per field actually present across the returned docs, in
+    // first-seen order, so the table shows real data instead of a raw blob.
+    const fieldOrder = [];
+    const seen = new Set();
+    let anyDoc = false;
+    for (const h of hits) {
+      if (!h.doc) continue;
+      anyDoc = true;
+      for (const k of Object.keys(h.doc)) {
+        if (k === 'id') continue;
+        if (!seen.has(k)) { seen.add(k); fieldOrder.push(k); }
       }
-      const s = c.stats || {};
-      const frozen = s.frozen ? badge('Frozen', 'green') : badge('Live', 'yellow');
-      html += `
-        <div class="card cursor-pointer hover:border-brand-600 transition" onclick="App.showIndexDetail('${escHtml(c.id)}')">
-          <div class="card-header flex items-center justify-between">
-            <span>${escHtml(c.id)}</span>${frozen}
-          </div>
-          <div class="grid grid-cols-2 gap-2 text-sm mt-2">
-            <div><span class="text-gray-500">Docs:</span> ${fmtNum(s.docs)}</div>
-            <div><span class="text-gray-500">Fields:</span> ${fmtNum(s.fields)}</div>
-            <div><span class="text-gray-500">Partitions:</span> ${fmtNum(s.partitions)}</div>
-            <div><span class="text-gray-500">Generation:</span> ${fmtNum(c.generation)}</div>
-          </div>
-        </div>`;
     }
-    html += '</div>';
-    content().innerHTML = html;
+
+    let html = `<div class="card"><div class="card-header">${hits.length} result(s)</div>`;
+    if (!anyDoc) {
+      html += `<p class="text-xs text-gray-500 mb-2">This index doesn't store full documents (created with DisableSource), so only ID and score are available.</p>`;
+    }
+    html += `<div class="overflow-x-auto"><table><thead><tr><th>ID</th><th>Score</th>${fieldOrder.map(f => `<th>${escHtml(f)}</th>`).join('')}</tr></thead><tbody>`;
+    for (const h of hits) {
+      html += `<tr>
+        <td class="font-mono text-sm">${escHtml(h.id)}</td>
+        <td>${h.score !== undefined ? h.score.toFixed(4) : '—'}</td>
+        ${fieldOrder.map(f => `<td class="text-sm max-w-xs truncate" title="${h.doc && h.doc[f] !== undefined ? escHtml(String(h.doc[f])) : ''}">${fmtCell(h.doc && h.doc[f])}</td>`).join('')}
+      </tr>`;
+    }
+    html += '</tbody></table></div></div>';
+    return html;
+  }
+
+  async function doLookup() {
+    const id = $('#lookup-index').value.trim();
+    if (!id) { toast('Select an index first.', false); return; }
+    const limit = parseInt($('#lookup-limit').value) || 25;
+    const raw = $('#lookup-query').value.trim().replace(/^\?/, '');
+    const params = new URLSearchParams();
+    for (const part of raw.split('&')) {
+      if (!part.trim()) continue;
+      const split = part.indexOf('=');
+      if (split < 1) { toast(`Invalid filter: ${part}`, false); return; }
+      params.append(part.slice(0, split).trim(), part.slice(split + 1).trim());
+    }
+    params.set('limit', String(limit));
+    const res = $('#search-results');
+    res.innerHTML = loading();
+    try {
+      const data = await api('GET', `/v1/indexes/${encodeURIComponent(id)}/lookup?${params.toString()}`);
+      res.innerHTML = `<div class="result-meta"><span>${fmtNum(data.total)} results</span><span>${fmtNum(data.latency_ns)} ns</span></div>${renderHits(data.hits)}`;
+    } catch (e) {
+      res.innerHTML = `<div class="card text-red-400 text-sm">Lookup error: ${escHtml(e.message)}</div>`;
+    }
   }
 
   // ── Indexes ────────────────────────────────────────────────────────────────
+  // GET/POST/DELETE /v1/indexes, /v1/indexes/{id}/stats, reload, reload-async,
+  // freeze, persist, snapshot, docs/{id}, generations, validate, repair, compact
+
+  let schemaFieldRows = 0;
 
   async function renderIndexes() {
-    let indexes = [];
-    try { indexes = await api('GET', '/v1/indexes'); } catch { content().innerHTML = empty('Cannot reach server.'); return; }
-    const list = Array.isArray(indexes) ? indexes : (indexes.indexes || []);
-    if (!list.length) { content().innerHTML = empty('No indexes. Create one from the Configuration tab.'); return; }
+    const list = await fetchIndexes();
+    let totalDocs = 0;
+    for (const mi of list) totalDocs += (mi.stats && mi.stats.docs) || 0;
 
-    let html = `<div class="space-y-4">`;
-    for (const item of list) {
-      const id = item.id || item;
-      let s = {};
-      try { s = await api('GET', `/v1/indexes/${id}/stats`); } catch {}
-      const st = s.stats || {};
-      const frozen = st.frozen ? badge('Frozen', 'green') : badge('Live', 'yellow');
-      html += `
-        <div class="card">
-          <div class="flex items-center justify-between mb-3">
-            <div class="flex items-center gap-2">
-              <span class="font-semibold">${escHtml(id)}</span>${frozen}
-              <span class="text-xs text-gray-500">gen ${s.generation || '?'}</span>
-            </div>
-            <div class="flex gap-2">
-              <button class="btn btn-primary text-xs" onclick="App.reloadIndex('${escHtml(id)}')">Reload</button>
-              <button class="btn btn-secondary text-xs" onclick="App.reloadSQL('${escHtml(id)}')">Reload SQL</button>
-              <button class="btn btn-secondary text-xs" onclick="App.reloadTable('${escHtml(id)}')">Reload Table</button>
-              <button class="btn btn-secondary text-xs" onclick="App.showIndexDetail('${escHtml(id)}')">Detail</button>
-              <button class="btn btn-danger text-xs" onclick="App.deleteIndex('${escHtml(id)}')">Delete</button>
-            </div>
+    let html = `
+      <div class="grid-3 mb-6">
+        <div class="card"><div class="card-header">Indexes</div><div class="text-3xl font-bold">${fmtNum(list.length)}</div></div>
+        <div class="card"><div class="card-header">Total Documents</div><div class="text-3xl font-bold">${fmtNum(totalDocs)}</div></div>
+        <div class="card"><div class="card-header">Server</div><div id="server-status" class="text-sm text-green-400 mt-1">checking…</div></div>
+      </div>
+
+      <div class="card max-w-2xl mb-6">
+        <div class="card-header">Create Index</div>
+        <div class="space-y-3 mt-2">
+          ${field('new-index-id', { label: 'Index ID', placeholder: 'e.g. claims, members, products' })}
+          <div class="space-y-1">
+            <label class="text-xs font-medium text-gray-400">Schema</label>
+            <select id="new-index-schema">
+              <option value="record">Built-in record schema (term + group_id + date_key + partition_id)</option>
+              <option value="custom">Custom fields</option>
+            </select>
           </div>
-          <div class="grid grid-cols-4 gap-3 text-sm">
-            <div class="text-gray-500">Docs: <span class="text-gray-200">${fmtNum(st.docs)}</span></div>
-            <div class="text-gray-500">Fields: <span class="text-gray-200">${fmtNum(st.fields)}</span></div>
-            <div class="text-gray-500">Partitions: <span class="text-gray-200">${fmtNum(st.partitions)}</span></div>
-            <div class="text-gray-500">Rows/s: <span class="text-gray-200">${s.latency ? fmtNum(Math.round(s.latency.last_rows_per_second)) : '—'}</span></div>
-          </div>
-        </div>`;
+          <div id="custom-schema-rows" class="hidden space-y-2"></div>
+          <button id="add-field-btn" class="btn btn-secondary text-xs hidden" onclick="App.addSchemaFieldRow()">+ Add field</button>
+          <button class="btn btn-primary" onclick="App.createIndex()">Create</button>
+        </div>
+      </div>
+
+      <div class="space-y-4">`;
+
+    if (!list.length) {
+      html += empty('No indexes yet. Create one above.');
+    } else {
+      for (const mi of list) {
+        const st = mi.stats || {};
+        const lat = mi.latency || {};
+        html += `
+          <div class="card">
+            <div class="flex items-center justify-between mb-3">
+              <div class="flex items-center gap-2">
+                <span class="font-semibold">${escHtml(mi.id)}</span>
+                ${mi.reloading ? '<span class="badge badge-yellow">Reloading</span>' : ''}
+                <span class="text-xs text-gray-500">gen ${fmtNum(mi.generation)}</span>
+              </div>
+              <div class="flex gap-2 flex-wrap justify-end">
+                <button class="btn btn-primary text-xs" onclick="App.reloadIndex('${escHtml(mi.id)}')">Reload</button>
+                <button class="btn btn-secondary text-xs" onclick="App.freezeIndex('${escHtml(mi.id)}')">Freeze</button>
+                <button class="btn btn-secondary text-xs" onclick="App.persistIndex('${escHtml(mi.id)}')">Persist</button>
+                <button class="btn btn-secondary text-xs" onclick="App.toggleDetail('${escHtml(mi.id)}')">Detail</button>
+                <button class="btn btn-danger text-xs" onclick="App.deleteIndex('${escHtml(mi.id)}')">Delete</button>
+              </div>
+            </div>
+            <div class="grid grid-cols-4 gap-3 text-sm">
+              <div class="text-gray-500">Docs: <span class="text-gray-200">${fmtNum(st.docs)}</span></div>
+              <div class="text-gray-500">Fields: <span class="text-gray-200">${fmtNum(st.fields)}</span></div>
+              <div class="text-gray-500">Terms: <span class="text-gray-200">${fmtNum(st.terms)}</span></div>
+              <div class="text-gray-500">Rows/s: <span class="text-gray-200">${lat.last_rows_per_second ? fmtNum(Math.round(lat.last_rows_per_second)) : '—'}</span></div>
+            </div>
+            ${lat.last_error ? `<div class="text-xs text-red-400 mt-2">Last error: ${escHtml(lat.last_error)}</div>` : ''}
+            <div id="detail-${escHtml(mi.id)}" class="mt-4 hidden"></div>
+          </div>`;
+      }
     }
     html += '</div>';
     content().innerHTML = html;
+
+    $('#new-index-schema').addEventListener('change', (e) => {
+      const custom = e.target.value === 'custom';
+      $('#custom-schema-rows').classList.toggle('hidden', !custom);
+      $('#add-field-btn').classList.toggle('hidden', !custom);
+      if (custom && !$('#custom-schema-rows').children.length) addSchemaFieldRow();
+    });
+
+    api('GET', '/health').then(() => {
+      const el = $('#server-status');
+      if (el) { el.textContent = 'Connected'; el.className = 'text-sm text-green-400 mt-1'; }
+    }).catch(() => {
+      const el = $('#server-status');
+      if (el) { el.textContent = 'Unreachable'; el.className = 'text-sm text-red-400 mt-1'; }
+    });
   }
 
-  async function showIndexDetail(id) {
-    content().innerHTML = loading();
-    try {
-      const st = await api('GET', `/v1/indexes/${id}/stats`);
-      let html = `
-        <div class="mb-4"><button class="btn btn-secondary text-xs" onclick="App.render()">← Back</button></div>
-        <div class="card">
-          <div class="card-header">${escHtml(id)} — Full Stats</div>
-          ${json(st)}
-        </div>`;
-      try {
-        const plan = await api('GET', `/v1/indexes/${id}/plan`);
-        html += `<div class="card mt-4"><div class="card-header">Query Plan</div>${json(plan)}</div>`;
-      } catch {}
-      content().innerHTML = html;
-    } catch (e) {
-      content().innerHTML = empty('Error: ' + e.message);
+  function addSchemaFieldRow() {
+    schemaFieldRows++;
+    const i = schemaFieldRows;
+    const row = document.createElement('div');
+    row.className = 'schema-row grid grid-cols-6 gap-2 items-end';
+    row.innerHTML = `
+      <input name="fname-${i}" placeholder="field name" class="col-span-2" />
+      <select name="fkind-${i}" class="col-span-1">
+        ${FIELD_KINDS.map(([v, l]) => `<option value="${v}">${l}</option>`).join('')}
+      </select>
+      <label class="text-xs flex items-center gap-1"><input type="checkbox" name="findexed-${i}" /> indexed</label>
+      <label class="text-xs flex items-center gap-1"><input type="checkbox" name="flookup-${i}" checked /> lookup</label>
+      <label class="text-xs flex items-center gap-1"><input type="checkbox" name="fprefix-${i}" /> prefix</label>`;
+    $('#custom-schema-rows').appendChild(row);
+  }
+
+  function collectSchemaFields() {
+    const fields = {};
+    for (const row of $$('.schema-row')) {
+      const name = row.querySelector('[name^="fname-"]').value.trim();
+      if (!name) continue;
+      const kind = parseInt(row.querySelector('[name^="fkind-"]').value, 10);
+      const indexed = row.querySelector('[name^="findexed-"]').checked;
+      const lookup = row.querySelector('[name^="flookup-"]').checked;
+      const prefix = row.querySelector('[name^="fprefix-"]').checked;
+      fields[name] = { kind, indexed, lookup, prefix, lowercase: true };
+      if (prefix) { fields[name].min_prefix = 3; fields[name].max_prefix = 5; }
     }
+    return fields;
+  }
+
+  async function createIndex() {
+    const id = $('#new-index-id').value.trim();
+    if (!id) { toast('Index ID required.', false); return; }
+    const schema = $('#new-index-schema').value;
+    const body = { id };
+    if (schema === 'record') {
+      body.schema = 'record';
+    } else {
+      const fields = collectSchemaFields();
+      if (!Object.keys(fields).length) { toast('Add at least one field.', false); return; }
+      body.config = { schema: { fields } };
+    }
+    try {
+      await api('POST', '/v1/indexes', body);
+      toast('Created index ' + id);
+      schemaFieldRows = 0;
+      render();
+    } catch (e) { toast('Create failed: ' + e.message, false); }
   }
 
   async function reloadIndex(id) {
     toast('Reloading ' + id + '…');
     try {
-      await api('POST', `/v1/indexes/${id}/reload`);
+      await api('POST', `/v1/indexes/${encodeURIComponent(id)}/reload`);
       toast('Reloaded ' + id);
       render();
     } catch (e) { toast('Reload failed: ' + e.message, false); }
   }
 
-  async function reloadSQL(id) {
-    toast('Reload SQL ' + id + '…');
+  async function freezeIndex(id) {
     try {
-      await api('POST', `/v1/indexes/${id}/reload-sql`);
-      toast('Reloaded SQL ' + id);
-      render();
-    } catch (e) { toast('SQL reload failed: ' + e.message, false); }
+      await api('POST', `/v1/indexes/${encodeURIComponent(id)}/freeze`);
+      toast('Frozen ' + id);
+    } catch (e) { toast('Freeze failed: ' + e.message, false); }
   }
 
-  async function reloadTable(id) {
-    toast('Reload table ' + id + '…');
+  async function persistIndex(id) {
     try {
-      await api('POST', `/v1/indexes/${id}/reload-table`);
-      toast('Reloaded table ' + id);
-      render();
-    } catch (e) { toast('Table reload failed: ' + e.message, false); }
+      const man = await api('POST', `/v1/indexes/${encodeURIComponent(id)}/persist`);
+      toast(`Persisted ${id} (gen ${man.generation})`);
+    } catch (e) { toast('Persist failed: ' + e.message, false); }
   }
 
   async function deleteIndex(id) {
@@ -281,138 +382,179 @@ const App = (() => {
     } catch (e) { toast('Delete failed: ' + e.message, false); }
   }
 
-  // ── Search ─────────────────────────────────────────────────────────────────
-
-  async function renderSearch() {
-    content().innerHTML = `
-      <div class="card max-w-3xl">
-        <div class="card-header">Search / Lookup</div>
-        <div class="space-y-4 mt-3">
-          <div>${indexSelect('search-index')}</div>
-          ${fieldInput('search-limit', '25', { label: 'Limit', type: 'number' })}
-          <div class="space-y-1">
-            <label class="text-xs font-medium text-gray-400">Query (key=value pairs, one per line)</label>
-            <textarea id="search-query" rows="4" class="font-mono text-sm" placeholder="term=foo&#10;group_id=1&#10;date_key=2026-01-01"></textarea>
+  async function toggleDetail(id) {
+    const el = $(`#detail-${id}`);
+    if (!el) return;
+    if (!el.classList.contains('hidden')) { el.classList.add('hidden'); return; }
+    el.classList.remove('hidden');
+    el.innerHTML = loading();
+    let stats = {};
+    try { stats = await api('GET', `/v1/indexes/${encodeURIComponent(id)}/stats`); } catch (e) {}
+    el.innerHTML = `
+      <div class="border-t border-gray-800 pt-3 mt-1 space-y-3">
+        ${json(stats)}
+        <div class="grid grid-cols-2 gap-4">
+          <div>
+            <div class="text-xs font-medium text-gray-400 mb-1">Upsert Document</div>
+            <div class="flex gap-2">
+              <input id="doc-id-${id}" placeholder="doc id" class="w-32" />
+              <input id="doc-json-${id}" placeholder='{"term":"foo"}' class="flex-1" />
+              <button class="btn btn-primary text-xs" onclick="App.upsertDoc('${id}')">Save</button>
+            </div>
           </div>
-          <button class="btn btn-primary" onclick="App.doSearch()">Search</button>
-        </div>
-      </div>
-      <div id="search-results" class="mt-4"></div>`;
-    await populateIndexSelect('search-index');
-  }
-
-  async function doSearch() {
-    const id = $('#search-index').value.trim();
-    if (!id) { toast('Select an index first.', false); return; }
-    const limit = parseInt($('#search-limit').value) || 25;
-    const raw = $('#search-query').value.trim();
-    const params = raw.split('\n').filter(Boolean).join('&');
-    const res = $('#search-results');
-    res.innerHTML = loading();
-    try {
-      const data = await api('GET', `/v1/indexes/${encodeURIComponent(id)}/lookup?${params}&limit=${limit}`);
-      const hits = data.hits || data || [];
-      if (!hits.length) { res.innerHTML = empty('No results.'); return; }
-      let html = `<div class="card"><div class="card-header">${hits.length} result(s)</div><div class="overflow-x-auto"><table>
-        <thead><tr><th>ID</th><th>Score</th><th>Data</th></tr></thead><tbody>`;
-      for (const h of hits) {
-        html += `<tr>
-          <td class="font-mono text-sm">${escHtml(h.id)}</td>
-          <td>${h.score ? h.score.toFixed(4) : '—'}</td>
-          <td class="text-xs text-gray-400 max-w-md truncate">${escHtml(JSON.stringify(h.data || h))}</td>
-        </tr>`;
-      }
-      html += '</tbody></table></div></div>';
-      res.innerHTML = html;
-    } catch (e) {
-      res.innerHTML = `<div class="card text-red-400 text-sm">Search error: ${escHtml(e.message)}</div>`;
-    }
-  }
-
-  // ── Configuration ──────────────────────────────────────────────────────────
-
-  async function renderConfig() {
-    content().innerHTML = `
-      <div class="space-y-6">
-        <!-- Create new index -->
-        <div class="card max-w-3xl">
-          <div class="card-header">Create New Index</div>
-          <div class="space-y-4 mt-3">
-            ${fieldInput('cfg-new-id', '', { label: 'Index ID', placeholder: 'e.g. claims, members, products' })}
-            <div class="space-y-1">
-              <label class="text-xs font-medium text-gray-400">Schema</label>
-              <select id="cfg-schema" class="w-full">
-                <option value="record">Record (term + group_id + date_key + partition_id)</option>
-                <option value="custom">Custom (provide fields below)</option>
-              </select>
+          <div>
+            <div class="text-xs font-medium text-gray-400 mb-1">Delete Document</div>
+            <div class="flex gap-2">
+              <input id="del-doc-id-${id}" placeholder="doc id" class="flex-1" />
+              <button class="btn btn-danger text-xs" onclick="App.deleteDoc('${id}')">Delete</button>
             </div>
-            <div id="cfg-custom-fields" class="hidden space-y-1">
-              <label class="text-xs font-medium text-gray-400">Custom Schema Fields (one per line: name kind)</label>
-              <textarea id="cfg-fields-text" rows="4" class="font-mono text-sm" placeholder="term keyword&#10;group_id keyword&#10;date_key keyword&#10;partition_id keyword"></textarea>
-            </div>
-            <button class="btn btn-primary" onclick="App.createIndex()">Create Index</button>
           </div>
         </div>
-
-        <!-- Add SQL data source to existing index -->
-        <div class="card max-w-3xl">
-          <div class="card-header">Load Data: SQL Query</div>
-          <div class="space-y-3 mt-3">
-            <div>${indexSelect('cfg-sql-index')}</div>
-            ${fieldInput('cfg-sql-driver', '', { label: 'Driver', placeholder: 'pgx / mysql / sqlite' })}
-            ${fieldInput('cfg-sql-dsn', '', { label: 'DSN', placeholder: 'host=localhost user=postgres password=… dbname=mydb' })}
-            <div class="space-y-1">
-              <label class="text-xs font-medium text-gray-400">SQL Query</label>
-              <textarea id="cfg-sql-query" rows="3" class="font-mono text-sm" placeholder="SELECT id, name, category, created_at FROM my_table WHERE active = true"></textarea>
-            </div>
-            ${fieldInput('cfg-sql-id', 'id', { label: 'ID Column' })}
-            <div class="space-y-1">
-              <label class="text-xs font-medium text-gray-400">Column Mappings (one per line: column field kind)</label>
-              <textarea id="cfg-sql-cols" rows="4" class="font-mono text-sm" placeholder="name term keyword&#10;category group_id keyword&#10;created_at date_key keyword"></textarea>
-            </div>
-            <button class="btn btn-primary" onclick="App.loadSQLQuery()">Load Data</button>
+        <div>
+          <div class="text-xs font-medium text-gray-400 mb-1">Maintenance (persisted indexes)</div>
+          <div class="flex gap-2 flex-wrap">
+            <button class="btn btn-secondary text-xs" onclick="App.listGenerations('${id}')">Generations</button>
+            <button class="btn btn-secondary text-xs" onclick="App.validateIndex('${id}')">Validate</button>
+            <button class="btn btn-secondary text-xs" onclick="App.repairIndex('${id}')">Repair</button>
+            <button class="btn btn-secondary text-xs" onclick="App.compactIndex('${id}')">Compact (keep 2)</button>
           </div>
-        </div>
-
-        <!-- Add SQL table (paged) data source -->
-        <div class="card max-w-3xl">
-          <div class="card-header">Load Data: SQL Table (Paged)</div>
-          <div class="space-y-3 mt-3">
-            <div>${indexSelect('cfg-tbl-index')}</div>
-            ${fieldInput('cfg-tbl-driver', '', { label: 'Driver', placeholder: 'pgx / mysql / sqlite' })}
-            ${fieldInput('cfg-tbl-dsn', '', { label: 'DSN', placeholder: 'host=localhost user=postgres password=… dbname=mydb' })}
-            ${fieldInput('cfg-tbl-name', '', { label: 'Table Name', placeholder: 'my_table' })}
-            ${fieldInput('cfg-tbl-id', 'id', { label: 'ID Column' })}
-            ${fieldInput('cfg-tbl-page', '10000', { label: 'Page Size', type: 'number' })}
-            <div class="space-y-1">
-              <label class="text-xs font-medium text-gray-400">Column Mappings (one per line: column field kind)</label>
-              <textarea id="cfg-tbl-cols" rows="4" class="font-mono text-sm" placeholder="name term keyword&#10;category group_id keyword&#10;created_at date_key keyword"></textarea>
-            </div>
-            <button class="btn btn-primary" onclick="App.loadSQLTable()">Load Data</button>
-          </div>
-        </div>
-
-        <!-- Add inline JSON data -->
-        <div class="card max-w-3xl">
-          <div class="card-header">Load Data: Inline JSON Records</div>
-          <div class="space-y-3 mt-3">
-            <div>${indexSelect('cfg-json-index')}</div>
-            <div class="space-y-1">
-              <label class="text-xs font-medium text-gray-400">JSON Records Array</label>
-              <textarea id="cfg-json-data" rows="6" class="font-mono text-sm" placeholder='[{"id":"1","term":"foo","group_id":"1","date_key":"2026-01-01","partition_id":"1"}]'></textarea>
-            </div>
-            <button class="btn btn-primary" onclick="App.loadJSONRecords()">Load Records</button>
-          </div>
+          <div id="maint-${id}" class="mt-2"></div>
         </div>
       </div>`;
+  }
 
-    document.getElementById('cfg-schema').addEventListener('change', (e) => {
-      document.getElementById('cfg-custom-fields').classList.toggle('hidden', e.target.value !== 'custom');
-    });
+  async function upsertDoc(id) {
+    const docId = $(`#doc-id-${id}`).value.trim();
+    const raw = $(`#doc-json-${id}`).value.trim();
+    if (!docId || !raw) { toast('Doc id and JSON required.', false); return; }
+    try {
+      const doc = JSON.parse(raw);
+      await api('PUT', `/v1/indexes/${encodeURIComponent(id)}/docs/${encodeURIComponent(docId)}`, doc);
+      toast('Upserted ' + docId);
+    } catch (e) { toast('Upsert failed: ' + e.message, false); }
+  }
+
+  async function deleteDoc(id) {
+    const docId = $(`#del-doc-id-${id}`).value.trim();
+    if (!docId) { toast('Doc id required.', false); return; }
+    try {
+      await api('DELETE', `/v1/indexes/${encodeURIComponent(id)}/docs/${encodeURIComponent(docId)}`);
+      toast('Deleted ' + docId);
+    } catch (e) { toast('Delete failed: ' + e.message, false); }
+  }
+
+  async function listGenerations(id) {
+    const el = $(`#maint-${id}`);
+    el.innerHTML = loading();
+    try {
+      const data = await api('GET', `/v1/indexes/${encodeURIComponent(id)}/generations`);
+      el.innerHTML = json(data.generations || data);
+    } catch (e) { el.innerHTML = `<p class="text-red-400 text-sm">${escHtml(e.message)}</p>`; }
+  }
+
+  async function validateIndex(id) {
+    const el = $(`#maint-${id}`);
+    el.innerHTML = loading();
+    try {
+      const data = await api('GET', `/v1/indexes/${encodeURIComponent(id)}/validate`);
+      el.innerHTML = json(data);
+    } catch (e) { el.innerHTML = `<p class="text-red-400 text-sm">${escHtml(e.message)}</p>`; }
+  }
+
+  async function repairIndex(id) {
+    const el = $(`#maint-${id}`);
+    el.innerHTML = loading();
+    try {
+      const data = await api('POST', `/v1/indexes/${encodeURIComponent(id)}/repair`);
+      el.innerHTML = json(data);
+    } catch (e) { el.innerHTML = `<p class="text-red-400 text-sm">${escHtml(e.message)}</p>`; }
+  }
+
+  async function compactIndex(id) {
+    const el = $(`#maint-${id}`);
+    el.innerHTML = loading();
+    try {
+      const data = await api('POST', `/v1/indexes/${encodeURIComponent(id)}/compact`, { keep_last: 2 });
+      el.innerHTML = json(data);
+    } catch (e) { el.innerHTML = `<p class="text-red-400 text-sm">${escHtml(e.message)}</p>`; }
+  }
+
+  // ── Integrations ───────────────────────────────────────────────────────────
+  // POST /v1/indexes/{id}/reload-sql, /reload-table, /reload — attach a data
+  // source to an already-created index.
+
+  async function renderIntegrations() {
+    content().innerHTML = `
+      <div class="space-y-6">
+        <div class="card max-w-3xl">
+          <div class="card-header">SQL Query</div>
+          <p class="text-xs text-gray-500 mb-3">POST /reload-sql — run one SQL query and load every row.</p>
+          <div class="space-y-3">
+            <div>${indexSelect('sql-index')}</div>
+            <div class="grid grid-cols-2 gap-3">
+              ${field('sql-driver', { label: 'Driver', placeholder: 'postgres / mysql / sqlite3' })}
+              ${field('sql-id-col', { label: 'ID Column', default: 'id' })}
+            </div>
+            ${field('sql-dsn', { label: 'DSN', placeholder: 'host=localhost user=postgres password=… dbname=mydb' })}
+            <div class="space-y-1">
+              <label class="text-xs font-medium text-gray-400">Query</label>
+              <textarea id="sql-query" rows="3" class="font-mono text-sm" placeholder="SELECT id, name, category, created_at FROM my_table WHERE active = true"></textarea>
+            </div>
+            <div class="space-y-1">
+              <div class="flex items-center justify-between">
+                <label class="text-xs font-medium text-gray-400">Column mappings (one per line: column field kind)</label>
+                <button class="btn btn-secondary text-xs" onclick="App.detectColumns('sql')">Detect from query</button>
+              </div>
+              <textarea id="sql-cols" rows="4" class="font-mono text-sm" placeholder="Click &quot;Detect from query&quot;, or type manually: name term keyword"></textarea>
+            </div>
+            <button class="btn btn-primary" onclick="App.loadSQLQuery()">Load</button>
+          </div>
+        </div>
+
+        <div class="card max-w-3xl">
+          <div class="card-header">SQL Table (paged)</div>
+          <p class="text-xs text-gray-500 mb-3">POST /reload-table — keyset-paginated full table scan, safe for very large tables.</p>
+          <div class="space-y-3">
+            <div>${indexSelect('tbl-index')}</div>
+            <div class="grid grid-cols-2 gap-3">
+              ${field('tbl-driver', { label: 'Driver', placeholder: 'postgres / mysql / sqlite3' })}
+              ${field('tbl-name', { label: 'Table', placeholder: 'my_table' })}
+            </div>
+            ${field('tbl-dsn', { label: 'DSN', placeholder: 'host=localhost user=postgres password=… dbname=mydb' })}
+            <div class="grid grid-cols-2 gap-3">
+              ${field('tbl-id-col', { label: 'ID Column', default: 'id' })}
+              ${field('tbl-page-size', { label: 'Page Size', type: 'number', default: '10000' })}
+            </div>
+            ${field('tbl-where', { label: 'Where (optional, raw SQL)', placeholder: 'active = true' })}
+            <div class="space-y-1">
+              <div class="flex items-center justify-between">
+                <label class="text-xs font-medium text-gray-400">Column mappings (one per line: column field kind)</label>
+                <button class="btn btn-secondary text-xs" onclick="App.detectColumns('tbl')">Detect from table</button>
+              </div>
+              <textarea id="tbl-cols" rows="4" class="font-mono text-sm" placeholder="Click &quot;Detect from table&quot;, or type manually: name term keyword"></textarea>
+            </div>
+            <button class="btn btn-primary" onclick="App.loadSQLTable()">Load</button>
+          </div>
+        </div>
+
+        <div class="card max-w-3xl">
+          <div class="card-header">Inline JSON Records</div>
+          <p class="text-xs text-gray-500 mb-3">PUT /docs/{id} per record — upserts each object into the index (each needs an "id" field).</p>
+          <div class="space-y-3">
+            <div>${indexSelect('json-index')}</div>
+            <div class="space-y-1">
+              <label class="text-xs font-medium text-gray-400">Records</label>
+              <textarea id="json-data" rows="6" class="font-mono text-sm" placeholder='[{"id":"1","term":"foo","group_id":"1","date_key":"2026-01-01","partition_id":"1"}]'></textarea>
+            </div>
+            <button class="btn btn-primary" onclick="App.loadJSONRecords()">Load</button>
+          </div>
+        </div>
+      </div>
+      <div id="integration-result" class="mt-4"></div>`;
     await Promise.all([
-      populateIndexSelect('cfg-sql-index'),
-      populateIndexSelect('cfg-tbl-index'),
-      populateIndexSelect('cfg-json-index'),
+      populateIndexSelect('sql-index'),
+      populateIndexSelect('tbl-index'),
+      populateIndexSelect('json-index'),
     ]);
   }
 
@@ -423,269 +565,120 @@ const App = (() => {
     });
   }
 
-  async function createIndex() {
-    const id = $('#cfg-new-id').value.trim();
-    if (!id) { toast('Index ID required.', false); return; }
-    const schema = $('#cfg-schema').value;
-    const body = { id };
-    if (schema === 'record') {
-      body.schema = 'record';
+  function showIntegrationResult(promise, doneMsg) {
+    const res = $('#integration-result');
+    res.innerHTML = loading();
+    return promise.then(data => {
+      toast(doneMsg);
+      res.innerHTML = json(data);
+    }).catch(e => {
+      toast('Load failed: ' + e.message, false);
+      res.innerHTML = `<div class="card text-red-400 text-sm">${escHtml(e.message)}</div>`;
+    });
+  }
+
+  // detectColumns calls the read-only /v1/infer-columns endpoint (no index is
+  // created or modified) and fills the "column mappings" textarea from the
+  // result, so Load can never be submitted with an empty columns list.
+  async function detectColumns(prefix) {
+    const driver = $(`#${prefix}-driver`).value.trim();
+    const dsn = $(`#${prefix}-dsn`).value.trim();
+    if (!driver || !dsn) { toast('Driver and DSN required.', false); return; }
+    const body = {
+      driver, dsn,
+      id_column: $(`#${prefix}-id-col`).value.trim() || 'id',
+    };
+    if (prefix === 'sql') {
+      const query = $('#sql-query').value.trim();
+      if (!query) { toast('Query required.', false); return; }
+      body.source = 'sql_query';
+      body.query = query;
     } else {
-      const raw = $('#cfg-fields-text').value.trim();
-      if (!raw) { toast('Provide schema fields.', false); return; }
-      const fields = raw.split('\n').filter(Boolean).map(line => {
-        const [name, kind] = line.split(/\s+/);
-        return { name, kind: kind || 'keyword' };
-      });
-      body.config = { schema: { fields } };
+      const table = $('#tbl-name').value.trim();
+      if (!table) { toast('Table required.', false); return; }
+      body.source = 'sql_table';
+      body.table = table;
+      const where = $('#tbl-where').value.trim();
+      if (where) body.where = where;
     }
     try {
-      await api('POST', '/v1/indexes', body);
-      toast('Created index ' + id);
-      render();
-    } catch (e) { toast('Create failed: ' + e.message, false); }
+      const data = await api('POST', '/v1/infer-columns', body);
+      const cols = data.columns || [];
+      if (!cols.length) { toast('No columns detected.', false); return; }
+      $(`#${prefix}-cols`).value = cols.map(c => `${c.column} ${c.field} ${c.kind}`).join('\n');
+      toast(`Detected ${cols.length} column(s).`);
+    } catch (e) {
+      toast('Detect failed: ' + e.message, false);
+    }
   }
 
-  async function loadSQLQuery() {
-    const id = $('#cfg-sql-index').value.trim();
+  function loadSQLQuery() {
+    const id = $('#sql-index').value.trim();
     if (!id) { toast('Select an index.', false); return; }
-    const driver = $('#cfg-sql-driver').value.trim();
-    const dsn = $('#cfg-sql-dsn').value.trim();
-    const query = $('#cfg-sql-query').value.trim();
-    const idCol = $('#cfg-sql-id').value.trim();
+    const driver = $('#sql-driver').value.trim();
+    const dsn = $('#sql-dsn').value.trim();
+    const query = $('#sql-query').value.trim();
     if (!driver || !dsn || !query) { toast('Driver, DSN, and query required.', false); return; }
-    const columns = parseColumns($('#cfg-sql-cols').value);
-    try {
-      await api('POST', `/v1/indexes/${encodeURIComponent(id)}/reload-sql`, {
-        driver, dsn, query, id_column: idCol, columns,
-      });
-      toast('Data loaded for ' + id);
-    } catch (e) { toast('Load failed: ' + e.message, false); }
+    const columns = parseColumns($('#sql-cols').value);
+    if (!columns.length) { toast('No column mappings — click "Detect from query" first (or add mappings manually).', false); return; }
+    const body = {
+      driver, dsn, query,
+      id_column: $('#sql-id-col').value.trim() || 'id',
+      columns,
+    };
+    showIntegrationResult(
+      api('POST', `/v1/indexes/${encodeURIComponent(id)}/reload-sql`, body),
+      'Data loaded for ' + id);
   }
 
-  async function loadSQLTable() {
-    const id = $('#cfg-tbl-index').value.trim();
+  function loadSQLTable() {
+    const id = $('#tbl-index').value.trim();
     if (!id) { toast('Select an index.', false); return; }
-    const driver = $('#cfg-tbl-driver').value.trim();
-    const dsn = $('#cfg-tbl-dsn').value.trim();
-    const table = $('#cfg-tbl-name').value.trim();
-    const idCol = $('#cfg-tbl-id').value.trim();
-    const pageSize = parseInt($('#cfg-tbl-page').value) || 10000;
+    const driver = $('#tbl-driver').value.trim();
+    const dsn = $('#tbl-dsn').value.trim();
+    const table = $('#tbl-name').value.trim();
     if (!driver || !dsn || !table) { toast('Driver, DSN, and table required.', false); return; }
-    const columns = parseColumns($('#cfg-tbl-cols').value);
-    const selectColumns = columns.map(c => c.column);
-    try {
-      await api('POST', `/v1/indexes/${encodeURIComponent(id)}/reload-table`, {
-        driver, dsn, table, id_column: idCol, page_size: pageSize, select_columns: selectColumns, columns,
-      });
-      toast('Data loaded for ' + id);
-    } catch (e) { toast('Load failed: ' + e.message, false); }
+    const columns = parseColumns($('#tbl-cols').value);
+    if (!columns.length) { toast('No column mappings — click "Detect from table" first (or add mappings manually).', false); return; }
+    const body = {
+      driver, dsn, table,
+      where: $('#tbl-where').value.trim(),
+      id_column: $('#tbl-id-col').value.trim() || 'id',
+      page_size: parseInt($('#tbl-page-size').value) || 10000,
+      select_columns: columns.map(c => c.column),
+      columns,
+    };
+    showIntegrationResult(
+      api('POST', `/v1/indexes/${encodeURIComponent(id)}/reload-table`, body),
+      'Data loaded for ' + id);
   }
 
   async function loadJSONRecords() {
-    const id = $('#cfg-json-index').value.trim();
+    const id = $('#json-index').value.trim();
     if (!id) { toast('Select an index.', false); return; }
-    const raw = $('#cfg-json-data').value.trim();
+    const raw = $('#json-data').value.trim();
     if (!raw) { toast('Provide JSON records.', false); return; }
-    try {
-      const records = JSON.parse(raw);
-      await api('POST', `/v1/indexes/${encodeURIComponent(id)}/reload`, { records });
-      toast('Records loaded for ' + id);
-    } catch (e) { toast('Load failed: ' + e.message, false); }
-  }
-
-  // ── Datasources ────────────────────────────────────────────────────────────
-
-  async function renderDatasources() {
-    content().innerHTML = `
-      <div class="card max-w-4xl">
-        <div class="card-header">Index Info</div>
-        <div class="space-y-3 mt-3">
-          <div>${indexSelect('ds-index')}</div>
-          <button class="btn btn-primary" onclick="App.inspectDatasource()">Inspect</button>
-        </div>
-        <div id="ds-result" class="mt-4"></div>
-      </div>`;
-    await populateIndexSelect('ds-index');
-  }
-
-  async function inspectDatasource() {
-    const id = $('#ds-index').value.trim();
-    if (!id) { toast('Select an index.', false); return; }
-    const res = $('#ds-result');
+    let records;
+    try { records = JSON.parse(raw); } catch (e) { toast('Invalid JSON: ' + e.message, false); return; }
+    if (!Array.isArray(records)) records = [records];
+    // There is no bulk "load raw JSON" endpoint on the server, so each record
+    // is upserted individually via the per-document endpoint.
+    const res = $('#integration-result');
     res.innerHTML = loading();
-    try {
-      const st = await api('GET', `/v1/indexes/${id}/stats`);
-      res.innerHTML = json(st);
-    } catch (e) { res.innerHTML = `<p class="text-red-400 text-sm">${escHtml(e.message)}</p>`; }
-  }
-
-  // ── Bulk Operations ────────────────────────────────────────────────────────
-
-  async function renderBulk() {
-    content().innerHTML = `
-      <div class="grid grid-cols-1 lg:grid-cols-2 gap-6">
-        <div class="card">
-          <div class="card-header">Bulk Reload</div>
-          <p class="text-sm text-gray-500 mt-1">Reload all indexes from their configured sources.</p>
-          <button class="btn btn-primary mt-3" onclick="App.bulkReload()">Reload All</button>
-          <div id="bulk-reload-result" class="mt-3 text-sm"></div>
-        </div>
-        <div class="card">
-          <div class="card-header">Freeze Index</div>
-          <div class="space-y-3 mt-2">
-            <div>${indexSelect('freeze-index')}</div>
-            <button class="btn btn-primary" onclick="App.freezeIndex()">Freeze</button>
-          </div>
-        </div>
-        <div class="card">
-          <div class="card-header">Plan Deployment</div>
-          <div class="space-y-3 mt-2">
-            <div>${indexSelect('plan-index')}</div>
-            ${fieldInput('plan-rows', '1000000000', { label: 'Row Count', type: 'number' })}
-            <button class="btn btn-primary" onclick="App.planDeployment()">Generate Plan</button>
-          </div>
-          <div id="plan-result" class="mt-3"></div>
-        </div>
-        <div class="card">
-          <div class="card-header">Compact Generations</div>
-          <div class="space-y-3 mt-2">
-            <div>${indexSelect('compact-index')}</div>
-            ${fieldInput('compact-keep', '2', { label: 'Keep Last N', type: 'number' })}
-            <button class="btn btn-danger" onclick="App.compactGenerations()">Compact</button>
-          </div>
-        </div>
-        <div class="card">
-          <div class="card-header">Validate Index</div>
-          <div class="space-y-3 mt-2">
-            <div>${indexSelect('val-index')}</div>
-            <button class="btn btn-secondary" onclick="App.validateIndex()">Validate</button>
-          </div>
-          <div id="validate-result" class="mt-3"></div>
-        </div>
-        <div class="card">
-          <div class="card-header">Repair Index</div>
-          <div class="space-y-3 mt-2">
-            <div>${indexSelect('repair-index')}</div>
-            <button class="btn btn-secondary" onclick="App.repairIndex()">Repair</button>
-          </div>
-        </div>
-      </div>`;
-    await Promise.all([
-      populateIndexSelect('freeze-index'),
-      populateIndexSelect('plan-index'),
-      populateIndexSelect('compact-index'),
-      populateIndexSelect('val-index'),
-      populateIndexSelect('repair-index'),
-    ]);
-  }
-
-  async function bulkReload() {
-    const res = $('#bulk-reload-result');
-    res.innerHTML = '<div class="spinner"></div>';
-    try {
-      await api('POST', '/v1/bulk/reload');
-      res.innerHTML = '<span class="text-green-400">All indexes reloaded.</span>';
-    } catch (e) { res.innerHTML = `<span class="text-red-400">${escHtml(e.message)}</span>`; }
-  }
-
-  async function planDeployment() {
-    const id = $('#plan-index').value.trim();
-    if (!id) { toast('Select an index.', false); return; }
-    const rows = parseInt($('#plan-rows').value) || 1e9;
-    const res = $('#plan-result');
-    res.innerHTML = loading();
-    try {
-      const plan = await api('POST', '/v1/plan', { index_id: id, rows });
-      res.innerHTML = json(plan);
-    } catch (e) { res.innerHTML = `<span class="text-red-400 text-sm">${escHtml(e.message)}</span>`; }
-  }
-
-  async function freezeIndex() {
-    const id = $('#freeze-index').value.trim();
-    if (!id) { toast('Select an index.', false); return; }
-    toast('Freezing ' + id + '…');
-    try {
-      await api('POST', `/v1/indexes/${encodeURIComponent(id)}/freeze`);
-      toast('Frozen ' + id);
-    } catch (e) { toast('Freeze failed: ' + e.message, false); }
-  }
-
-  async function compactGenerations() {
-    const id = $('#compact-index').value.trim();
-    if (!id) { toast('Select an index.', false); return; }
-    const keep = parseInt($('#compact-keep').value) || 2;
-    toast('Compacting ' + id + '…');
-    try {
-      await api('POST', `/v1/indexes/${encodeURIComponent(id)}/compact`, { keep_last: keep });
-      toast('Compacted ' + id);
-    } catch (e) { toast('Compact failed: ' + e.message, false); }
-  }
-
-  async function validateIndex() {
-    const id = $('#val-index').value.trim();
-    if (!id) { toast('Select an index.', false); return; }
-    const res = $('#validate-result');
-    res.innerHTML = loading();
-    try {
-      const v = await api('GET', `/v1/indexes/${encodeURIComponent(id)}/validate`);
-      res.innerHTML = json(v);
-    } catch (e) { res.innerHTML = `<span class="text-red-400 text-sm">${escHtml(e.message)}</span>`; }
-  }
-
-  async function repairIndex() {
-    const id = $('#repair-index').value.trim();
-    if (!id) { toast('Select an index.', false); return; }
-    toast('Repairing ' + id + '…');
-    try {
-      await api('POST', `/v1/indexes/${encodeURIComponent(id)}/repair`);
-      toast('Repaired ' + id);
-    } catch (e) { toast('Repair failed: ' + e.message, false); }
-  }
-
-  // ── Generations ────────────────────────────────────────────────────────────
-
-  async function renderGenerations() {
-    let indexes = [];
-    try { indexes = await api('GET', '/v1/indexes'); } catch { content().innerHTML = empty('Cannot reach server.'); return; }
-    const list = Array.isArray(indexes) ? indexes : (indexes.indexes || []);
-    if (!list.length) { content().innerHTML = empty('No indexes.'); return; }
-
-    let html = '<div class="space-y-4">';
-    for (const item of list) {
-      const id = item.id || item;
-      let gens = [];
-      try { gens = await api('GET', `/v1/indexes/${encodeURIComponent(id)}/generations`); } catch {}
-      const arr = Array.isArray(gens) ? gens : (gens.generations || []);
-      html += `<div class="card">
-        <div class="card-header">${escHtml(id)}</div>`;
-      if (!arr.length) {
-        html += '<p class="text-sm text-gray-500 mt-2">No generations.</p>';
-      } else {
-        html += `<table class="mt-2"><thead><tr><th>Generation</th><th>Docs</th><th>Path</th><th>Actions</th></tr></thead><tbody>`;
-        for (const g of arr) {
-          html += `<tr>
-            <td>${fmtNum(g.generation)}</td>
-            <td>${fmtNum(g.docs)}</td>
-            <td class="text-xs text-gray-400 font-mono">${escHtml(g.path || '—')}</td>
-            <td><button class="btn btn-secondary text-xs" onclick="App.restoreGeneration('${escHtml(id)}', ${g.generation})">Restore</button></td>
-          </tr>`;
-        }
-        html += '</tbody></table>';
+    let ok = 0;
+    const errors = [];
+    for (const r of records) {
+      const docId = r.id !== undefined ? String(r.id) : '';
+      if (!docId) { errors.push('record missing "id" field: ' + JSON.stringify(r)); continue; }
+      try {
+        await api('PUT', `/v1/indexes/${encodeURIComponent(id)}/docs/${encodeURIComponent(docId)}`, r);
+        ok++;
+      } catch (e) {
+        errors.push(`${docId}: ${e.message}`);
       }
-      html += '</div>';
     }
-    html += '</div>';
-    content().innerHTML = html;
-  }
-
-  async function restoreGeneration(id, gen) {
-    toast(`Restoring ${id} gen ${gen}…`);
-    try {
-      await api('POST', `/v1/indexes/${encodeURIComponent(id)}/restore`, { generation: gen });
-      toast('Restored generation ' + gen);
-      render();
-    } catch (e) { toast('Restore failed: ' + e.message, false); }
+    toast(`Loaded ${ok}/${records.length} record(s) for ${id}`, errors.length === 0);
+    res.innerHTML = json({ loaded: ok, total: records.length, errors });
   }
 
   function refresh() { render(); }
@@ -697,10 +690,31 @@ const App = (() => {
 
   document.addEventListener('DOMContentLoaded', init);
 
-  return {
-    refresh, render, showIndexDetail, reloadIndex, reloadSQL, reloadTable, deleteIndex,
-    doSearch, createIndex, loadSQLQuery, loadSQLTable, loadJSONRecords, inspectDatasource,
-    bulkReload, planDeployment, freezeIndex, compactGenerations, validateIndex, repairIndex,
-    restoreGeneration
+  // Wraps every onclick-invoked handler so a mismatched/missing DOM element
+  // (e.g. a stale cached app.js served against a newer index.html) surfaces
+  // as a toast instead of a silent uncaught exception that makes buttons
+  // appear to do nothing.
+  function safe(fn) {
+    return function (...args) {
+      try {
+        const r = fn.apply(this, args);
+        if (r && typeof r.catch === 'function') {
+          r.catch(e => toast('Unexpected error: ' + e.message, false));
+        }
+        return r;
+      } catch (e) {
+        toast('Unexpected error: ' + e.message, false);
+      }
+    };
+  }
+
+  const handlers = {
+    refresh, render,
+    doLookup, addSearchField,
+    addSchemaFieldRow, createIndex, reloadIndex, freezeIndex, persistIndex, deleteIndex,
+    toggleDetail, upsertDoc, deleteDoc, listGenerations, validateIndex, repairIndex, compactIndex,
+    detectColumns, loadSQLQuery, loadSQLTable, loadJSONRecords,
   };
+  for (const k of Object.keys(handlers)) handlers[k] = safe(handlers[k]);
+  return handlers;
 })();

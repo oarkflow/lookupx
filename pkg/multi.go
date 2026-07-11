@@ -168,6 +168,19 @@ func (m *MultiIndexManager) Reload(ctx context.Context, id string) (BulkStats, e
 }
 
 func (m *MultiIndexManager) ReloadFromFactory(ctx context.Context, id string, factory SourceFactory, opt BulkOptions) (BulkStats, error) {
+	m.mu.RLock()
+	old := m.indexes[cleanIndexID(id)]
+	m.mu.RUnlock()
+	if old == nil {
+		return BulkStats{}, fmt.Errorf("index %q not found", id)
+	}
+	return m.ReloadWithConfig(ctx, id, old.Config, factory, opt)
+}
+
+// ReloadWithConfig atomically replaces an index using a new schema. The source
+// factory receives the new index so column names are resolved against the
+// replacement schema, not the index being retired.
+func (m *MultiIndexManager) ReloadWithConfig(ctx context.Context, id string, cfg Config, factory SourceFactory, opt BulkOptions) (BulkStats, error) {
 	id = cleanIndexID(id)
 	m.mu.RLock()
 	old := m.indexes[id]
@@ -183,7 +196,7 @@ func (m *MultiIndexManager) ReloadFromFactory(ctx context.Context, id string, fa
 	}
 	m.setReloading(id, true, "")
 	started := time.Now()
-	ix, err := New(old.Config)
+	ix, err := New(cfg)
 	if err != nil {
 		m.setReloading(id, false, err.Error())
 		return BulkStats{}, err
@@ -206,8 +219,8 @@ func (m *MultiIndexManager) ReloadFromFactory(ctx context.Context, id string, fa
 	m.mu.Lock()
 	cur := m.indexes[id]
 	if err == nil {
-		ix.cfg = old.Config
-		m.indexes[id] = &ManagedIndex{ID: id, Index: ix, Config: old.Config, Source: factory, Bulk: opt, Latency: lat, Generation: old.Generation + 1}
+		ix.cfg = cfg
+		m.indexes[id] = &ManagedIndex{ID: id, Index: ix, Config: cfg, Source: factory, Bulk: opt, Latency: lat, Generation: old.Generation + 1}
 	} else if cur != nil {
 		cur.Reloading = false
 		cur.Latency.LastError = err.Error()
@@ -346,6 +359,24 @@ func (s *MultiServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, map[string]any{"ok": true})
 		return
 	}
+	if path == "v1/auto-index" && r.Method == http.MethodPost {
+		resp, err := s.autoCreateIndex(r.Context(), r)
+		if err != nil {
+			http.Error(w, err.Error(), 400)
+			return
+		}
+		writeJSON(w, resp)
+		return
+	}
+	if path == "v1/infer-columns" && r.Method == http.MethodPost {
+		resp, err := s.inferColumns(r.Context(), r)
+		if err != nil {
+			http.Error(w, err.Error(), 400)
+			return
+		}
+		writeJSON(w, resp)
+		return
+	}
 	parts := strings.Split(path, "/")
 	if len(parts) < 3 || parts[0] != "v1" || parts[1] != "indexes" {
 		http.NotFound(w, r)
@@ -365,6 +396,8 @@ func (s *MultiServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case r.Method == http.MethodGet && action == "stats":
 		mi, _ := s.Manager.Managed(id)
 		writeJSON(w, map[string]any{"id": id, "stats": ix.Stats(), "latency": mi.Latency, "generation": mi.Generation, "reloading": mi.Reloading})
+	case r.Method == http.MethodGet && action == "schema":
+		writeJSON(w, map[string]any{"id": id, "fields": schemaFieldsWire(ix.SchemaFields())})
 	case r.Method == http.MethodPost && action == "search":
 		var q WireQuery
 		dec := json.NewDecoder(r.Body)
@@ -378,14 +411,25 @@ func (s *MultiServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			limit = 20
 		}
 		started := time.Now()
-		res, hits := ix.SearchInto(SearchRequest{Query: q.ToQuery(), Limit: limit, Offset: q.Offset, WithDocs: q.WithDocs, Sort: q.Sort, Facets: q.Facets}, nil)
+		// Search APIs are record-oriented by default. Clients can opt out with
+		// ?with_docs=false for the lowest-allocation ID-only hot path.
+		withDocs := true
+		if raw := r.URL.Query().Get("with_docs"); raw != "" {
+			withDocs, _ = strconv.ParseBool(raw)
+		}
+		res, hits := ix.SearchInto(SearchRequest{Query: q.ToQuery(), Limit: limit, Offset: q.Offset, WithDocs: withDocs, Sort: q.Sort, Facets: q.Facets}, nil)
 		res.Hits = hits
 		writeJSON(w, map[string]any{"result": res, "latency_ns": time.Since(started).Nanoseconds()})
 	case r.Method == http.MethodGet && action == "lookup":
 		raw := r.URL.RawQuery
 		limit := IntParam(r, "limit", 20)
+		query, err := ix.CompileDatasourceLookup(raw)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
 		started := time.Now()
-		_, hits := ix.SearchInto(SearchRequest{Query: ParseLookupQuery(raw), Limit: limit}, nil)
+		_, hits := ix.SearchInto(SearchRequest{Query: query, Limit: limit, WithDocs: true}, nil)
 		writeJSON(w, map[string]any{"hits": hits, "total": len(hits), "latency_ns": time.Since(started).Nanoseconds()})
 	case r.Method == http.MethodPost && action == "count":
 		var q WireQuery
@@ -459,6 +503,12 @@ func (s *MultiServer) serveWebOrNotFound(w http.ResponseWriter, r *http.Request)
 		http.NotFound(w, r)
 		return
 	}
+	// Force revalidation on every request. Without this, browsers may serve a
+	// stale index.html/app.js/styles.css straight from disk cache (no request
+	// to the server at all) even on a normal reload, since Go's static file
+	// server sends no cache-control hints of its own — only Last-Modified/ETag,
+	// which no-cache still lets the browser use for a cheap 304.
+	w.Header().Set("Cache-Control", "no-cache")
 	path := strings.TrimPrefix(r.URL.Path, "/")
 	if path == "" || path == "index.html" {
 		http.ServeFile(w, r, filepath.Join(s.WebDir, "index.html"))
@@ -532,7 +582,7 @@ func (s *MultiServer) reloadSQL(ctx context.Context, id string, r *http.Request)
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		return BulkStats{}, err
 	}
-	ix, ok := s.Manager.Get(id)
+	mi, ok := s.Manager.Managed(id)
 	if !ok {
 		return BulkStats{}, errors.New("index not found")
 	}
@@ -541,10 +591,18 @@ func (s *MultiServer) reloadSQL(ctx context.Context, id string, r *http.Request)
 		return BulkStats{}, err
 	}
 	defer db.Close()
-	cols := sqlColumnSpecs(ix, req.Columns)
-	src := SQLQuerySource{DB: db.DB(), Query: req.Query, Args: req.Args, IDColumn: req.IDColumn, SeqColumn: req.SeqColumn, Columns: cols}
+	inferred, err := InferSQLColumns(ctx, db.DB(), req.Query, req.Args, req.IDColumn, req.SeqColumn, 200)
+	if err != nil {
+		return BulkStats{}, err
+	}
+	inferred = applySQLColumnSpecs(inferred, req.Columns)
+	cfg := mi.Config
+	cfg.Schema = AutoSchema(inferred)
+	cfg.DisableSource = false
 	opt := bulkFromSQLReq(id, req.BatchSize, req.CheckpointPath, req.Resume)
-	return s.Manager.ReloadFromSource(ctx, id, src, opt)
+	return s.Manager.ReloadWithConfig(ctx, id, cfg, func(ix *Index) (Source, error) {
+		return SQLQuerySource{DB: db.DB(), Query: req.Query, Args: req.Args, IDColumn: req.IDColumn, SeqColumn: req.SeqColumn, Columns: BindSQLColumns(ix, inferred)}, nil
+	}, opt)
 }
 
 func (s *MultiServer) reloadTable(ctx context.Context, id string, r *http.Request) (BulkStats, error) {
@@ -589,6 +647,45 @@ func sqlColumnSpecs(ix *Index, specs []SQLColumnSpec) []SQLColumn {
 		cols = append(cols, SQLColumn{Column: sp.Column, Field: ix.FieldID(field), Kind: parseValueKind(sp.Kind), Normalized: sp.Normalized, Layout: sp.Layout})
 	}
 	return cols
+}
+
+func applySQLColumnSpecs(inferred []AutoColumn, specs []SQLColumnSpec) []AutoColumn {
+	byColumn := make(map[string]SQLColumnSpec, len(specs))
+	for _, spec := range specs {
+		byColumn[strings.ToLower(spec.Column)] = spec
+	}
+	for i := range inferred {
+		spec, ok := byColumn[strings.ToLower(inferred[i].Column)]
+		if !ok {
+			continue
+		}
+		if spec.Field != "" {
+			inferred[i].Field = spec.Field
+		}
+		if spec.Kind != "" {
+			inferred[i].Kind = parseValueKind(spec.Kind)
+			inferred[i].Options = fieldOptionsForValueKind(inferred[i].Kind)
+		}
+		if spec.Layout != "" {
+			inferred[i].Layout = spec.Layout
+		}
+	}
+	return inferred
+}
+
+func fieldOptionsForValueKind(kind ValueKind) FieldOptions {
+	switch kind {
+	case ValueText:
+		return FieldOptions{Kind: FieldText, Indexed: true, Stored: true, Lowercase: true}
+	case ValueNumber:
+		return FieldOptions{Kind: FieldFloat, Indexed: true, Stored: true, Sortable: true}
+	case ValueTimeUnix:
+		return FieldOptions{Kind: FieldTime, Indexed: true, Stored: true, Sortable: true}
+	case ValueVector:
+		return FieldOptions{Kind: FieldVector, Indexed: true, Stored: true}
+	default:
+		return FieldOptions{Kind: FieldKeyword, Indexed: true, Stored: true, Lookup: true, Lowercase: true}
+	}
 }
 
 func parseValueKind(kind string) ValueKind {

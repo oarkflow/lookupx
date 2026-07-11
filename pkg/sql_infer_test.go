@@ -119,6 +119,55 @@ func openFakeDB(t *testing.T, ds *fakeDataset) *sql.DB {
 	return db
 }
 
+func TestPostgresShapedDatasourceLookupReturnsSelectedRecord(t *testing.T) {
+	columns := []fakeColSpec{
+		{name: "id", dbType: "BIGINT"},
+		{name: "ld", dbType: "TEXT"},
+		{name: "cpt_code", dbType: "TEXT"},
+		{name: "work_item", dbType: "INT8"},
+		{name: "effective_date", dbType: "TIMESTAMPTZ"},
+		{name: "end_effective_date", dbType: "TIMESTAMPTZ"},
+		{name: "charge_type", dbType: "TEXT"},
+		{name: "charge_amt", dbType: "NUMERIC"},
+		{name: "provider_category", dbType: "TEXT"},
+		{name: "patient_status", dbType: "INT4"},
+	}
+	row := []driver.Value{
+		int64(943843), "943846", "99213", int64(37),
+		"2018-01-01T00:00:00Z", "2018-12-31T00:00:00Z",
+		"professional", "125.50", "physician", int64(1),
+	}
+	db := openFakeDB(t, &fakeDataset{cols: columns, rows: [][]driver.Value{row}})
+	ix, src, err := AutoSQLQuery(context.Background(), Config{}, db,
+		"SELECT id, ld, cpt_code, work_item, effective_date, end_effective_date, charge_type, charge_amt, provider_category, patient_status FROM charge_master",
+		nil, "id", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ix.IndexFrom(context.Background(), src, BulkOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	for _, raw := range []string{"ld=943846", "work_item=37", "ld=943846&work_item=37"} {
+		q, err := ix.CompileDatasourceLookup(raw)
+		if err != nil {
+			t.Fatalf("compile %q: %v", raw, err)
+		}
+		_, hits := ix.SearchInto(SearchRequest{Query: q, Limit: 10, WithDocs: true}, nil)
+		if len(hits) != 1 {
+			t.Fatalf("lookup %q returned %d hits", raw, len(hits))
+		}
+		doc := hits[0].Doc
+		for _, field := range []string{"ld", "cpt_code", "work_item", "effective_date", "end_effective_date", "charge_type", "charge_amt", "provider_category", "patient_status"} {
+			if _, ok := doc[field]; !ok {
+				t.Fatalf("lookup %q missing selected field %q in %#v", raw, field, doc)
+			}
+		}
+		if doc["effective_date"] != "2018-01-01T00:00:00Z" {
+			t.Fatalf("datasource timestamp was rewritten: %#v", doc)
+		}
+	}
+}
+
 func chargeMasterFakeDataset() *fakeDataset {
 	return &fakeDataset{
 		cols: []fakeColSpec{

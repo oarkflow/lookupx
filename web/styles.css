@@ -20,6 +20,19 @@ input[type="text"], input[type="number"], select, textarea {
 }
 input:focus, select:focus, textarea:focus { box-shadow: 0 0 0 2px #6366f1; }
 
+.search-bar { display: grid; grid-template-columns: minmax(150px, 220px) minmax(260px, 1fr) 88px auto; gap: 0.75rem; align-items: end; }
+.search-bar input, .search-bar select { height: 2.5rem; }
+.search-bar .btn { height: 2.5rem; padding-inline: 1.25rem; }
+.field-list { display: flex; flex-wrap: wrap; gap: 0.375rem; min-height: 1.75rem; margin-top: 0.75rem; }
+.field-chip { color: #9ca3af; background: #111827; border: 1px solid #374151; border-radius: 0.25rem; padding: 0.2rem 0.5rem; font-size: 0.75rem; }
+.field-chip:hover { color: #e5e7eb; border-color: #6366f1; }
+.result-meta { display: flex; justify-content: space-between; color: #9ca3af; font-size: 0.75rem; margin-bottom: 0.5rem; }
+
+@media (max-width: 760px) {
+  .search-bar { grid-template-columns: 1fr 80px auto; }
+  .search-index { grid-column: 1 / -1; }
+}
+
 table { width: 100%; border-collapse: collapse; font-size: 0.875rem; }
 th { text-align: left; padding: 0.5rem 0.75rem; border-bottom: 2px solid #374151; color: #9ca3af; font-weight: 600; }
 td { padding: 0.5rem 0.75rem; border-bottom: 1px solid #1f2937; }
@@ -32,14 +45,10 @@ pre.json { background: #0d1117; border: 1px solid #1f2937; border-radius: 0.375r
 
 @keyframes slideIn { from { transform: translateY(1rem); opacity: 0; } to { transform: translateY(0); opacity: 1; } }
 
-.grid-2 { display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 1rem; }
 .grid-3 { display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 1rem; }
 
 .badge { display: inline-block; padding: 0.125rem 0.5rem; border-radius: 9999px; font-size: 0.75rem; font-weight: 600; }
-.badge-green { background: #065f46; color: #6ee7b7; }
 .badge-yellow { background: #78350f; color: #fcd34d; }
-.badge-red { background: #7f1d1d; color: #fca5a5; }
-.badge-blue { background: #1e3a5f; color: #93c5fd; }
 
 .spinner { width: 1.25rem; height: 1.25rem; border: 2px solid #4b5563; border-top-color: #6366f1; border-radius: 50%; animation: spin 0.6s linear infinite; display: inline-block; }
 @keyframes spin { to { transform: rotate(360deg); } }

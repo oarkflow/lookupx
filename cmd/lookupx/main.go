@@ -12,6 +12,13 @@ import (
 	"time"
 
 	lookup "github.com/oarkflow/lookupx/pkg"
+
+	// Blank-imported so their database/sql drivers ("pgx", "mysql", "sqlite")
+	// are registered for the reload-sql/reload-table HTTP endpoints, which
+	// connect by driver name at request time (see pkg/datasource_sql.go).
+	_ "github.com/oarkflow/squealx/drivers/mysql"
+	_ "github.com/oarkflow/squealx/drivers/postgres"
+	_ "github.com/oarkflow/squealx/drivers/sqlite"
 )
 
 func main() {

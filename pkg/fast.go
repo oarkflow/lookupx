@@ -15,6 +15,12 @@ func (ix *Index) FieldID(name string) FieldID {
 	return InvalidFieldID
 }
 
+// SchemaFields returns the compiled schema's field options, keyed by field
+// name. Callers must not mutate the returned map.
+func (ix *Index) SchemaFields() map[string]FieldOptions {
+	return ix.cfg.Schema.Fields
+}
+
 func (ix *Index) fieldByID(id FieldID) *schemaField {
 	if int(id) >= len(ix.fieldList) {
 		return nil
