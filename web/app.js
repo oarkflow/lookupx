@@ -112,15 +112,20 @@ const App = (() => {
   // GET  /v1/indexes/{id}/lookup?k=v&...    quick key=value lookup
   // POST /v1/indexes/{id}/search            full query DSL (WireQuery)
 
+  let searchSchema = {};
+  let filterRowSeq = 0;
+
   async function renderSearch() {
     content().innerHTML = `
       <form class="search-bar" onsubmit="event.preventDefault(); App.doLookup()">
         <div class="search-index">${indexSelect('lookup-index')}</div>
-        <input id="lookup-query" type="search" autocomplete="off" placeholder="field=value &amp; status=active" aria-label="Search filters" />
         <input id="lookup-limit" type="number" min="1" max="500" value="25" aria-label="Result limit" />
         <button class="btn btn-primary" type="submit">Search</button>
       </form>
-      <div id="search-fields" class="field-list"></div>
+      <div class="filter-toolbar">
+        <button class="btn btn-secondary" type="button" onclick="App.addFilter()">+ Add filter</button>
+      </div>
+      <div id="filter-rows" class="filter-rows"></div>
       <div id="search-results" class="mt-4">
         <div class="empty-state"><p>Select an index and enter filters.</p></div>
       </div>
@@ -132,20 +137,74 @@ const App = (() => {
 
   async function loadSearchFields() {
     const id = $('#lookup-index') && $('#lookup-index').value;
-    const host = $('#search-fields');
-    if (!id || !host) return;
+    if (!id) return;
     try {
       const data = await api('GET', `/v1/indexes/${encodeURIComponent(id)}/schema`);
-      host.innerHTML = Object.keys(data.fields || {}).map(name =>
-        `<button type="button" class="field-chip" onclick="App.addSearchField(decodeURIComponent('${encodeURIComponent(name)}'))">${escHtml(name)}</button>`).join('');
-    } catch { host.innerHTML = ''; }
+      searchSchema = data.fields || {};
+      const rows = $('#filter-rows');
+      rows.innerHTML = '';
+      addFilter();
+    } catch { searchSchema = {}; }
   }
 
-  function addSearchField(name) {
-    const input = $('#lookup-query');
-    const separator = input.value.trim() ? '&' : '';
-    input.value += `${separator}${name}=`;
-    input.focus();
+  function operatorsForField(name) {
+    const kind = Number((searchSchema[name] || {}).kind);
+    if ([2, 3, 5].includes(kind)) return [
+      ['eq', 'Equal'], ['ne', 'Not equal'], ['not_zero', 'Not zero'],
+      ['gt', 'Greater than'], ['gte', 'Greater or equal'],
+      ['lt', 'Less than'], ['lte', 'Less or equal'], ['between', 'Between'],
+      ['in', 'In list'], ['not_in', 'Not in list'], ['exists', 'Has value'], ['missing', 'Has no value'],
+    ];
+    return [
+      ['eq', 'Equal'], ['ne', 'Not equal'], ['contains', 'Contains'],
+      ['not_contains', 'Does not contain'], ['starts_with', 'Starts with'],
+      ['ends_with', 'Ends with'], ['fuzzy', 'Similar to'], ['in', 'In list'],
+      ['not_in', 'Not in list'], ['exists', 'Has value'], ['missing', 'Has no value'],
+    ];
+  }
+
+  function addFilter(selectedField = '') {
+    const host = $('#filter-rows');
+    const fields = Object.keys(searchSchema);
+    if (!host || !fields.length) return;
+    const id = ++filterRowSeq;
+    const fieldName = selectedField || fields[0];
+    host.insertAdjacentHTML('beforeend', `
+      <div class="filter-row" data-filter-id="${id}">
+        <select class="filter-field" aria-label="Filter field" onchange="App.updateFilterOperators(${id})">
+          ${fields.map(name => `<option value="${escHtml(name)}" ${name === fieldName ? 'selected' : ''}>${escHtml(name)}</option>`).join('')}
+        </select>
+        <select class="filter-operator" aria-label="Filter operator"></select>
+        <input class="filter-value" type="text" autocomplete="off" placeholder="Value" aria-label="Filter value" />
+        <button class="filter-remove" type="button" title="Remove filter" aria-label="Remove filter" onclick="App.removeFilter(${id})">×</button>
+      </div>`);
+    updateFilterOperators(id);
+  }
+
+  function updateFilterOperators(id) {
+    const row = document.querySelector(`[data-filter-id="${id}"]`);
+    if (!row) return;
+    const fieldName = row.querySelector('.filter-field').value;
+    const op = row.querySelector('.filter-operator');
+    op.innerHTML = operatorsForField(fieldName).map(([value, label]) => `<option value="${value}">${label}</option>`).join('');
+    op.onchange = () => updateFilterValueState(id);
+    updateFilterValueState(id);
+  }
+
+  function updateFilterValueState(id) {
+    const row = document.querySelector(`[data-filter-id="${id}"]`);
+    if (!row) return;
+    const op = row.querySelector('.filter-operator').value;
+    const input = row.querySelector('.filter-value');
+    const noValue = ['exists', 'missing', 'not_zero'].includes(op);
+    input.disabled = noValue;
+    input.placeholder = op === 'between' ? 'Minimum, maximum' : ['in', 'not_in'].includes(op) ? 'Value 1, value 2' : 'Value';
+    if (noValue) input.value = '';
+  }
+
+  function removeFilter(id) {
+    const row = document.querySelector(`[data-filter-id="${id}"]`);
+    if (row) row.remove();
   }
 
   function fmtCell(v) {
@@ -191,13 +250,14 @@ const App = (() => {
     const id = $('#lookup-index').value.trim();
     if (!id) { toast('Select an index first.', false); return; }
     const limit = parseInt($('#lookup-limit').value) || 25;
-    const raw = $('#lookup-query').value.trim().replace(/^\?/, '');
     const params = new URLSearchParams();
-    for (const part of raw.split('&')) {
-      if (!part.trim()) continue;
-      const split = part.indexOf('=');
-      if (split < 1) { toast(`Invalid filter: ${part}`, false); return; }
-      params.append(part.slice(0, split).trim(), part.slice(split + 1).trim());
+    for (const row of $$('.filter-row')) {
+      const fieldName = row.querySelector('.filter-field').value;
+      const operator = row.querySelector('.filter-operator').value;
+      const input = row.querySelector('.filter-value');
+      const value = input.disabled ? '' : input.value.trim();
+      if (!input.disabled && !value) { toast(`Value required for ${fieldName}`, false); input.focus(); return; }
+      params.append(`${fieldName}__${operator}`, value);
     }
     params.set('limit', String(limit));
     const res = $('#search-results');
@@ -710,7 +770,7 @@ const App = (() => {
 
   const handlers = {
     refresh, render,
-    doLookup, addSearchField,
+    doLookup, addFilter, updateFilterOperators, removeFilter,
     addSchemaFieldRow, createIndex, reloadIndex, freezeIndex, persistIndex, deleteIndex,
     toggleDetail, upsertDoc, deleteDoc, listGenerations, validateIndex, repairIndex, compactIndex,
     detectColumns, loadSQLQuery, loadSQLTable, loadJSONRecords,

@@ -930,41 +930,161 @@ func (ix *Index) CompileDatasourceLookup(raw string) (Query, error) {
 		if field == "limit" || field == "offset" {
 			continue
 		}
-		opt, ok := ix.cfg.Schema.Fields[field]
+		name, operator := lookupFieldOperator(field)
+		opt, ok := ix.cfg.Schema.Fields[name]
 		if !ok {
-			return nil, fmt.Errorf("unknown filter field %q", field)
+			return nil, fmt.Errorf("unknown filter field %q", name)
 		}
 		for _, value := range values {
 			value = strings.TrimSpace(value)
-			if value == "" {
+			if value == "" && operator != "exists" && operator != "missing" && operator != "not_zero" {
 				continue
 			}
-			switch opt.Kind {
-			case FieldInt, FieldFloat:
-				n, err := strconv.ParseFloat(value, 64)
-				if err != nil {
-					return nil, fmt.Errorf("filter %q requires a number: %w", field, err)
-				}
-				filters = append(filters, Range{Field: field, GTE: n, LTE: n})
-			case FieldTime:
-				unix, err := parseSourceTime(value, "")
-				if err != nil {
-					return nil, fmt.Errorf("filter %q: %w", field, err)
-				}
-				filters = append(filters, Range{Field: field, GTE: unix, LTE: unix})
-			case FieldText:
-				filters = append(filters, Simple(field, value))
-			case FieldVector:
-				return nil, fmt.Errorf("field %q requires vector search, not lookup filtering", field)
-			default:
-				filters = append(filters, Term{Field: field, Value: value})
+			q, err := compileDatasourceFilter(name, operator, value, opt)
+			if err != nil {
+				return nil, err
 			}
+			filters = append(filters, q)
 		}
 	}
 	if len(filters) == 0 {
 		return MatchAll{}, nil
 	}
 	return Bool{Filter: filters}, nil
+}
+
+func lookupFieldOperator(key string) (string, string) {
+	parts := strings.SplitN(key, "__", 2)
+	if len(parts) == 1 {
+		return key, "eq"
+	}
+	return parts[0], strings.ToLower(parts[1])
+}
+
+func compileDatasourceFilter(field, op, value string, opt FieldOptions) (Query, error) {
+	numeric := opt.Kind == FieldInt || opt.Kind == FieldFloat || opt.Kind == FieldTime
+	parseNumber := func(raw string) (float64, error) {
+		if opt.Kind == FieldTime {
+			n, err := parseSourceTime(raw, "")
+			return float64(n), err
+		}
+		n, err := strconv.ParseFloat(raw, 64)
+		if err != nil {
+			return 0, fmt.Errorf("filter %q requires a number: %w", field, err)
+		}
+		return n, nil
+	}
+	equal := func(raw string) (Query, error) {
+		if numeric {
+			n, err := parseNumber(raw)
+			return Range{Field: field, GTE: n, LTE: n}, err
+		}
+		if opt.Kind == FieldText {
+			return Simple(field, raw), nil
+		}
+		return Term{Field: field, Value: raw}, nil
+	}
+	switch op {
+	case "eq", "equal", "equals":
+		return equal(value)
+	case "ne", "neq", "not_equal":
+		q, err := equal(value)
+		return Not{Q: q}, err
+	case "exists":
+		return Exists{Field: field}, nil
+	case "missing", "not_exists":
+		return Missing{Field: field}, nil
+	case "not_zero":
+		if !numeric {
+			return nil, fmt.Errorf("operator %q requires a numeric field", op)
+		}
+		return Or{Range{Field: field, LT: 0}, Range{Field: field, GT: 0}}, nil
+	case "gt", "gte", "lt", "lte":
+		if !numeric {
+			return nil, fmt.Errorf("operator %q requires a numeric or time field", op)
+		}
+		n, err := parseNumber(value)
+		if err != nil {
+			return nil, err
+		}
+		q := Range{Field: field}
+		switch op {
+		case "gt":
+			q.GT = n
+		case "gte":
+			q.GTE = n
+		case "lt":
+			q.LT = n
+		case "lte":
+			q.LTE = n
+		}
+		return q, nil
+	case "between":
+		if !numeric {
+			return nil, fmt.Errorf("operator %q requires a numeric or time field", op)
+		}
+		bounds := strings.SplitN(value, ",", 2)
+		if len(bounds) != 2 {
+			return nil, fmt.Errorf("filter %q between value must be min,max", field)
+		}
+		lo, err := parseNumber(strings.TrimSpace(bounds[0]))
+		if err != nil {
+			return nil, err
+		}
+		hi, err := parseNumber(strings.TrimSpace(bounds[1]))
+		if err != nil {
+			return nil, err
+		}
+		return Range{Field: field, GTE: lo, LTE: hi}, nil
+	case "contains", "not_contains", "starts_with", "ends_with", "fuzzy":
+		if numeric || opt.Kind == FieldVector {
+			return nil, fmt.Errorf("operator %q requires a string field", op)
+		}
+		var q Query
+		switch op {
+		case "contains", "not_contains":
+			if !opt.Ngram {
+				return nil, fmt.Errorf("contains is not enabled for field %q; reload the datasource to rebuild its schema", field)
+			}
+			q = Contains{Field: field, Value: value}
+		case "starts_with":
+			if !opt.Prefix {
+				return nil, fmt.Errorf("starts_with is not enabled for field %q; reload the datasource to rebuild its schema", field)
+			}
+			q = Prefix{Field: field, Value: value}
+		case "ends_with":
+			if !opt.Suffix {
+				return nil, fmt.Errorf("ends_with is not enabled for field %q; reload the datasource to rebuild its schema", field)
+			}
+			q = Suffix{Field: field, Value: value}
+		case "fuzzy":
+			if !opt.Fuzzy {
+				return nil, fmt.Errorf("fuzzy is not enabled for field %q; reload the datasource to rebuild its schema", field)
+			}
+			q = Fuzzy{Field: field, Value: value, Distance: 1}
+		}
+		if op == "not_contains" {
+			return Not{Q: q}, nil
+		}
+		return q, nil
+	case "in", "not_in":
+		parts := strings.Split(value, ",")
+		queries := make([]Query, 0, len(parts))
+		for _, part := range parts {
+			q, err := equal(strings.TrimSpace(part))
+			if err != nil {
+				return nil, err
+			}
+			queries = append(queries, q)
+		}
+		q := Query(Or(queries))
+		if op == "not_in" {
+			q = Not{Q: q}
+		}
+		return q, nil
+	default:
+		return nil, fmt.Errorf("unsupported operator %q for field %q", op, field)
+	}
 }
 
 // PagedSQLSource streams very large database tables with keyset pagination.

@@ -353,7 +353,21 @@ func isBoolDBType(t string) bool {
 func AutoSchema(cols []AutoColumn) Schema {
 	fields := make(map[string]FieldOptions, len(cols))
 	for _, c := range cols {
-		fields[c.Field] = c.Options
+		opt := c.Options
+		if opt.Kind == FieldKeyword || opt.Kind == FieldText {
+			opt.Indexed = true
+			opt.Prefix = true
+			opt.Suffix = true
+			opt.Ngram = true
+			opt.Fuzzy = true
+			if opt.MinGram <= 0 {
+				opt.MinGram = 3
+			}
+			if opt.MaxGram <= 0 {
+				opt.MaxGram = 3
+			}
+		}
+		fields[c.Field] = opt
 	}
 	return Schema{Fields: fields}
 }

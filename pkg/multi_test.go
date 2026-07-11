@@ -85,7 +85,7 @@ func TestReloadWithConfigReplacesOldDatasourceSchema(t *testing.T) {
 func TestLookupFiltersDatasourceTextAndNumericFields(t *testing.T) {
 	mgr := NewMultiIndexManager()
 	ix, err := New(Config{Schema: Schema{Fields: map[string]FieldOptions{
-		"ld":        {Kind: FieldText, Indexed: true, Stored: true, Lowercase: true},
+		"ld":        {Kind: FieldText, Indexed: true, Stored: true, Lowercase: true, Prefix: true, Suffix: true, Ngram: true, Fuzzy: true, MinGram: 3, MaxGram: 3},
 		"work_item": {Kind: FieldInt, Indexed: true, Stored: true, Sortable: true},
 		"cpt_code":  {Kind: FieldKeyword, Indexed: true, Stored: true, Lookup: true, Lowercase: true},
 	}}})
@@ -101,6 +101,9 @@ func TestLookupFiltersDatasourceTextAndNumericFields(t *testing.T) {
 		{ID: "other", Seq: 2, Values: []SourceValue{
 			{Field: ix.FieldID("ld"), Kind: ValueText, String: "different record"},
 			{Field: ix.FieldID("work_item"), Kind: ValueNumber, Number: 99},
+		}},
+		{ID: "zero", Seq: 3, Values: []SourceValue{
+			{Field: ix.FieldID("work_item"), Kind: ValueNumber, Number: 0},
 		}},
 	}
 	if _, err := ix.IndexFrom(context.Background(), SliceSource{Records: records}, BulkOptions{}); err != nil {
@@ -125,6 +128,46 @@ func TestLookupFiltersDatasourceTextAndNumericFields(t *testing.T) {
 		}
 		if len(body.Hits) != 1 || body.Hits[0].ID != "943846" || body.Hits[0].Doc["work_item"] != float64(37) {
 			t.Fatalf("filter %q returned %#v", filter, body.Hits)
+		}
+	}
+}
+
+func TestLookupDatasourceOperators(t *testing.T) {
+	ix, err := New(Config{Schema: Schema{Fields: map[string]FieldOptions{
+		"name":   {Kind: FieldKeyword, Indexed: true, Stored: true, Lowercase: true, Prefix: true, Suffix: true, Ngram: true, Fuzzy: true, MinGram: 3, MaxGram: 3},
+		"amount": {Kind: FieldFloat, Indexed: true, Stored: true, Sortable: true},
+	}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	records := []SourceRecord{
+		{ID: "a", Values: []SourceValue{{Field: ix.FieldID("name"), Kind: ValueKeyword, String: "Alpha service"}, {Field: ix.FieldID("amount"), Kind: ValueNumber, Number: 0}}},
+		{ID: "b", Values: []SourceValue{{Field: ix.FieldID("name"), Kind: ValueKeyword, String: "Beta service"}, {Field: ix.FieldID("amount"), Kind: ValueNumber, Number: 37}}},
+		{ID: "c", Values: []SourceValue{{Field: ix.FieldID("name"), Kind: ValueKeyword, String: "Gamma plan"}, {Field: ix.FieldID("amount"), Kind: ValueNumber, Number: 99}}},
+		{ID: "d"},
+	}
+	if _, err := ix.IndexFrom(context.Background(), SliceSource{Records: records}, BulkOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	tests := []struct {
+		raw  string
+		want int
+	}{
+		{"name__eq=Alpha+service", 1}, {"name__ne=Alpha+service", 3},
+		{"name__contains=service", 2}, {"name__not_contains=service", 2},
+		{"name__starts_with=beta", 1}, {"name__ends_with=plan", 1},
+		{"name__in=Alpha+service%2CGamma+plan", 2}, {"name__not_in=Alpha+service%2CGamma+plan", 2},
+		{"name__exists=", 3}, {"name__missing=", 1},
+		{"amount__not_zero=", 2}, {"amount__gt=37", 1}, {"amount__gte=37", 2},
+		{"amount__lt=37", 1}, {"amount__lte=37", 2}, {"amount__between=30%2C40", 1},
+	}
+	for _, tc := range tests {
+		q, err := ix.CompileDatasourceLookup(tc.raw)
+		if err != nil {
+			t.Fatalf("%s: %v", tc.raw, err)
+		}
+		if got := ix.Count(q); got != tc.want {
+			t.Errorf("%s: got %d, want %d", tc.raw, got, tc.want)
 		}
 	}
 }
