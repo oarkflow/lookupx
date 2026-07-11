@@ -178,7 +178,10 @@ const App = (() => {
           ${fields.map(name => `<option value="${escHtml(name)}" ${name === fieldName ? 'selected' : ''}>${escHtml(name)}</option>`).join('')}
         </select>
         <select class="filter-operator" aria-label="Filter operator"></select>
-        <input class="filter-value" type="text" autocomplete="off" placeholder="Value" aria-label="Filter value" />
+        <div class="filter-value-pair">
+          <input class="filter-value" type="text" autocomplete="off" placeholder="Value" aria-label="Filter value" />
+          <input class="filter-value-2" type="text" autocomplete="off" placeholder="Maximum" aria-label="Filter value 2" style="display:none" />
+        </div>
         <button class="filter-remove" type="button" title="Remove filter" aria-label="Remove filter" onclick="App.removeFilter(${id})">×</button>
       </div>`);
     updateFilterOperators(id);
@@ -194,15 +197,48 @@ const App = (() => {
     updateFilterValueState(id);
   }
 
+  function fieldKind(name) {
+    return Number((searchSchema[name] || {}).kind);
+  }
+
   function updateFilterValueState(id) {
     const row = document.querySelector(`[data-filter-id="${id}"]`);
     if (!row) return;
     const op = row.querySelector('.filter-operator').value;
+    const fieldName = row.querySelector('.filter-field').value;
+    const kind = fieldKind(fieldName);
     const input = row.querySelector('.filter-value');
+    const input2 = row.querySelector('.filter-value-2');
     const noValue = ['exists', 'missing', 'not_zero'].includes(op);
-    input.disabled = noValue;
-    input.placeholder = op === 'between' ? 'Minimum, maximum' : ['in', 'not_in'].includes(op) ? 'Value 1, value 2' : 'Value';
-    if (noValue) input.value = '';
+    const isBetween = op === 'between';
+    const isTime = kind === 5;
+    const isNumeric = [2, 3, 5].includes(kind);
+
+    if (noValue) {
+      input.disabled = true;
+      input.value = '';
+      input2.style.display = 'none';
+      input2.disabled = true;
+      input2.value = '';
+      row.style.gridTemplateColumns = '';
+    } else if (isBetween) {
+      input.disabled = false;
+      input2.disabled = false;
+      input2.style.display = '';
+      input.placeholder = 'Minimum';
+      input2.placeholder = 'Maximum';
+      input.type = isTime ? 'date' : isNumeric ? 'number' : 'text';
+      input2.type = isTime ? 'date' : isNumeric ? 'number' : 'text';
+      row.style.gridTemplateColumns = 'minmax(150px, 1fr) minmax(160px, 220px) minmax(90px, 1fr) minmax(90px, 1fr) 2.5rem';
+    } else {
+      input.disabled = false;
+      input2.disabled = true;
+      input2.style.display = 'none';
+      input2.value = '';
+      row.style.gridTemplateColumns = '';
+      input.placeholder = ['in', 'not_in'].includes(op) ? 'Value 1, value 2' : 'Value';
+      input.type = 'text';
+    }
   }
 
   function removeFilter(id) {
@@ -262,8 +298,17 @@ const App = (() => {
       const fieldName = row.querySelector('.filter-field').value;
       const operator = row.querySelector('.filter-operator').value;
       const input = row.querySelector('.filter-value');
-      const value = input.disabled ? '' : input.value.trim();
-      if (!input.disabled && !value) { toast(`Value required for ${fieldName}`, false); input.focus(); return; }
+      const input2 = row.querySelector('.filter-value-2');
+      let value;
+      if (operator === 'between') {
+        const v1 = input.value.trim();
+        const v2 = input2.value.trim();
+        if (!v1 || !v2) { toast(`Both values required for ${fieldName} between`, false); input.focus(); return; }
+        value = `${v1},${v2}`;
+      } else {
+        value = input.disabled ? '' : input.value.trim();
+      }
+      if (operator !== 'between' && !input.disabled && !value) { toast(`Value required for ${fieldName}`, false); input.focus(); return; }
       params.append(`${fieldName}__${operator}`, value);
     }
     params.set('limit', String(limit));
