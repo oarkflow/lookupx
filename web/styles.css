@@ -26,7 +26,7 @@ input:-webkit-autofill, input:-webkit-autofill:hover, input:-webkit-autofill:foc
   -webkit-text-fill-color: #e5e7eb; box-shadow: 0 0 0 1000px #1f2937 inset;
 }
 
-.search-bar { display: grid; grid-template-columns: minmax(180px, 260px) 88px auto; gap: 0.75rem; align-items: end; }
+.search-bar { display: grid; grid-template-columns: minmax(180px, 260px) minmax(240px, 1fr) 88px auto; gap: 0.75rem; align-items: end; }
 .search-bar input, .search-bar select { height: 2.5rem; }
 .search-bar .btn { height: 2.5rem; padding-inline: 1.25rem; }
 .filter-toolbar { display: flex; justify-content: flex-end; margin-top: 0.75rem; }
@@ -40,6 +40,7 @@ input:-webkit-autofill, input:-webkit-autofill:hover, input:-webkit-autofill:foc
 @media (max-width: 760px) {
   .search-bar { grid-template-columns: 1fr 80px auto; }
   .search-index { grid-column: 1 / -1; }
+	#lookup-term { grid-column: 1 / -1; }
   .filter-row { grid-template-columns: 1fr 1fr 2.5rem; }
   .filter-value { grid-column: 1 / 3; grid-row: 2; }
   .filter-remove { grid-column: 3; grid-row: 1; }

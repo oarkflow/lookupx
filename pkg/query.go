@@ -54,33 +54,84 @@ func (q sourceStringFilter) eval(ix *Index) *Bitmap {
 	ix.mu.RLock()
 	defer ix.mu.RUnlock()
 	opt, ok := ix.cfg.Schema.Fields[q.Field]
-	if !ok || ix.cfg.DisableSource {
+	if !ok {
 		return NewBitmap()
 	}
 	want := normalize(q.Value, opt.Lowercase)
 	out := NewBitmapCap(ix.nextDocID)
-	for id := DocID(1); id < ix.nextDocID; id++ {
-		if ix.isDeletedOrExpiredLocked(id) || int(id) >= len(ix.docs) || ix.docs[id] == nil {
-			continue
-		}
-		raw, exists := ix.docs[id][q.Field]
-		if !exists || raw == nil {
-			continue
-		}
-		got := normalize(fmt.Sprint(raw), opt.Lowercase)
-		match := false
+	match := func(got string) bool {
 		switch q.Operator {
 		case "contains":
-			match = strings.Contains(got, want)
+			return strings.Contains(got, want)
 		case "starts_with":
-			match = strings.HasPrefix(got, want)
+			return strings.HasPrefix(got, want)
 		case "ends_with":
-			match = strings.HasSuffix(got, want)
+			return strings.HasSuffix(got, want)
 		case "fuzzy":
-			match = levenshtein(got, want, 1) <= 1
+			return levenshtein(got, want, 1) <= 1
 		}
-		if match {
+		return false
+	}
+	// Stored string columns remain available when source documents are disabled
+	// and preserve the complete value (unlike analyzed text postings).
+	if col := ix.strings[q.Field]; col != nil {
+		for id, raw := range col {
+			if !ix.isDeletedOrExpiredLocked(id) && match(normalize(raw, opt.Lowercase)) {
+				out.Add(id)
+			}
+		}
+		return out
+	}
+	// If source documents are retained, scan them as the compatibility path.
+	if !ix.cfg.DisableSource {
+		for id := DocID(1); id < ix.nextDocID; id++ {
+			if ix.isDeletedOrExpiredLocked(id) || int(id) >= len(ix.docs) || ix.docs[id] == nil {
+				continue
+			}
+			raw, exists := ix.docs[id][q.Field]
+			if !exists || raw == nil {
+				continue
+			}
+			got := normalize(fmt.Sprint(raw), opt.Lowercase)
+			if match(got) {
+				out.Add(id)
+			}
+		}
+		return out
+	}
+	// Lookup/keyword fields retain their full values as posting terms, so pattern
+	// matching can still be correct without either source documents or a derived
+	// pattern index. This is slower than an n-gram index but avoids extra indexing
+	// cost and is only used when a pattern query is requested.
+	fi := ix.fields[q.Field]
+	if fi == nil {
+		return out
+	}
+	addTerm := func(term string) {
+		if !match(term) {
+			return
+		}
+		if id := fi.termOne[term]; id != 0 && !ix.isDeletedOrExpiredLocked(id) {
 			out.Add(id)
+		}
+		if bm := fi.terms[term]; bm != nil {
+			out = out.OrInPlace(bm)
+		}
+		if id, exists := fi.unique[term]; exists && !ix.isDeletedOrExpiredLocked(id) {
+			out.Add(id)
+		}
+	}
+	for term := range fi.termOne {
+		addTerm(term)
+	}
+	for term := range fi.terms {
+		if fi.termOne[term] == 0 {
+			addTerm(term)
+		}
+	}
+	for term := range fi.unique {
+		if fi.termOne[term] == 0 && fi.terms[term] == nil {
+			addTerm(term)
 		}
 	}
 	return out

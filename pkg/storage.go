@@ -932,6 +932,19 @@ func (ix *Index) CompileDatasourceLookup(raw string) (Query, error) {
 		if field == "limit" || field == "offset" {
 			continue
 		}
+		if field == "term" {
+			if _, schemaField := ix.cfg.Schema.Fields[field]; schemaField {
+				// Preserve exact filtering for schemas that define a real field named
+				// "term" (for example TupleLookupSchema).
+			} else {
+				for _, value := range values {
+					if q := ix.compileGlobalTerm(strings.TrimSpace(value)); q != nil {
+						filters = append(filters, q)
+					}
+				}
+				continue
+			}
+		}
 		name, operator := lookupFieldOperator(field)
 		opt, ok := ix.cfg.Schema.Fields[name]
 		if !ok {
@@ -953,6 +966,35 @@ func (ix *Index) CompileDatasourceLookup(raw string) (Query, error) {
 		return MatchAll{}, nil
 	}
 	return Bool{Filter: filters}, nil
+}
+
+// compileGlobalTerm searches each word across every text, keyword, and boolean
+// field. Words are ANDed, while fields are ORed, so "nail repair" may match
+// either one column or values distributed across multiple searchable columns.
+func (ix *Index) compileGlobalTerm(value string) Query {
+	words := strings.Fields(value)
+	if len(words) == 0 {
+		return nil
+	}
+	wordQueries := make([]Query, 0, len(words))
+	for _, word := range words {
+		fields := make([]Query, 0, len(ix.cfg.Schema.Fields))
+		for field, opt := range ix.cfg.Schema.Fields {
+			switch opt.Kind {
+			case FieldText:
+				fields = append(fields, Term{Field: field, Value: word})
+			case FieldKeyword, FieldBool:
+				fields = append(fields, sourceStringFilter{Field: field, Value: word, Operator: "contains"})
+			}
+		}
+		if len(fields) > 0 {
+			wordQueries = append(wordQueries, Or(fields))
+		}
+	}
+	if len(wordQueries) == 0 {
+		return nil
+	}
+	return And(wordQueries)
 }
 
 func lookupFieldOperator(key string) (string, string) {

@@ -119,6 +119,7 @@ const App = (() => {
     content().innerHTML = `
       <form class="search-bar" onsubmit="event.preventDefault(); App.doLookup()">
         <div class="search-index">${indexSelect('lookup-index')}</div>
+		<input id="lookup-term" type="search" placeholder="Search all text columns…" aria-label="Full-text search term" />
         <input id="lookup-limit" type="number" min="1" max="500" value="25" aria-label="Result limit" />
         <button class="btn btn-primary" type="submit">Search</button>
       </form>
@@ -251,6 +252,8 @@ const App = (() => {
     if (!id) { toast('Select an index first.', false); return; }
     const limit = parseInt($('#lookup-limit').value) || 25;
     const params = new URLSearchParams();
+	const term = $('#lookup-term').value.trim();
+	if (term) params.set('term', term);
     for (const row of $$('.filter-row')) {
       const fieldName = row.querySelector('.filter-field').value;
       const operator = row.querySelector('.filter-operator').value;

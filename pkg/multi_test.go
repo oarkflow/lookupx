@@ -238,6 +238,74 @@ func TestLookupFiltersDatasourceTextAndNumericFields(t *testing.T) {
 	}
 }
 
+func TestLookupPatternFiltersWithDisabledSourceAndExactFilter(t *testing.T) {
+	ix, err := New(Config{DisableSource: true, Schema: Schema{Fields: map[string]FieldOptions{
+		"work_item": {Kind: FieldInt, Indexed: true},
+		"cpt_code":  {Kind: FieldKeyword, Lookup: true, Lowercase: true},
+	}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	records := []SourceRecord{
+		{ID: "match", Values: []SourceValue{{Field: ix.FieldID("work_item"), Kind: ValueNumber, Number: 37}, {Field: ix.FieldID("cpt_code"), Kind: ValueKeyword, String: "NAIL-REPAIR"}}},
+		{ID: "wrong-work-item", Values: []SourceValue{{Field: ix.FieldID("work_item"), Kind: ValueNumber, Number: 99}, {Field: ix.FieldID("cpt_code"), Kind: ValueKeyword, String: "NAIL-REMOVAL"}}},
+	}
+	if _, err := ix.IndexFrom(context.Background(), SliceSource{Records: records}, BulkOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	for _, raw := range []string{
+		"work_item=37&cpt_code__contains=nail",
+		"work_item=37&cpt_code__starts_with=nai",
+		"work_item=37&cpt_code__ends_with=repair",
+		"work_item=37&cpt_code__fuzzy=nail-repai",
+	} {
+		q, err := ix.CompileDatasourceLookup(raw)
+		if err != nil {
+			t.Fatalf("compile %q: %v", raw, err)
+		}
+		_, hits := ix.SearchInto(SearchRequest{Query: q, Limit: 10}, nil)
+		if len(hits) != 1 || hits[0].ID != "match" {
+			t.Fatalf("filter %q returned %#v", raw, hits)
+		}
+	}
+}
+
+func TestLookupGlobalTermAcrossColumnsAndStructuredFilters(t *testing.T) {
+	ix, err := New(Config{DisableSource: true, Schema: Schema{Fields: map[string]FieldOptions{
+		"description": {Kind: FieldText, Indexed: true, Lowercase: true},
+		"code":        {Kind: FieldKeyword, Lookup: true, Lowercase: true},
+		"work_item":   {Kind: FieldInt, Indexed: true},
+	}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	records := []SourceRecord{
+		{ID: "a", Values: []SourceValue{{Field: ix.FieldID("description"), Kind: ValueText, String: "Repair nail bed"}, {Field: ix.FieldID("code"), Kind: ValueKeyword, String: "11760"}, {Field: ix.FieldID("work_item"), Kind: ValueNumber, Number: 37}}},
+		{ID: "b", Values: []SourceValue{{Field: ix.FieldID("description"), Kind: ValueText, String: "Repair nail bed"}, {Field: ix.FieldID("code"), Kind: ValueKeyword, String: "11760"}, {Field: ix.FieldID("work_item"), Kind: ValueNumber, Number: 99}}},
+		{ID: "c", Values: []SourceValue{{Field: ix.FieldID("description"), Kind: ValueText, String: "Office visit"}, {Field: ix.FieldID("code"), Kind: ValueKeyword, String: "NAIL-CODE"}, {Field: ix.FieldID("work_item"), Kind: ValueNumber, Number: 37}}},
+	}
+	if _, err := ix.IndexFrom(context.Background(), SliceSource{Records: records}, BulkOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		raw  string
+		want int
+	}{
+		{"term=nail", 3},
+		{"term=nail+repair", 2},
+		{"term=nail&work_item=37", 2},
+	} {
+		q, err := ix.CompileDatasourceLookup(tc.raw)
+		if err != nil {
+			t.Fatalf("compile %q: %v", tc.raw, err)
+		}
+		_, hits := ix.SearchInto(SearchRequest{Query: q, Limit: 10}, nil)
+		if len(hits) != tc.want {
+			t.Fatalf("term query %q returned %d hits: %#v", tc.raw, len(hits), hits)
+		}
+	}
+}
+
 func TestLookupDatasourceOperators(t *testing.T) {
 	ix, err := New(Config{Schema: Schema{Fields: map[string]FieldOptions{
 		"name":   {Kind: FieldKeyword, Indexed: true, Stored: true, Lowercase: true},
