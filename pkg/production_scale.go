@@ -425,7 +425,12 @@ func (s FileSegmentStore) SaveIndex(ctx context.Context, indexID string, ix *Ind
 		return PersistentManifest{}, err
 	}
 	if err = gob.NewEncoder(f).Encode(dump); err == nil {
-		err = f.Close()
+		err = f.Sync()
+		if err == nil {
+			err = f.Close()
+		} else {
+			_ = f.Close()
+		}
 	} else {
 		_ = f.Close()
 	}
@@ -440,7 +445,14 @@ func (s FileSegmentStore) SaveIndex(ctx context.Context, indexID string, ix *Ind
 	if err = os.WriteFile(filepath.Join(genDir, "manifest.json"), mb, 0644); err != nil {
 		return PersistentManifest{}, err
 	}
-	return man, os.WriteFile(filepath.Join(base, "CURRENT"), []byte(fmt.Sprintf("generation-%020d", gen)), 0644)
+	current := filepath.Join(base, "CURRENT")
+	if err = os.WriteFile(current+".tmp", []byte(fmt.Sprintf("generation-%020d", gen)), 0644); err != nil {
+		return PersistentManifest{}, err
+	}
+	if err = os.Rename(current+".tmp", current); err != nil {
+		return PersistentManifest{}, err
+	}
+	return man, syncDir(base)
 }
 func (s FileSegmentStore) LoadIndex(ctx context.Context, indexID string, cfg Config) (*Index, PersistentManifest, error) {
 	base := s.dir(indexID)
@@ -513,6 +525,7 @@ type persistentDump struct {
 	NextDocID     DocID
 	ExtToDoc      map[string]DocID
 	DocToExt      []string
+	Docs          []Document
 	Deleted       []uint64
 	Live          []uint64
 	Expires       map[DocID]int64
@@ -556,6 +569,12 @@ func (ix *Index) persistentDump() (*persistentDump, error) {
 	cfg.EnableWAL = false
 	cfg.WALPath = ""
 	d := &persistentDump{Config: cfg, NextDocID: ix.nextDocID, ExtToDoc: copyMapStringDoc(ix.extToDoc), DocToExt: append([]string(nil), ix.docToExt...), Deleted: ix.deleted.Words(ix.nextDocID), Live: ix.live.Words(ix.nextDocID), Expires: copyMapDocInt64(ix.expires), HasTTL: ix.hasTTL, HasDeletes: ix.hasDeletes, Fields: map[string]fieldDump{}, NumericDense: map[string][]float64{}, NumericExists: map[string][]uint64{}, Strings: map[string]map[DocID]string{}, IP4: map[string]map[DocID]uint32{}, Vectors: map[string]map[DocID][]float64{}}
+	if !ix.cfg.DisableSource {
+		// Documents are immutable after assignment to a DocID; updates allocate a
+		// new DocID/document. Snapshot the slice without duplicating every map so
+		// persistence does not temporarily double source-record memory.
+		d.Docs = append([]Document(nil), ix.docs...)
+	}
 	for name, fi := range ix.fields {
 		d.Fields[name] = fieldDump{Terms: dumpBitmapMap(fi.terms), TermOne: copyMapStringDoc(fi.termOne), Prefix: dumpBitmapMap(fi.prefix), PrefixOne: copyMapStringDoc(fi.prefixOne), Suffix: dumpBitmapMap(fi.suffix), SuffixOne: copyMapStringDoc(fi.suffixOne), Ngram: dumpBitmapMap(fi.ngram), NgramOne: copyMapStringDoc(fi.ngramOne), Unique: copyMapStringDoc(fi.unique), Exists: fi.exists.Words(ix.nextDocID)}
 	}
@@ -601,7 +620,16 @@ func (ix *Index) restorePersistentDump(d *persistentDump) error {
 	ix.nextDocID = d.NextDocID
 	ix.extToDoc = copyMapStringDoc(d.ExtToDoc)
 	ix.docToExt = append([]string(nil), d.DocToExt...)
-	ix.docs = make([]Document, len(ix.docToExt))
+	if d.Config.DisableSource {
+		ix.docs = nil
+	} else {
+		ix.docs = make([]Document, len(ix.docToExt))
+		for i := range d.Docs {
+			if i < len(ix.docs) {
+				ix.docs[i] = cloneDoc(d.Docs[i])
+			}
+		}
+	}
 	ix.deleted = &Bitmap{words: append([]uint64(nil), d.Deleted...)}
 	ix.live = &Bitmap{words: append([]uint64(nil), d.Live...)}
 	ix.expires = copyMapDocInt64(d.Expires)

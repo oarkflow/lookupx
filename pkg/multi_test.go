@@ -6,11 +6,90 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"testing"
 	"time"
 )
+
+func TestPersistentManagerRestoreKeepsRecordsAndFilters(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "indexes")
+	store := FileSegmentStore{Root: root}
+	mgr := NewMultiIndexManager()
+	ix, err := New(Config{Schema: Schema{Fields: map[string]FieldOptions{
+		"name": {Kind: FieldKeyword, Indexed: true, Stored: true, Lowercase: true},
+	}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := SourceRecord{ID: "row-1", Values: []SourceValue{{Field: ix.FieldID("name"), Kind: ValueKeyword, String: "Persistent service", Source: "Persistent service"}}}
+	if _, err := ix.IndexFrom(context.Background(), SliceSource{Records: []SourceRecord{r}}, BulkOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := mgr.AddIndex("services", ix); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.SaveIndex(context.Background(), "services", ix); err != nil {
+		t.Fatal(err)
+	}
+
+	restarted := NewMultiIndexManager()
+	if err := restarted.RestorePersistent(context.Background(), store); err != nil {
+		t.Fatal(err)
+	}
+	restored, ok := restarted.Get("services")
+	if !ok {
+		t.Fatal("restored manager did not discover services index")
+	}
+	q, err := restored.CompileDatasourceLookup("name__contains=service")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, hits := restored.SearchInto(SearchRequest{Query: q, Limit: 10, WithDocs: true}, nil)
+	if len(hits) != 1 || hits[0].Doc["name"] != "Persistent service" {
+		t.Fatalf("restored record mismatch: %#v", hits)
+	}
+}
+
+func TestHTTPReloadPersistsForServerRestart(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "indexes")
+	mgr := NewMultiIndexManager()
+	_, err := mgr.Register(IndexDefinition{
+		ID:     "products",
+		Config: Config{Schema: Schema{Fields: map[string]FieldOptions{"sku": {Kind: FieldKeyword, Indexed: true, Stored: true, Lookup: true}}}},
+		Source: func(ix *Index) (Source, error) {
+			return SliceSource{Records: []SourceRecord{{ID: "p-1", Values: []SourceValue{{Field: ix.FieldID("sku"), Kind: ValueKeyword, String: "SKU-1", Source: "SKU-1"}}}}}, nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := &MultiServer{Manager: mgr, DataDir: root}
+	req := httptest.NewRequest(http.MethodPost, "/v1/indexes/products/reload", nil)
+	res := httptest.NewRecorder()
+	server.ServeHTTP(res, req)
+	if res.Code != http.StatusOK {
+		t.Fatalf("reload status=%d body=%s", res.Code, res.Body.String())
+	}
+
+	restarted := NewMultiIndexManager()
+	if err := restarted.RestorePersistent(context.Background(), FileSegmentStore{Root: root}); err != nil {
+		t.Fatal(err)
+	}
+	ix, ok := restarted.Get("products")
+	if !ok {
+		t.Fatal("products index missing after restart")
+	}
+	q, err := ix.CompileDatasourceLookup("sku=SKU-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, hits := ix.SearchInto(SearchRequest{Query: q, Limit: 1, WithDocs: true}, nil)
+	if len(hits) != 1 || hits[0].Doc["sku"] != "SKU-1" {
+		t.Fatalf("restored hits=%#v", hits)
+	}
+}
 
 func TestMultiServerSearchReturnsBulkDatasourceRecordsByDefault(t *testing.T) {
 	mgr := NewMultiIndexManager()

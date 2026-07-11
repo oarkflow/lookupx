@@ -560,13 +560,6 @@ const App = (() => {
               <label class="text-xs font-medium text-gray-400">Query</label>
               <textarea id="sql-query" rows="3" class="font-mono text-sm" placeholder="SELECT id, name, category, created_at FROM my_table WHERE active = true"></textarea>
             </div>
-            <div class="space-y-1">
-              <div class="flex items-center justify-between">
-                <label class="text-xs font-medium text-gray-400">Column mappings (one per line: column field kind)</label>
-                <button class="btn btn-secondary text-xs" onclick="App.detectColumns('sql')">Detect from query</button>
-              </div>
-              <textarea id="sql-cols" rows="4" class="font-mono text-sm" placeholder="Click &quot;Detect from query&quot;, or type manually: name term keyword"></textarea>
-            </div>
             <button class="btn btn-primary" onclick="App.loadSQLQuery()">Load</button>
           </div>
         </div>
@@ -586,13 +579,6 @@ const App = (() => {
               ${field('tbl-page-size', { label: 'Page Size', type: 'number', default: '10000' })}
             </div>
             ${field('tbl-where', { label: 'Where (optional, raw SQL)', placeholder: 'active = true' })}
-            <div class="space-y-1">
-              <div class="flex items-center justify-between">
-                <label class="text-xs font-medium text-gray-400">Column mappings (one per line: column field kind)</label>
-                <button class="btn btn-secondary text-xs" onclick="App.detectColumns('tbl')">Detect from table</button>
-              </div>
-              <textarea id="tbl-cols" rows="4" class="font-mono text-sm" placeholder="Click &quot;Detect from table&quot;, or type manually: name term keyword"></textarea>
-            </div>
             <button class="btn btn-primary" onclick="App.loadSQLTable()">Load</button>
           </div>
         </div>
@@ -618,13 +604,6 @@ const App = (() => {
     ]);
   }
 
-  function parseColumns(text) {
-    return text.trim().split('\n').filter(Boolean).map(line => {
-      const parts = line.trim().split(/\s+/);
-      return { column: parts[0], field: parts[1] || parts[0], kind: parts[2] || 'keyword' };
-    });
-  }
-
   function showIntegrationResult(promise, doneMsg) {
     const res = $('#integration-result');
     res.innerHTML = loading();
@@ -637,41 +616,6 @@ const App = (() => {
     });
   }
 
-  // detectColumns calls the read-only /v1/infer-columns endpoint (no index is
-  // created or modified) and fills the "column mappings" textarea from the
-  // result, so Load can never be submitted with an empty columns list.
-  async function detectColumns(prefix) {
-    const driver = $(`#${prefix}-driver`).value.trim();
-    const dsn = $(`#${prefix}-dsn`).value.trim();
-    if (!driver || !dsn) { toast('Driver and DSN required.', false); return; }
-    const body = {
-      driver, dsn,
-      id_column: $(`#${prefix}-id-col`).value.trim() || 'id',
-    };
-    if (prefix === 'sql') {
-      const query = $('#sql-query').value.trim();
-      if (!query) { toast('Query required.', false); return; }
-      body.source = 'sql_query';
-      body.query = query;
-    } else {
-      const table = $('#tbl-name').value.trim();
-      if (!table) { toast('Table required.', false); return; }
-      body.source = 'sql_table';
-      body.table = table;
-      const where = $('#tbl-where').value.trim();
-      if (where) body.where = where;
-    }
-    try {
-      const data = await api('POST', '/v1/infer-columns', body);
-      const cols = data.columns || [];
-      if (!cols.length) { toast('No columns detected.', false); return; }
-      $(`#${prefix}-cols`).value = cols.map(c => `${c.column} ${c.field} ${c.kind}`).join('\n');
-      toast(`Detected ${cols.length} column(s).`);
-    } catch (e) {
-      toast('Detect failed: ' + e.message, false);
-    }
-  }
-
   function loadSQLQuery() {
     const id = $('#sql-index').value.trim();
     if (!id) { toast('Select an index.', false); return; }
@@ -679,12 +623,9 @@ const App = (() => {
     const dsn = $('#sql-dsn').value.trim();
     const query = $('#sql-query').value.trim();
     if (!driver || !dsn || !query) { toast('Driver, DSN, and query required.', false); return; }
-    const columns = parseColumns($('#sql-cols').value);
-    if (!columns.length) { toast('No column mappings — click "Detect from query" first (or add mappings manually).', false); return; }
     const body = {
       driver, dsn, query,
       id_column: $('#sql-id-col').value.trim() || 'id',
-      columns,
     };
     showIntegrationResult(
       api('POST', `/v1/indexes/${encodeURIComponent(id)}/reload-sql`, body),
@@ -698,15 +639,11 @@ const App = (() => {
     const dsn = $('#tbl-dsn').value.trim();
     const table = $('#tbl-name').value.trim();
     if (!driver || !dsn || !table) { toast('Driver, DSN, and table required.', false); return; }
-    const columns = parseColumns($('#tbl-cols').value);
-    if (!columns.length) { toast('No column mappings — click "Detect from table" first (or add mappings manually).', false); return; }
     const body = {
       driver, dsn, table,
       where: $('#tbl-where').value.trim(),
       id_column: $('#tbl-id-col').value.trim() || 'id',
       page_size: parseInt($('#tbl-page-size').value) || 10000,
-      select_columns: columns.map(c => c.column),
-      columns,
     };
     showIntegrationResult(
       api('POST', `/v1/indexes/${encodeURIComponent(id)}/reload-table`, body),
@@ -773,7 +710,7 @@ const App = (() => {
     doLookup, addFilter, updateFilterOperators, removeFilter,
     addSchemaFieldRow, createIndex, reloadIndex, freezeIndex, persistIndex, deleteIndex,
     toggleDetail, upsertDoc, deleteDoc, listGenerations, validateIndex, repairIndex, compactIndex,
-    detectColumns, loadSQLQuery, loadSQLTable, loadJSONRecords,
+    loadSQLQuery, loadSQLTable, loadJSONRecords,
   };
   for (const k of Object.keys(handlers)) handlers[k] = safe(handlers[k]);
   return handlers;

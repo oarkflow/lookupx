@@ -99,15 +99,19 @@ func serveCmd(args []string) {
 	addr := fs.String("addr", getenv("ADDR", ":8089"), "listen address")
 	apiKey := fs.String("api-key", getenv("LOOKUPX_API_KEY", ""), "optional API key")
 	webDir := fs.String("web", getenv("LOOKUPX_WEB_DIR", ""), "directory for static web frontend files")
+	dataDir := fs.String("data", getenv("LOOKUPX_DATA_DIR", "./data/indexes"), "persistent index directory")
 	_ = fs.Parse(args)
 
 	mgr := lookup.NewMultiIndexManager()
+	if err := mgr.RestorePersistent(context.Background(), lookup.FileSegmentStore{Root: *dataDir}); err != nil {
+		log.Fatalf("restore persistent indexes: %v", err)
+	}
 	keys := []string{}
 	if *apiKey != "" {
 		keys = append(keys, *apiKey)
 	}
 	log.Printf("lookupx server listening on %s", *addr)
-	log.Fatal(http.ListenAndServe(*addr, &lookup.MultiServer{Manager: mgr, APIKeys: keys, WebDir: *webDir}))
+	log.Fatal(http.ListenAndServe(*addr, &lookup.MultiServer{Manager: mgr, APIKeys: keys, WebDir: *webDir, DataDir: *dataDir}))
 }
 
 func demoCmd(args []string) {

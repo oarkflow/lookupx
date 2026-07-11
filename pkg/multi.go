@@ -58,6 +58,43 @@ type MultiIndexManager struct {
 	indexes map[string]*ManagedIndex
 }
 
+// RestorePersistent discovers every index directory with a CURRENT generation
+// and atomically adds the restored indexes to the manager.
+func (m *MultiIndexManager) RestorePersistent(ctx context.Context, store FileSegmentStore) error {
+	entries, err := os.ReadDir(store.Root)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		id := cleanIndexID(entry.Name())
+		if id == "" {
+			continue
+		}
+		ix, man, err := OpenPersistent(ctx, store, id, Config{})
+		if errors.Is(err, os.ErrNotExist) {
+			continue
+		}
+		if err != nil {
+			return fmt.Errorf("restore index %q: %w", id, err)
+		}
+		mi := &ManagedIndex{ID: id, Index: ix, Config: ix.cfg, Generation: man.Generation}
+		m.mu.Lock()
+		old := m.indexes[id]
+		m.indexes[id] = mi
+		m.mu.Unlock()
+		if old != nil && old.Index != nil {
+			_ = old.Index.Close()
+		}
+	}
+	return nil
+}
+
 func NewMultiIndexManager() *MultiIndexManager {
 	return &MultiIndexManager{indexes: make(map[string]*ManagedIndex)}
 }
@@ -276,7 +313,33 @@ type MultiServer struct {
 	Manager  *MultiIndexManager
 	APIKeys  []string
 	WebDir   string // optional: directory to serve static frontend files
+	DataDir  string // persistent index root; defaults to LOOKUPX_DATA_DIR or data/indexes
 	Requests uint64
+}
+
+func (s *MultiServer) persistentStore() FileSegmentStore {
+	root := s.DataDir
+	if root == "" {
+		root = os.Getenv("LOOKUPX_DATA_DIR")
+	}
+	if root == "" {
+		root = filepath.Join("data", "indexes")
+	}
+	return FileSegmentStore{Root: root}
+}
+
+func (s *MultiServer) persistManagedIndex(ctx context.Context, id string) (PersistentManifest, error) {
+	ix, ok := s.Manager.Get(id)
+	if !ok {
+		return PersistentManifest{}, errors.New("index not found")
+	}
+	store := s.persistentStore()
+	man, err := store.SaveIndex(ctx, id, ix)
+	if err != nil {
+		return man, err
+	}
+	_, _ = CompactPersistentGenerations(ctx, store, id, GenerationPolicy{KeepLast: 2})
+	return man, nil
 }
 
 func (s *MultiServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -288,11 +351,7 @@ func (s *MultiServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return
 	}
-	storeRoot := os.Getenv("LOOKUPX_DATA_DIR")
-	if storeRoot == "" {
-		storeRoot = filepath.Join("data", "indexes")
-	}
-	if s.ServeProductionHTTP(w, r, FileSegmentStore{Root: storeRoot}) {
+	if s.ServeProductionHTTP(w, r, s.persistentStore()) {
 		return
 	}
 	path := strings.Trim(r.URL.Path, "/")
@@ -448,21 +507,36 @@ func (s *MultiServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, err.Error(), 500)
 			return
 		}
-		writeJSON(w, map[string]any{"ok": true, "stats": stats})
+		man, err := s.persistManagedIndex(r.Context(), id)
+		if err != nil {
+			http.Error(w, "indexed but persistence failed: "+err.Error(), 500)
+			return
+		}
+		writeJSON(w, map[string]any{"ok": true, "stats": stats, "manifest": man})
 	case r.Method == http.MethodPost && action == "reload-sql":
 		stats, err := s.reloadSQL(r.Context(), id, r)
 		if err != nil {
 			http.Error(w, err.Error(), 500)
 			return
 		}
-		writeJSON(w, map[string]any{"ok": true, "stats": stats})
+		man, err := s.persistManagedIndex(r.Context(), id)
+		if err != nil {
+			http.Error(w, "indexed but persistence failed: "+err.Error(), 500)
+			return
+		}
+		writeJSON(w, map[string]any{"ok": true, "stats": stats, "manifest": man})
 	case r.Method == http.MethodPost && action == "reload-table":
 		stats, err := s.reloadTable(r.Context(), id, r)
 		if err != nil {
 			http.Error(w, err.Error(), 500)
 			return
 		}
-		writeJSON(w, map[string]any{"ok": true, "stats": stats})
+		man, err := s.persistManagedIndex(r.Context(), id)
+		if err != nil {
+			http.Error(w, "indexed but persistence failed: "+err.Error(), 500)
+			return
+		}
+		writeJSON(w, map[string]any{"ok": true, "stats": stats, "manifest": man})
 	case r.Method == http.MethodPost && action == "snapshot":
 		var body struct {
 			Path string `json:"path"`
@@ -582,6 +656,9 @@ func (s *MultiServer) reloadSQL(ctx context.Context, id string, r *http.Request)
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		return BulkStats{}, err
 	}
+	if req.IDColumn == "" {
+		req.IDColumn = "id"
+	}
 	mi, ok := s.Manager.Managed(id)
 	if !ok {
 		return BulkStats{}, errors.New("index not found")
@@ -610,19 +687,40 @@ func (s *MultiServer) reloadTable(ctx context.Context, id string, r *http.Reques
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		return BulkStats{}, err
 	}
-	ix, ok := s.Manager.Get(id)
+	if req.IDColumn == "" {
+		req.IDColumn = "id"
+	}
+	if req.OrderColumn == "" {
+		req.OrderColumn = req.IDColumn
+	}
+	mi, ok := s.Manager.Managed(id)
 	if !ok {
 		return BulkStats{}, errors.New("index not found")
 	}
-	db, err := squealx.Connect(squealxDriver(req.Driver), req.DSN, "")
+	db, inferred, err := connectAndSample(ctx, sqlSampleRequest{
+		Driver: req.Driver, DSN: req.DSN, Source: "sql_table", Table: req.Table,
+		Where: req.Where, IDColumn: req.IDColumn, SeqColumn: req.SeqColumn,
+		OrderColumn: req.OrderColumn, SampleSize: 200,
+	})
 	if err != nil {
 		return BulkStats{}, err
 	}
 	defer db.Close()
-	cols := sqlColumnSpecs(ix, req.Columns)
-	src := PagedSQLSource{DB: db.DB(), Table: req.Table, Columns: req.SelectColumns, Where: req.Where, OrderColumn: req.OrderColumn, PageSize: req.PageSize, IDColumn: req.IDColumn, SeqColumn: req.SeqColumn, ColumnBindings: cols}
+	inferred = applySQLColumnSpecs(inferred, req.Columns)
+	cfg := mi.Config
+	cfg.Schema = AutoSchema(inferred)
+	cfg.DisableSource = false
+	selectColumns := []string{req.IDColumn}
+	if req.SeqColumn != "" && !strings.EqualFold(req.SeqColumn, req.IDColumn) {
+		selectColumns = append(selectColumns, req.SeqColumn)
+	}
+	for _, col := range inferred {
+		selectColumns = append(selectColumns, col.Column)
+	}
 	opt := bulkFromSQLReq(id, req.BatchSize, req.CheckpointPath, req.Resume)
-	return s.Manager.ReloadFromSource(ctx, id, src, opt)
+	return s.Manager.ReloadWithConfig(ctx, id, cfg, func(ix *Index) (Source, error) {
+		return PagedSQLSource{DB: db.DB(), Table: req.Table, Columns: selectColumns, Where: req.Where, OrderColumn: req.OrderColumn, PageSize: req.PageSize, IDColumn: req.IDColumn, SeqColumn: req.SeqColumn, ColumnBindings: BindSQLColumns(ix, inferred)}, nil
+	}, opt)
 }
 
 func bulkFromSQLReq(id string, batch int, checkpointPath string, resume bool) BulkOptions {
