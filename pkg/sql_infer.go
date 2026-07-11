@@ -160,7 +160,7 @@ func classifyStringColumn(name string, samples []string) AutoColumn {
 	case containsAny(lname, textNameHints):
 		return AutoColumn{
 			Column: name, Field: name, Kind: ValueText,
-			Options: FieldOptions{Kind: FieldText, Indexed: true, Lowercase: true},
+			Options: FieldOptions{Kind: FieldText, Indexed: true, Lowercase: true, Fuzzy: true},
 		}
 	case containsAny(lname, codeNameHints):
 		return AutoColumn{
@@ -175,7 +175,7 @@ func classifyStringColumn(name string, samples []string) AutoColumn {
 	case shape.avgLen > 40 || shape.hasSpaces:
 		return AutoColumn{
 			Column: name, Field: name, Kind: ValueText,
-			Options: FieldOptions{Kind: FieldText, Indexed: true, Lowercase: true},
+			Options: FieldOptions{Kind: FieldText, Indexed: true, Lowercase: true, Fuzzy: true},
 		}
 	default:
 		return AutoColumn{
@@ -205,7 +205,7 @@ func classifyFromValues(name string, samples []string) AutoColumn {
 	if containsAny(lname, textNameHints) {
 		return AutoColumn{
 			Column: name, Field: name, Kind: ValueText,
-			Options: FieldOptions{Kind: FieldText, Indexed: true, Lowercase: true},
+			Options: FieldOptions{Kind: FieldText, Indexed: true, Lowercase: true, Fuzzy: true},
 		}
 	}
 	if len(samples) > 0 && allNumeric(samples) {

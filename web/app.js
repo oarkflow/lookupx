@@ -120,6 +120,8 @@ const App = (() => {
       <form class="search-bar" onsubmit="event.preventDefault(); App.doLookup()">
         <div class="search-index">${indexSelect('lookup-index')}</div>
 		<input id="lookup-term" type="search" placeholder="Search all text columns…" aria-label="Full-text search term" />
+		<label class="search-fuzzy"><input id="lookup-fuzzy" type="checkbox" /> Fuzzy</label>
+		<label class="search-fuzzy"><input id="lookup-profile" type="checkbox" /> Profile</label>
         <input id="lookup-limit" type="number" min="1" max="500" value="25" aria-label="Result limit" />
         <button class="btn btn-primary" type="submit">Search</button>
       </form>
@@ -254,6 +256,8 @@ const App = (() => {
     const params = new URLSearchParams();
 	const term = $('#lookup-term').value.trim();
 	if (term) params.set('term', term);
+	if (term && $('#lookup-fuzzy').checked) params.set('fuzzy', 'true');
+	if ($('#lookup-profile').checked) params.set('profile', 'true');
     for (const row of $$('.filter-row')) {
       const fieldName = row.querySelector('.filter-field').value;
       const operator = row.querySelector('.filter-operator').value;
@@ -267,7 +271,12 @@ const App = (() => {
     res.innerHTML = loading();
     try {
       const data = await api('GET', `/v1/indexes/${encodeURIComponent(id)}/lookup?${params.toString()}`);
-      res.innerHTML = `<div class="result-meta"><span>${fmtNum(data.total)} results</span><span>${fmtNum(data.latency_ns)} ns</span></div>${renderHits(data.hits)}`;
+	  const usage = data.resources || {};
+	  const perf = [`${fmtNum(data.latency_ns)} ns`];
+	  if (usage.cpu_seconds !== undefined) perf.push(`${(usage.cpu_seconds * 1000).toFixed(2)} ms CPU`);
+	  if (usage.total_alloc_bytes !== undefined) perf.push(`${(usage.total_alloc_bytes / 1048576).toFixed(2)} MB allocated`);
+	  if (usage.heap_bytes !== undefined) perf.push(`${(usage.heap_bytes / 1048576).toFixed(1)} MB heap`);
+      res.innerHTML = `<div class="result-meta"><span>${fmtNum(data.total)} results</span><span>${perf.join(' · ')}</span></div>${renderHits(data.hits)}`;
     } catch (e) {
       res.innerHTML = `<div class="card text-red-400 text-sm">Lookup error: ${escHtml(e.message)}</div>`;
     }

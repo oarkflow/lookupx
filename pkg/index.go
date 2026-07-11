@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"hash/crc32"
 	"io"
+	"math"
 	"net"
 	"os"
 	"sort"
@@ -30,7 +31,17 @@ type fieldIndex struct {
 	fuzzyTerms                              map[byte][]string
 	exists                                  *Bitmap
 	capHint                                 DocID
+	docLengths                              []uint32
+	totalTokens                             uint64
+	extraTF                                 map[string]map[DocID]uint16
 }
+
+type globalScoreWorkspace struct {
+	scores  []float64
+	touched []DocID
+}
+
+var globalScorePool = sync.Pool{New: func() any { return &globalScoreWorkspace{} }}
 
 func newFieldIndex(capHint int, opt FieldOptions) *fieldIndex {
 	// Allocate large maps only for structures that are actually used. This keeps
@@ -58,7 +69,7 @@ func newFieldIndex(capHint int, opt FieldOptions) *fieldIndex {
 		terms: make(map[string]*Bitmap, termCap), prefix: make(map[string]*Bitmap, prefixCap), suffix: make(map[string]*Bitmap, suffixCap), ngram: make(map[string]*Bitmap, ngramCap),
 		termOne: make(map[string]DocID, termCap), prefixOne: make(map[string]DocID, prefixCap), suffixOne: make(map[string]DocID, suffixCap), ngramOne: make(map[string]DocID, ngramCap),
 		positions: map[string]map[DocID][]uint32{}, phrases: map[string]*Bitmap{}, phraseOne: map[string]DocID{},
-		unique: make(map[string]DocID, uniqueCap), fuzzyTerms: map[byte][]string{}, exists: NewBitmapCap(DocID(capHint + 1)), capHint: DocID(capHint + 1),
+		unique: make(map[string]DocID, uniqueCap), fuzzyTerms: map[byte][]string{}, exists: NewBitmapCap(DocID(capHint + 1)), capHint: DocID(capHint + 1), extraTF: map[string]map[DocID]uint16{},
 	}
 }
 
@@ -468,6 +479,59 @@ func (ix *Index) Search(req SearchRequest) Result {
 	bm := req.Query.eval(ix)
 	ix.mu.RLock()
 	defer ix.mu.RUnlock()
+	if global, ok := globalTermFromQuery(req.Query); ok && len(req.Sort) == 0 && len(req.Facets) == 0 {
+		type scoredDoc struct {
+			id    DocID
+			score float64
+		}
+		ws := globalScorePool.Get().(*globalScoreWorkspace)
+		if cap(ws.scores) < int(ix.nextDocID) {
+			ws.scores = make([]float64, ix.nextDocID)
+		} else {
+			ws.scores = ws.scores[:ix.nextDocID]
+		}
+		ws.touched = ws.touched[:0]
+		ix.globalBM25ScoresLocked(global, ws)
+		ranked := make([]scoredDoc, 0, bm.Count())
+		bm.Each(func(id DocID) bool {
+			if !ix.isDeletedOrExpiredLocked(id) {
+				score := ws.scores[id]
+				if score == 0 && global.Fuzzy {
+					score = 0.1
+				}
+				ranked = append(ranked, scoredDoc{id: id, score: score})
+			}
+			return true
+		})
+		sort.Slice(ranked, func(i, j int) bool {
+			if ranked[i].score == ranked[j].score {
+				return ranked[i].id < ranked[j].id
+			}
+			return ranked[i].score > ranked[j].score
+		})
+		from := req.Offset
+		if from > len(ranked) {
+			from = len(ranked)
+		}
+		to := from + req.Limit
+		if to > len(ranked) {
+			to = len(ranked)
+		}
+		hits := make([]Hit, 0, to-from)
+		for _, rankedDoc := range ranked[from:to] {
+			id := rankedDoc.id
+			h := Hit{ID: ix.docToExt[id], DocID: id, Score: rankedDoc.score}
+			if req.WithDocs && int(id) < len(ix.docs) && ix.docs[id] != nil {
+				h.Doc = cloneDoc(ix.docs[id])
+			}
+			hits = append(hits, h)
+		}
+		for _, id := range ws.touched {
+			ws.scores[id] = 0
+		}
+		globalScorePool.Put(ws)
+		return Result{Total: len(ranked), Hits: hits, Took: ix.elapsed(start)}
+	}
 	if len(req.Sort) == 0 && len(req.Facets) == 0 {
 		hits := make([]Hit, 0, req.Limit)
 		skipped, total := 0, 0
@@ -523,6 +587,132 @@ func (ix *Index) Search(req SearchRequest) Result {
 		hits = append(hits, h)
 	}
 	return Result{Total: total, Hits: hits, Facets: facets, Took: ix.elapsed(start)}
+}
+
+func globalTermFromQuery(q Query) (GlobalTerm, bool) {
+	switch x := q.(type) {
+	case GlobalTerm:
+		return x, true
+	case Bool:
+		for _, list := range [][]Query{x.Must, x.Filter, x.Should} {
+			for _, child := range list {
+				if g, ok := globalTermFromQuery(child); ok {
+					return g, true
+				}
+			}
+		}
+	case And:
+		for _, child := range x {
+			if g, ok := globalTermFromQuery(child); ok {
+				return g, true
+			}
+		}
+	}
+	return GlobalTerm{}, false
+}
+
+func (ix *Index) globalBM25ScoresLocked(q GlobalTerm, ws *globalScoreWorkspace) {
+	add := func(id DocID, score float64) {
+		if ws.scores[id] == 0 {
+			ws.touched = append(ws.touched, id)
+		}
+		ws.scores[id] += score
+	}
+	n := float64(ix.live.Count())
+	for _, word := range q.Words {
+		for field, opt := range ix.cfg.Schema.Fields {
+			if opt.Kind != FieldText && opt.Kind != FieldKeyword && opt.Kind != FieldBool {
+				continue
+			}
+			fi := ix.fields[field]
+			if fi == nil {
+				continue
+			}
+			term := normalize(word, opt.Lowercase)
+			avgdl := 1.0
+			if docs := fi.exists.Count(); docs > 0 && fi.totalTokens > 0 {
+				avgdl = float64(fi.totalTokens) / float64(docs)
+			}
+			if did := fi.termOne[term]; did != 0 {
+				idf := math.Log(1 + (n-1+0.5)/(1+0.5))
+				add(did, idf*ix.bm25TFNormLocked(fi, term, did, avgdl))
+			}
+			if b := fi.terms[term]; b != nil {
+				df := float64(b.Count())
+				idf := math.Log(1 + (n-df+0.5)/(df+0.5))
+				b.Each(func(id DocID) bool { add(id, idf*ix.bm25TFNormLocked(fi, term, id, avgdl)); return true })
+			}
+			if did, exists := fi.unique[term]; exists {
+				add(did, math.Log(1+(n-1+0.5)/(1+0.5))*ix.bm25TFNormLocked(fi, term, did, avgdl))
+			}
+			if q.Fuzzy && opt.Fuzzy && term != "" {
+				expanded := 0
+				for _, candidate := range fi.fuzzyTerms[term[0]] {
+					if candidate == term || abs(len(candidate)-len(term)) > 1 || levenshtein(candidate, term, 1) > 1 {
+						continue
+					}
+					if did := fi.termOne[candidate]; did != 0 {
+						idf := math.Log(1 + (n-1+0.5)/(1+0.5))
+						add(did, .8*idf*ix.bm25TFNormLocked(fi, candidate, did, avgdl))
+					}
+					if posting := fi.terms[candidate]; posting != nil {
+						df := float64(posting.Count())
+						idf := math.Log(1 + (n-df+0.5)/(df+0.5))
+						posting.Each(func(id DocID) bool { add(id, .8*idf*ix.bm25TFNormLocked(fi, candidate, id, avgdl)); return true })
+					}
+					expanded++
+					if expanded >= 128 {
+						break
+					}
+				}
+			}
+		}
+	}
+}
+
+func (ix *Index) bm25TFNormLocked(fi *fieldIndex, term string, id DocID, avgdl float64) float64 {
+	tf, dl := 1.0, 1.0
+	if byDoc := fi.extraTF[term]; byDoc != nil && byDoc[id] > 1 {
+		tf = float64(byDoc[id])
+	} else if byDoc := fi.positions[term]; byDoc != nil {
+		if positions := byDoc[id]; len(positions) > 0 {
+			tf = float64(len(positions))
+		}
+	}
+	if int(id) < len(fi.docLengths) && fi.docLengths[id] > 0 {
+		dl = float64(fi.docLengths[id])
+	}
+	const k1, b = 1.2, 0.75
+	return tf * (k1 + 1) / (tf + k1*(1-b+b*dl/avgdl))
+}
+
+func (ix *Index) recordTextStatsLocked(fi *fieldIndex, id DocID, tokens []string) {
+	if int(id) >= len(fi.docLengths) {
+		if int(id) == len(fi.docLengths) {
+			fi.docLengths = append(fi.docLengths, 0)
+		} else {
+			fi.docLengths = append(fi.docLengths, make([]uint32, int(id)-len(fi.docLengths)+1)...)
+		}
+	}
+	fi.docLengths[id] += uint32(len(tokens))
+	fi.totalTokens += uint64(len(tokens))
+	for i, term := range tokens {
+		count := uint16(1)
+		for j := 0; j < i; j++ {
+			if tokens[j] == term {
+				count++
+			}
+		}
+		if count <= 1 {
+			continue
+		}
+		byDoc := fi.extraTF[term]
+		if byDoc == nil {
+			byDoc = map[DocID]uint16{}
+			fi.extraTF[term] = byDoc
+		}
+		byDoc[id] = count
+	}
 }
 
 func (ix *Index) numericValueLocked(field string, id DocID) (float64, bool) {
@@ -764,6 +954,7 @@ func (ix *Index) indexDocLocked(id DocID, doc Document) {
 						ix.indexDerivedLocked(fi, opt, t, id)
 					}
 				}
+				ix.recordTextStatsLocked(fi, id, ix.tokens)
 				if opt.Phrase {
 					addPhrases(fi, ix.tokens, id)
 				}

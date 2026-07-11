@@ -164,6 +164,7 @@ func (w *RowWriter) text(fid FieldID, value string, normalized bool) {
 			w.ix.indexDerivedLocked(sf.fi, sf.opt, t, w.did)
 		}
 	}
+	w.ix.recordTextStatsLocked(sf.fi, w.did, w.ix.tokens)
 	if sf.opt.Phrase {
 		addPhrases(sf.fi, w.ix.tokens, w.did)
 	}

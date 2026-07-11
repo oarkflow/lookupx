@@ -541,16 +541,20 @@ type persistentDump struct {
 	Frozen        bool
 }
 type fieldDump struct {
-	Terms     map[string][]uint64
-	TermOne   map[string]DocID
-	Prefix    map[string][]uint64
-	PrefixOne map[string]DocID
-	Suffix    map[string][]uint64
-	SuffixOne map[string]DocID
-	Ngram     map[string][]uint64
-	NgramOne  map[string]DocID
-	Unique    map[string]DocID
-	Exists    []uint64
+	Terms       map[string][]uint64
+	TermOne     map[string]DocID
+	Prefix      map[string][]uint64
+	PrefixOne   map[string]DocID
+	Suffix      map[string][]uint64
+	SuffixOne   map[string]DocID
+	Ngram       map[string][]uint64
+	NgramOne    map[string]DocID
+	Unique      map[string]DocID
+	Exists      []uint64
+	DocLengths  []uint32
+	TotalTokens uint64
+	Positions   map[string]map[DocID][]uint32
+	ExtraTF     map[string]map[DocID]uint16
 }
 type compositeDump struct {
 	Terms     map[string]uint32
@@ -576,7 +580,7 @@ func (ix *Index) persistentDump() (*persistentDump, error) {
 		d.Docs = append([]Document(nil), ix.docs...)
 	}
 	for name, fi := range ix.fields {
-		d.Fields[name] = fieldDump{Terms: dumpBitmapMap(fi.terms), TermOne: copyMapStringDoc(fi.termOne), Prefix: dumpBitmapMap(fi.prefix), PrefixOne: copyMapStringDoc(fi.prefixOne), Suffix: dumpBitmapMap(fi.suffix), SuffixOne: copyMapStringDoc(fi.suffixOne), Ngram: dumpBitmapMap(fi.ngram), NgramOne: copyMapStringDoc(fi.ngramOne), Unique: copyMapStringDoc(fi.unique), Exists: fi.exists.Words(ix.nextDocID)}
+		d.Fields[name] = fieldDump{Terms: dumpBitmapMap(fi.terms), TermOne: copyMapStringDoc(fi.termOne), Prefix: dumpBitmapMap(fi.prefix), PrefixOne: copyMapStringDoc(fi.prefixOne), Suffix: dumpBitmapMap(fi.suffix), SuffixOne: copyMapStringDoc(fi.suffixOne), Ngram: dumpBitmapMap(fi.ngram), NgramOne: copyMapStringDoc(fi.ngramOne), Unique: copyMapStringDoc(fi.unique), Exists: fi.exists.Words(ix.nextDocID), DocLengths: append([]uint32(nil), fi.docLengths...), TotalTokens: fi.totalTokens, Positions: copyPositions(fi.positions), ExtraTF: copyExtraTF(fi.extraTF)}
 	}
 	for k, v := range ix.numericDense {
 		d.NumericDense[k] = append([]float64(nil), v...)
@@ -647,6 +651,10 @@ func (ix *Index) restorePersistentDump(d *persistentDump) error {
 			fi.ngramOne = copyMapStringDoc(fd.NgramOne)
 			fi.unique = copyMapStringDoc(fd.Unique)
 			fi.exists = &Bitmap{words: append([]uint64(nil), fd.Exists...)}
+			fi.docLengths = append([]uint32(nil), fd.DocLengths...)
+			fi.totalTokens = fd.TotalTokens
+			fi.positions = copyPositions(fd.Positions)
+			fi.extraTF = copyExtraTF(fd.ExtraTF)
 		}
 	}
 	ix.numericDense = map[string][]float64{}
@@ -702,6 +710,30 @@ func (ix *Index) restorePersistentDump(d *persistentDump) error {
 	}
 	ex.mu.Unlock()
 	return nil
+}
+
+func copyPositions(in map[string]map[DocID][]uint32) map[string]map[DocID][]uint32 {
+	out := make(map[string]map[DocID][]uint32, len(in))
+	for term, docs := range in {
+		cloned := make(map[DocID][]uint32, len(docs))
+		for id, positions := range docs {
+			cloned[id] = append([]uint32(nil), positions...)
+		}
+		out[term] = cloned
+	}
+	return out
+}
+
+func copyExtraTF(in map[string]map[DocID]uint16) map[string]map[DocID]uint16 {
+	out := make(map[string]map[DocID]uint16, len(in))
+	for term, docs := range in {
+		cloned := make(map[DocID]uint16, len(docs))
+		for id, tf := range docs {
+			cloned[id] = tf
+		}
+		out[term] = cloned
+	}
+	return out
 }
 func dumpBitmapMap(in map[string]*Bitmap) map[string][]uint64 {
 	out := map[string][]uint64{}

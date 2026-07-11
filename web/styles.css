@@ -26,7 +26,9 @@ input:-webkit-autofill, input:-webkit-autofill:hover, input:-webkit-autofill:foc
   -webkit-text-fill-color: #e5e7eb; box-shadow: 0 0 0 1000px #1f2937 inset;
 }
 
-.search-bar { display: grid; grid-template-columns: minmax(180px, 260px) minmax(240px, 1fr) 88px auto; gap: 0.75rem; align-items: end; }
+.search-bar { display: grid; grid-template-columns: minmax(180px, 260px) minmax(240px, 1fr) auto auto 88px auto; gap: 0.75rem; align-items: center; }
+.search-fuzzy { display: flex; align-items: center; gap: .4rem; white-space: nowrap; color: #d1d5db; font-size: .875rem; }
+.search-fuzzy input { width: auto; height: auto; }
 .search-bar input, .search-bar select { height: 2.5rem; }
 .search-bar .btn { height: 2.5rem; padding-inline: 1.25rem; }
 .filter-toolbar { display: flex; justify-content: flex-end; margin-top: 0.75rem; }

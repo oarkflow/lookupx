@@ -272,7 +272,7 @@ func TestLookupPatternFiltersWithDisabledSourceAndExactFilter(t *testing.T) {
 
 func TestLookupGlobalTermAcrossColumnsAndStructuredFilters(t *testing.T) {
 	ix, err := New(Config{DisableSource: true, Schema: Schema{Fields: map[string]FieldOptions{
-		"description": {Kind: FieldText, Indexed: true, Lowercase: true},
+		"description": {Kind: FieldText, Indexed: true, Lowercase: true, Fuzzy: true},
 		"code":        {Kind: FieldKeyword, Lookup: true, Lowercase: true},
 		"work_item":   {Kind: FieldInt, Indexed: true},
 	}}})
@@ -291,9 +291,10 @@ func TestLookupGlobalTermAcrossColumnsAndStructuredFilters(t *testing.T) {
 		raw  string
 		want int
 	}{
-		{"term=nail", 3},
+		{"term=nail", 2},
 		{"term=nail+repair", 2},
-		{"term=nail&work_item=37", 2},
+		{"term=nail&work_item=37", 1},
+		{"term=naol&fuzzy=true", 2},
 	} {
 		q, err := ix.CompileDatasourceLookup(tc.raw)
 		if err != nil {
@@ -303,6 +304,53 @@ func TestLookupGlobalTermAcrossColumnsAndStructuredFilters(t *testing.T) {
 		if len(hits) != tc.want {
 			t.Fatalf("term query %q returned %d hits: %#v", tc.raw, len(hits), hits)
 		}
+	}
+}
+
+func TestGlobalTermUsesBM25TermFrequencyAndDocumentLength(t *testing.T) {
+	ix, err := New(Config{DisableSource: true, Schema: Schema{Fields: map[string]FieldOptions{
+		"body": {Kind: FieldText, Indexed: true, Lowercase: true},
+	}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	records := []SourceRecord{
+		{ID: "dense", Values: []SourceValue{{Field: ix.FieldID("body"), Kind: ValueText, String: "nail nail nail repair"}}},
+		{ID: "sparse", Values: []SourceValue{{Field: ix.FieldID("body"), Kind: ValueText, String: "nail with many unrelated words in a much longer clinical description"}}},
+	}
+	if _, err := ix.IndexFrom(context.Background(), SliceSource{Records: records}, BulkOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	result, _ := ix.SearchInto(SearchRequest{Query: GlobalTerm{Words: []string{"nail"}}, Limit: 10, WithDocs: true}, nil)
+	if len(result.Hits) != 2 || result.Hits[0].ID != "dense" || result.Hits[0].Score <= result.Hits[1].Score {
+		t.Fatalf("expected dense term usage to rank first with a higher BM25 score: %#v", result.Hits)
+	}
+}
+
+func TestPersistentGlobalTermPreservesBM25Statistics(t *testing.T) {
+	cfg := Config{DisableSource: true, Schema: Schema{Fields: map[string]FieldOptions{"body": {Kind: FieldText, Indexed: true, Lowercase: true}}}}
+	ix, err := New(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	records := []SourceRecord{
+		{ID: "dense", Values: []SourceValue{{Field: ix.FieldID("body"), Kind: ValueText, String: "nail nail nail repair"}}},
+		{ID: "sparse", Values: []SourceValue{{Field: ix.FieldID("body"), Kind: ValueText, String: "nail with many unrelated words in a longer description"}}},
+	}
+	if _, err := ix.IndexFrom(context.Background(), SliceSource{Records: records}, BulkOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	store := FileSegmentStore{Root: filepath.Join(t.TempDir(), "indexes")}
+	if _, err := store.SaveIndex(context.Background(), "bm25", ix); err != nil {
+		t.Fatal(err)
+	}
+	restored, _, err := store.LoadIndex(context.Background(), "bm25", cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, _ := restored.SearchInto(SearchRequest{Query: GlobalTerm{Words: []string{"nail"}}, Limit: 10, WithDocs: true}, nil)
+	if len(result.Hits) != 2 || result.Hits[0].ID != "dense" || result.Hits[0].Score <= result.Hits[1].Score {
+		t.Fatalf("restored BM25 ranking mismatch: %#v", result.Hits)
 	}
 }
 

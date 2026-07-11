@@ -38,6 +38,7 @@ type IndexLatency struct {
 	LastRowsPerSecond float64       `json:"last_rows_per_second"`
 	LastError         string        `json:"last_error,omitempty"`
 	LastReloadAt      time.Time     `json:"last_reload_at,omitempty"`
+	LastResources     ResourceUsage `json:"last_resources"`
 }
 
 type ManagedIndex struct {
@@ -232,6 +233,7 @@ func (m *MultiIndexManager) ReloadWithConfig(ctx context.Context, id string, cfg
 		return BulkStats{}, fmt.Errorf("index %q has no source", id)
 	}
 	m.setReloading(id, true, "")
+	usageBefore := readResourceUsage()
 	started := time.Now()
 	ix, err := New(cfg)
 	if err != nil {
@@ -253,6 +255,7 @@ func (m *MultiIndexManager) ReloadWithConfig(ctx context.Context, id string, cfg
 	stats, err := ix.IndexFrom(ctx, src, opt)
 	took := time.Since(started)
 	lat := latencyFromStats(stats, took, err)
+	lat.LastResources = usageDelta(usageBefore, readResourceUsage())
 	m.mu.Lock()
 	cur := m.indexes[id]
 	if err == nil {
@@ -473,7 +476,7 @@ func (s *MultiServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	switch {
 	case r.Method == http.MethodGet && action == "stats":
 		mi, _ := s.Manager.Managed(id)
-		writeJSON(w, map[string]any{"id": id, "stats": ix.Stats(), "latency": mi.Latency, "generation": mi.Generation, "reloading": mi.Reloading})
+		writeJSON(w, map[string]any{"id": id, "stats": ix.Stats(), "latency": mi.Latency, "resources": readResourceUsage(), "generation": mi.Generation, "reloading": mi.Reloading})
 	case r.Method == http.MethodGet && action == "schema":
 		writeJSON(w, map[string]any{"id": id, "fields": schemaFieldsWire(ix.SchemaFields())})
 	case r.Method == http.MethodPost && action == "search":
@@ -499,6 +502,11 @@ func (s *MultiServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		res.Hits = hits
 		writeJSON(w, map[string]any{"result": res, "latency_ns": time.Since(started).Nanoseconds()})
 	case r.Method == http.MethodGet && action == "lookup":
+		profile, _ := strconv.ParseBool(r.URL.Query().Get("profile"))
+		var usageBefore ResourceUsage
+		if profile {
+			usageBefore = readResourceUsage()
+		}
 		raw := r.URL.RawQuery
 		limit := IntParam(r, "limit", 20)
 		query, err := ix.CompileDatasourceLookup(raw)
@@ -507,8 +515,12 @@ func (s *MultiServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		started := time.Now()
-		_, hits := ix.SearchInto(SearchRequest{Query: query, Limit: limit, WithDocs: true}, nil)
-		writeJSON(w, map[string]any{"hits": hits, "total": len(hits), "latency_ns": time.Since(started).Nanoseconds()})
+		result, hits := ix.SearchInto(SearchRequest{Query: query, Limit: limit, WithDocs: true}, nil)
+		response := map[string]any{"hits": hits, "total": result.Total, "latency_ns": time.Since(started).Nanoseconds()}
+		if profile {
+			response["resources"] = usageDelta(usageBefore, readResourceUsage())
+		}
+		writeJSON(w, response)
 	case r.Method == http.MethodPost && action == "count":
 		var q WireQuery
 		dec := json.NewDecoder(r.Body)

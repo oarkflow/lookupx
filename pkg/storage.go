@@ -186,12 +186,15 @@ type BulkProgress struct {
 }
 
 type BulkStats struct {
-	SourceName string        `json:"source_name"`
-	Seen       uint64        `json:"seen"`
-	Indexed    uint64        `json:"indexed"`
-	Skipped    uint64        `json:"skipped"`
-	LastSeq    uint64        `json:"last_seq"`
-	Took       time.Duration `json:"took"`
+	SourceName    string        `json:"source_name"`
+	Seen          uint64        `json:"seen"`
+	Indexed       uint64        `json:"indexed"`
+	Skipped       uint64        `json:"skipped"`
+	LastSeq       uint64        `json:"last_seq"`
+	Took          time.Duration `json:"took"`
+	SourceTook    time.Duration `json:"source_took"`
+	IndexTook     time.Duration `json:"index_took"`
+	RowsPerSecond float64       `json:"rows_per_second"`
 }
 
 // IndexFrom streams a Source into the index. It is safe for very large datasets
@@ -229,7 +232,9 @@ func (ix *Index) IndexFrom(ctx context.Context, src Source, opt BulkOptions) (Bu
 		if len(batch) == 0 {
 			return nil
 		}
+		indexStarted := time.Now()
 		indexed, skipped, lastSeq, err := ix.indexSourceBatch(batch, opt.SkipBadRecords)
+		stats.IndexTook += time.Since(indexStarted)
 		stats.Indexed += indexed
 		stats.Skipped += skipped
 		if lastSeq > 0 {
@@ -301,6 +306,10 @@ func (ix *Index) IndexFrom(ctx context.Context, src Source, opt BulkOptions) (Bu
 		}
 	}
 	stats.Took = time.Since(started)
+	stats.SourceTook = stats.Took - stats.IndexTook
+	if stats.Took > 0 {
+		stats.RowsPerSecond = float64(stats.Indexed) / stats.Took.Seconds()
+	}
 	return stats, nil
 }
 
@@ -929,7 +938,7 @@ func (ix *Index) CompileDatasourceLookup(raw string) (Query, error) {
 	}
 	filters := make([]Query, 0, len(vals))
 	for field, values := range vals {
-		if field == "limit" || field == "offset" {
+		if field == "limit" || field == "offset" || field == "fuzzy" || field == "profile" || field == "with_docs" {
 			continue
 		}
 		if field == "term" {
@@ -938,7 +947,8 @@ func (ix *Index) CompileDatasourceLookup(raw string) (Query, error) {
 				// "term" (for example TupleLookupSchema).
 			} else {
 				for _, value := range values {
-					if q := ix.compileGlobalTerm(strings.TrimSpace(value)); q != nil {
+					fuzzy, _ := strconv.ParseBool(vals.Get("fuzzy"))
+					if q := ix.compileGlobalTerm(strings.TrimSpace(value), fuzzy); q != nil {
 						filters = append(filters, q)
 					}
 				}
@@ -971,30 +981,12 @@ func (ix *Index) CompileDatasourceLookup(raw string) (Query, error) {
 // compileGlobalTerm searches each word across every text, keyword, and boolean
 // field. Words are ANDed, while fields are ORed, so "nail repair" may match
 // either one column or values distributed across multiple searchable columns.
-func (ix *Index) compileGlobalTerm(value string) Query {
+func (ix *Index) compileGlobalTerm(value string, fuzzy bool) Query {
 	words := strings.Fields(value)
 	if len(words) == 0 {
 		return nil
 	}
-	wordQueries := make([]Query, 0, len(words))
-	for _, word := range words {
-		fields := make([]Query, 0, len(ix.cfg.Schema.Fields))
-		for field, opt := range ix.cfg.Schema.Fields {
-			switch opt.Kind {
-			case FieldText:
-				fields = append(fields, Term{Field: field, Value: word})
-			case FieldKeyword, FieldBool:
-				fields = append(fields, sourceStringFilter{Field: field, Value: word, Operator: "contains"})
-			}
-		}
-		if len(fields) > 0 {
-			wordQueries = append(wordQueries, Or(fields))
-		}
-	}
-	if len(wordQueries) == 0 {
-		return nil
-	}
-	return And(wordQueries)
+	return GlobalTerm{Words: words, Fuzzy: fuzzy}
 }
 
 func lookupFieldOperator(key string) (string, string) {

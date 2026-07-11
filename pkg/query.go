@@ -46,6 +46,42 @@ type Contains struct{ Field, Value string }
 
 func (q Contains) eval(ix *Index) *Bitmap { return ix.ngramBitmap(q.Field, q.Value) }
 
+// GlobalTerm performs indexed full-text retrieval across all searchable string
+// fields. Each word must match at least one field; optional fuzzy expansion is
+// bounded by each field's fuzzy term index.
+type GlobalTerm struct {
+	Words []string
+	Fuzzy bool
+}
+
+func (q GlobalTerm) eval(ix *Index) *Bitmap {
+	var result *Bitmap
+	for _, word := range q.Words {
+		perWord := NewBitmap()
+		for field, opt := range ix.cfg.Schema.Fields {
+			if opt.Kind != FieldText && opt.Kind != FieldKeyword && opt.Kind != FieldBool {
+				continue
+			}
+			perWord = perWord.OrInPlace(ix.termBitmap(field, word))
+			if q.Fuzzy && opt.Fuzzy {
+				perWord = perWord.OrInPlace(ix.fuzzyBitmap(field, word, 1, 128))
+			}
+		}
+		if result == nil {
+			result = perWord
+		} else {
+			result = result.AndInPlace(perWord)
+		}
+		if result.Empty() {
+			break
+		}
+	}
+	if result == nil {
+		return NewBitmap()
+	}
+	return result
+}
+
 type sourceStringFilter struct {
 	Field, Value, Operator string
 }

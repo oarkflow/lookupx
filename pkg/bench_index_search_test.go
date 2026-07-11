@@ -235,6 +235,22 @@ func BenchmarkSearch(b *testing.B) {
 			_, hits = ix.SearchInto(req, hits)
 		}
 	})
+	b.Run("GlobalTermBM25", func(b *testing.B) {
+		q := GlobalTerm{Words: []string{"engine"}}
+		b.ReportAllocs()
+		req := SearchRequest{Query: q, Limit: 20, WithDocs: true}
+		for i := 0; i < b.N; i++ {
+			_, hits = ix.SearchInto(req, hits)
+		}
+	})
+	b.Run("GlobalTermFuzzyBM25", func(b *testing.B) {
+		q := GlobalTerm{Words: []string{"engin"}, Fuzzy: true}
+		b.ReportAllocs()
+		req := SearchRequest{Query: q, Limit: 20, WithDocs: true}
+		for i := 0; i < b.N; i++ {
+			_, hits = ix.SearchInto(req, hits)
+		}
+	})
 	b.Run("Range", func(b *testing.B) {
 		q := Range{Field: "price", GTE: 100, LT: 200}
 		b.ReportAllocs()
