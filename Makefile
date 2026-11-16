@@ -8,10 +8,12 @@ DATASET := $(BENCH_DIR)/dataset.jsonl
 QUERIES := $(BENCH_DIR)/queries.jsonl
 LOOKUPX_RESULT ?= $(BENCH_DIR)/lookupx-result.json
 LUCENE_RESULT ?= $(BENCH_DIR)/lucene-result.json
+ELASTIC_URL ?= http://localhost:9200
+ELASTIC_RESULT ?= $(BENCH_DIR)/elasticsearch-result.json
 
 .PHONY: help test bench run example zip \
 	install-macos-tools install-mvn check-java check-mvn \
-	benchdata bench-lookupx bench-lucene bench-compare bench-clean
+	benchdata bench-lookupx bench-lucene bench-elasticsearch bench-compare bench-compare-elasticsearch bench-clean
 
 help:
 	@echo "LookupX targets"
@@ -21,6 +23,8 @@ help:
 	@echo "  make benchdata ROWS=100000 FIELDS=term,group_id,date_key"
 	@echo "  make bench-lookupx        Run LookupX benchmark using shared JSONL data"
 	@echo "  make bench-lucene         Run Lucene benchmark using same JSONL data"
+	@echo "  make bench-elasticsearch  Run Elasticsearch benchmark using same JSONL data (ELASTIC_URL=...)"
+	@echo "  make bench-compare-elasticsearch  Run LookupX and Elasticsearch on the same generated data"
 	@echo "  make bench-compare        Generate data, run LookupX and Lucene, save JSON results"
 	@echo "  make bench-clean          Remove generated benchmark data/results"
 
@@ -63,10 +67,13 @@ check-java:
 
 check-mvn: install-mvn
 
-$(DATASET) $(QUERIES):
+$(DATASET):
 	@mkdir -p $(BENCH_DIR)
 	go run ./cmd/benchgen -rows $(ROWS) -out $(BENCH_DIR) -fields $(FIELDS)
 	@echo "Generated: $(DATASET) and $(QUERIES)"
+
+$(QUERIES): $(DATASET)
+	@if [[ ! -f "$@" ]]; then go run ./cmd/benchgen -rows $(ROWS) -out $(BENCH_DIR) -fields $(FIELDS); fi
 
 benchdata: $(DATASET) $(QUERIES)
 
@@ -81,11 +88,20 @@ bench-lucene: check-java check-mvn $(DATASET) $(QUERIES)
 	cd bench/lucene && mvn -q compile exec:java \
 		-Dexec.args="--data ../../$(DATASET) --queries ../../$(QUERIES) --fields $(FIELDS) --loops $(LOOPS)" | tee ../../$(LUCENE_RESULT)
 
+bench-elasticsearch: $(DATASET) $(QUERIES)
+	go run ./cmd/benchelasticsearch -url $(ELASTIC_URL) -data $(DATASET) -queries $(QUERIES) -fields $(FIELDS) -loops $(LOOPS) | tee $(ELASTIC_RESULT)
+
 bench-compare: benchdata
 	$(MAKE) bench-lookupx ROWS=$(ROWS) LOOPS=$(LOOPS) FIELDS=$(FIELDS) BENCH_DIR=$(BENCH_DIR)
 	$(MAKE) bench-lucene ROWS=$(ROWS) LOOPS=$(LOOPS) FIELDS=$(FIELDS) BENCH_DIR=$(BENCH_DIR)
 	@echo "LookupX result: $(LOOKUPX_RESULT)"
 	@echo "Lucene result:  $(LUCENE_RESULT)"
+
+bench-compare-elasticsearch: benchdata
+	$(MAKE) bench-lookupx ROWS=$(ROWS) LOOPS=$(LOOPS) FIELDS=$(FIELDS) BENCH_DIR=$(BENCH_DIR)
+	$(MAKE) bench-elasticsearch ROWS=$(ROWS) LOOPS=$(LOOPS) FIELDS=$(FIELDS) BENCH_DIR=$(BENCH_DIR) ELASTIC_URL=$(ELASTIC_URL)
+	@echo "LookupX result:       $(LOOKUPX_RESULT)"
+	@echo "Elasticsearch result: $(ELASTIC_RESULT)"
 
 bench-clean:
 	rm -rf $(BENCH_DIR)

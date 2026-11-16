@@ -1252,6 +1252,25 @@ benchdata/lucene-result.json
 
 The Lucene target requires Java 17+ and Maven. On macOS, `make install-mvn` installs Maven through Homebrew when `mvn` is missing. Java is intentionally not installed automatically because JDK selection can affect system configuration; install it with `brew install openjdk@17` if needed.
 
+Run the same dataset and exact-key query against Elasticsearch:
+
+```bash
+make bench-elasticsearch ELASTIC_URL=http://localhost:9200 ROWS=100000 LOOPS=1000 FIELDS=term,group_id,date_key
+```
+
+Set `ELASTIC_API_KEY` for API key auth. The runner recreates `lookupx-bench`, uses bulk indexing with replicas and automatic refresh disabled and `_source` disabled, then reports indexing, store/heap, and query timings in `benchdata/elasticsearch-result.json`. The shared manifest exercises exact composite and popular single-field queries. Elasticsearch's `took` value has millisecond precision; client latency also includes HTTP and JSON overhead. LookupX's runner reads the same JSONL file in-process.
+
+### Search pages and streaming ingestion
+
+For deep unsorted result pages, use `after_doc_id` from the last hit of the prior page. Document IDs are monotonic within an index and sparse postings seek directly to the next ID. Cursor paging cannot be combined with explicit sort order; use offset pages for sorted result sets. Add `skip_total:true` to avoid recounting all matches on each cursor page; the response then uses `total:-1`, and callers can request an exact count separately from `POST /count`.
+
+```json
+{"type":"term","field":"status","value":"active","limit":50}
+{"type":"term","field":"status","value":"active","limit":50,"after_doc_id":12345,"skip_total":true}
+```
+
+The second request is sent to `POST /search`. The HTTP server also accepts `offset` for compatibility. Cursor order follows monotonically assigned document IDs. Inserts made during a pagination session can appear on later pages; use a frozen index or application snapshot when a fixed result set is required. Bulk `IndexFrom` flushes each batch under a short write lock, so concurrent searches can see each completed batch before the source finishes; the progress callback reports those same flush boundaries.
+
 ## Generic engine guarantee
 
 The reusable engine is not tied to any business domain. Index IDs, schema fields, composite-key definitions, SQL bindings, source mappings, and benchmark fields are all configurable. Demo datasets use neutral placeholder names and can be replaced with any domain-specific schema by configuring `Schema`, `SourceValue` mappings, and `CompositeDefinition`.

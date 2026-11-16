@@ -145,7 +145,15 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		limit := s.sanitizeLimit(q.Limit)
-		res := s.Index.Search(SearchRequest{Query: q.ToQuery(), Limit: limit, Offset: q.Offset, WithDocs: q.WithDocs, Sort: q.Sort, Facets: q.Facets})
+		if q.AfterDocID > 0 && len(q.Sort) > 0 {
+			writeError(w, http.StatusBadRequest, "after_doc_id pagination cannot be combined with sort")
+			return
+		}
+		if q.AfterDocID > 0 && q.Offset > 0 {
+			writeError(w, http.StatusBadRequest, "after_doc_id pagination cannot be combined with offset")
+			return
+		}
+		res := s.Index.Search(SearchRequest{Query: q.ToQuery(), Limit: limit, Offset: q.Offset, AfterDocID: q.AfterDocID, SkipTotal: q.SkipTotal, WithDocs: q.WithDocs, Sort: q.Sort, Facets: q.Facets})
 		json.NewEncoder(w).Encode(res)
 	case r.Method == "POST" && r.URL.Path == "/count":
 		var q WireQuery
@@ -215,6 +223,8 @@ type WireQuery struct {
 	MinShouldMatch int         `json:"min_should_match,omitempty"`
 	Limit          int         `json:"limit,omitempty"`
 	Offset         int         `json:"offset,omitempty"`
+	AfterDocID     DocID       `json:"after_doc_id,omitempty"`
+	SkipTotal      bool        `json:"skip_total,omitempty"`
 	WithDocs       bool        `json:"with_docs,omitempty"`
 	Sort           []SortField `json:"sort,omitempty"`
 	Facets         []string    `json:"facets,omitempty"`

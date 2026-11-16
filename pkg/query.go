@@ -303,12 +303,14 @@ func (q Bool) eval(ix *Index) *Bitmap {
 }
 
 type SearchRequest struct {
-	Query    Query
-	Limit    int
-	Offset   int
-	WithDocs bool
-	Sort     []SortField
-	Facets   []string
+	Query      Query
+	Limit      int
+	Offset     int
+	AfterDocID DocID
+	SkipTotal  bool
+	WithDocs   bool
+	Sort       []SortField
+	Facets     []string
 }
 
 func Simple(field, expr string) Query {

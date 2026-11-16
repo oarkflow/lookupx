@@ -717,3 +717,18 @@ The architecture now supports 1B-row operation by routing data into many persist
 - [x] Added tests for vector dimension mutation safety, vector graph compaction, strict WAL corruption detection, and HTTP vector validation/compaction.
 - [x] Verified `go test ./...`, `go vet ./...`, and `go test -race ./pkg` with the local Go toolchain.
 
+## Elasticsearch comparison and pagination improvements
+
+- [x] Add a repeatable Elasticsearch bulk-index/search runner using the shared JSONL data and query manifest.
+- [x] Add `make bench-elasticsearch` target and document setup, API key auth, and timing caveats.
+- [x] Add `after_doc_id` keyset pagination for unsorted Search and HTTP requests.
+- [x] Add sparse and dense bitmap seek support for cursor pages.
+- [x] Add `skip_total` for cursor pages so clients can avoid repeated full-match recounts; retrieve exact counts separately.
+- [x] Verify cursor pagination returns every document once across successive pages.
+- [x] Verify `IndexFrom` progress callbacks can search completed batches without deadlock.
+- [x] Document that `IndexFrom` exposes completed batches during ongoing ingestion and reports progress at each flush.
+- [x] Expand shared benchmark manifest with popular single-field and exact composite query shapes.
+- [x] Report retained LookupX heap, Elasticsearch store bytes, and Elasticsearch JVM heap alongside indexing/search timing.
+- [x] Run the shared 1M-row, 1,000-iteration benchmark against Elasticsearch 8.17.0 and record throughput, page latency, and memory observations.
+- [x] Add a concise reproducibility report with benchmark configuration and measurement-boundary caveats.
+- [x] Rerun the 1M-row benchmark with 100 warmup queries excluded and refresh the recorded results.

@@ -101,6 +101,30 @@ func (ix *Index) searchIntoFast(req SearchRequest, dst []Hit) (Result, []Hit) {
 	if req.Query == nil {
 		req.Query = MatchAll{}
 	}
+	if req.AfterDocID > 0 {
+		if len(req.Sort) != 0 || len(req.Facets) != 0 || req.WithDocs {
+			res := ix.Search(req)
+			dst = append(dst[:0], res.Hits...)
+			res.Hits = dst
+			return res, dst
+		}
+		bm := req.Query.eval(ix)
+		dst = dst[:0]
+		ix.mu.RLock()
+		total := -1
+		if !req.SkipTotal {
+			total = ix.countLiveLocked(bm)
+		}
+		bm.EachAfter(req.AfterDocID, func(id DocID) bool {
+			if ix.isDeletedOrExpiredLocked(id) {
+				return true
+			}
+			dst = append(dst, Hit{ID: ix.docToExt[id], DocID: id, Score: 1})
+			return len(dst) < req.Limit
+		})
+		ix.mu.RUnlock()
+		return Result{Total: total, Hits: dst, Took: ix.elapsed(start)}, dst
+	}
 	if len(req.Sort) != 0 || len(req.Facets) != 0 || req.WithDocs {
 		res := ix.Search(req)
 		dst = append(dst[:0], res.Hits...)

@@ -312,6 +312,47 @@ func (b *Bitmap) Each(fn func(DocID) bool) {
 		}
 	}
 }
+
+// EachAfter visits set document IDs strictly greater than after. Sparse
+// postings seek with binary search and dense postings start at the matching
+// word, so cursor pagination does not walk earlier result IDs.
+func (b *Bitmap) EachAfter(after DocID, fn func(DocID) bool) {
+	if b == nil {
+		return
+	}
+	if !b.isDense() {
+		i := sort.Search(len(b.sparse), func(i int) bool { return b.sparse[i] > after })
+		for ; i < len(b.sparse); i++ {
+			if !fn(b.sparse[i]) {
+				return
+			}
+		}
+		return
+	}
+	wi := int(after >> 6)
+	if wi >= len(b.words) {
+		return
+	}
+	w := b.words[wi] & (^uint64(0) << ((after & 63) + 1))
+	if after&63 == 63 {
+		w = 0
+	}
+	for ; ; wi++ {
+		if wi >= len(b.words) {
+			return
+		}
+		if wi != int(after>>6) {
+			w = b.words[wi]
+		}
+		for w != 0 {
+			tz := bits.TrailingZeros64(w)
+			if !fn(DocID(wi*64 + tz)) {
+				return
+			}
+			w &= w - 1
+		}
+	}
+}
 func (b *Bitmap) Words(max DocID) []uint64 {
 	if b == nil {
 		return nil

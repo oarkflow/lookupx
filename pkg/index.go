@@ -477,6 +477,27 @@ func (ix *Index) Search(req SearchRequest) Result {
 		req.Query = MatchAll{}
 	}
 	bm := req.Query.eval(ix)
+	if req.AfterDocID > 0 && len(req.Sort) == 0 && len(req.Facets) == 0 {
+		total := -1
+		if !req.SkipTotal {
+			total = ix.Count(req.Query)
+		}
+		hits := make([]Hit, 0, req.Limit)
+		ix.mu.RLock()
+		bm.EachAfter(req.AfterDocID, func(id DocID) bool {
+			if ix.isDeletedOrExpiredLocked(id) {
+				return true
+			}
+			h := Hit{ID: ix.docToExt[id], DocID: id, Score: 1}
+			if req.WithDocs && int(id) < len(ix.docs) && ix.docs[id] != nil {
+				h.Doc = cloneDoc(ix.docs[id])
+			}
+			hits = append(hits, h)
+			return len(hits) < req.Limit
+		})
+		ix.mu.RUnlock()
+		return Result{Total: total, Hits: hits, Took: ix.elapsed(start)}
+	}
 	ix.mu.RLock()
 	defer ix.mu.RUnlock()
 	if global, ok := globalTermFromQuery(req.Query); ok && len(req.Sort) == 0 && len(req.Facets) == 0 {

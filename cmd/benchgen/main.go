@@ -15,6 +15,7 @@ type row struct {
 }
 
 type query struct {
+	Type   string            `json:"type"`
 	Name   string            `json:"name"`
 	Fields map[string]string `json:"fields"`
 	Limit  int               `json:"limit"`
@@ -42,7 +43,7 @@ func main() {
 		for pos, f := range fields {
 			m[f] = generatedValue(f, pos, i)
 		}
-	b, _ := json.Marshal(row{ID: fmt.Sprintf("doc-%09d", i), Fields: m})
+		b, _ := json.Marshal(row{ID: fmt.Sprintf("doc-%09d", i), Fields: m})
 		w.Write(b)
 		w.WriteByte('\n')
 	}
@@ -60,7 +61,8 @@ func main() {
 		first[f] = generatedValue(f, pos, 0)
 	}
 	for _, q := range []query{
-		{Name: "exact-composite", Fields: pick(fields, first), Limit: 10},
+		{Type: "composite", Name: "exact-composite", Fields: pick(fields, first), Limit: 10},
+		{Type: "term", Name: "popular-term", Fields: pick(fields[:1], first), Limit: 10},
 	} {
 		b, _ := json.Marshal(q)
 		qw.Write(b)

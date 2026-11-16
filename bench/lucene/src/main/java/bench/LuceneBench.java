@@ -14,7 +14,7 @@ import java.util.*;
 public class LuceneBench {
   static final ObjectMapper M = new ObjectMapper();
   static class Row { public String id; public Map<String,String> fields; }
-  static class QuerySpec { public String name; public Map<String,String> fields; public int limit = 10; }
+  static class QuerySpec { public String type; public String name; public Map<String,String> fields; public int limit = 10; }
   static class QResult { public String name; public long avg_nanos; public int hits; public int loops; QResult(String n,long a,int h,int l){name=n;avg_nanos=a;hits=h;loops=l;} }
   static class Result { public String engine="lucene"; public int rows; public long index_nanos; public double index_rows_per_sec; public List<QResult> queries = new ArrayList<>(); }
 
@@ -58,19 +58,25 @@ public class LuceneBench {
       IndexSearcher searcher = new IndexSearcher(reader);
       List<QuerySpec> qs = readQueries(queries);
       for (QuerySpec q : qs) {
-        StringBuilder comp = new StringBuilder();
-        for (int i=0;i<fields.size();i++) {
-          String v = q.fields.getOrDefault(fields.get(i).trim(), "").toLowerCase(Locale.ROOT);
-          if (i>0) comp.append('\u001f');
-          comp.append(v);
+        org.apache.lucene.search.Query lq;
+        if ("term".equals(q.type)) {
+          String f = q.fields.keySet().iterator().next();
+          lq = new TermQuery(new Term(f, q.fields.get(f).toLowerCase(Locale.ROOT)));
+        } else {
+          StringBuilder comp = new StringBuilder();
+          for (int i=0;i<fields.size();i++) {
+            String v = q.fields.getOrDefault(fields.get(i).trim(), "").toLowerCase(Locale.ROOT);
+            if (i>0) comp.append('\u001f');
+            comp.append(v);
+          }
+          lq = new TermQuery(new Term("__composite", comp.toString()));
         }
-        org.apache.lucene.search.Query lq = new TermQuery(new Term("__composite", comp.toString()));
         int limit = q.limit <= 0 ? 10 : q.limit;
         int hits = 0;
         long qstart = System.nanoTime();
         for (int i=0;i<loops;i++) {
           TopDocs td = searcher.search(lq, limit);
-          hits = Math.toIntExact(td.totalHits.value());
+          hits = td.scoreDocs.length;
         }
         out.queries.add(new QResult(q.name, (System.nanoTime()-qstart)/loops, hits, loops));
       }
