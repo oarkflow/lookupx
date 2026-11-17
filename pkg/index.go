@@ -473,6 +473,19 @@ func (ix *Index) documentLocked(id DocID) Document {
 			doc[field] = value
 		}
 	}
+	// Time values use numeric columns for range queries. Older indexes and
+	// source-disabled bulk loads may not have a parallel stored string value,
+	// so format stored times from the numeric column for result documents.
+	for _, field := range ix.fieldList {
+		if field.opt.Kind != FieldTime || !field.opt.Stored || doc[field.name] != nil {
+			continue
+		}
+		values := ix.numericDense[field.name]
+		exists := ix.numericExists[field.name]
+		if int(id) < len(values) && exists != nil && exists.Has(id) {
+			doc[field.name] = time.Unix(int64(values[id]), 0).UTC().Format(time.RFC3339)
+		}
+	}
 	return doc
 }
 
@@ -1045,6 +1058,11 @@ func (ix *Index) indexDocLocked(id DocID, doc Document) {
 					ix.numeric[field] = make(map[DocID]float64, ix.cfg.InitialCapacity)
 				}
 				ix.setNumericLocked(field, id, n)
+				if opt.Kind == FieldTime && sf.stringsCol != nil {
+					if raw, ok := v.(string); ok && raw != "" {
+						ix.setStringColumnLocked(field, id, raw)
+					}
+				}
 			}
 			if opt.TTLField {
 				if ts := toUnix(v); ts > 0 {
@@ -1575,6 +1593,41 @@ func (ix *Index) rangeBitmap(field string, gte, gt, lte, lt any) *Bitmap {
 	}
 	return r
 }
+
+// rangeBitmapWithin applies a numeric range only to an already narrowed
+// candidate set. This avoids building a global sorted range bitmap for common
+// compound lookups that first constrain text or exact fields.
+func (ix *Index) rangeBitmapWithin(field string, gte, gt, lte, lt any, candidates *Bitmap) *Bitmap {
+	r := NewBitmap()
+	if candidates == nil {
+		return r
+	}
+	ix.mu.RLock()
+	defer ix.mu.RUnlock()
+	values := ix.numericDense[field]
+	exists := ix.numericExists[field]
+	if exists == nil {
+		return r
+	}
+	min, hasMin, minInc := boundFloat(gte, gt, true)
+	max, hasMax, maxInc := boundFloat(lte, lt, false)
+	candidates.Each(func(id DocID) bool {
+		if ix.deleted.Has(id) || !exists.Has(id) || int(id) >= len(values) {
+			return true
+		}
+		v := values[id]
+		if hasMin && (v < min || (!minInc && v == min)) {
+			return true
+		}
+		if hasMax && (v > max || (!maxInc && v == max)) {
+			return true
+		}
+		r.Add(id)
+		return true
+	})
+	return r
+}
+
 func (ix *Index) sortedIPv4Locked(field string) []ipPair {
 	if !ix.ip4Dirty[field] && ix.ip4Sorted[field] != nil {
 		return ix.ip4Sorted[field]

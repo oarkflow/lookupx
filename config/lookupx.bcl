@@ -40,11 +40,11 @@ datasource "cpt" {
     normalized true
   }
   column "effective_date" {
-    kind "keyword"
+    kind "time"
     normalized true
   }
   column "end_effective_date" {
-    kind "keyword"
+    kind "time"
     normalized true
   }
   column "patient_status" {
@@ -88,11 +88,11 @@ datasource "hcpcs" {
     normalized true
   }
   column "effective_date" {
-    kind "keyword"
+    kind "time"
     normalized true
   }
   column "end_effective_date" {
-    kind "keyword"
+    kind "time"
     normalized true
   }
   column "patient_status" {
@@ -204,7 +204,7 @@ datasource "dx_icd10" {
     normalized true
   }
   column "effective_date" {
-    kind "keyword"
+    kind "time"
     normalized true
   }
 }
@@ -232,7 +232,7 @@ datasource "dx_icd10_pcs" {
     normalized true
   }
   column "effective_date" {
-    kind "keyword"
+    kind "time"
     normalized true
   }
 }
@@ -268,7 +268,7 @@ datasource "special_fac" {
     normalized true
   }
   column "effective_date" {
-    kind "keyword"
+    kind "time"
     normalized true
   }
   column "charge_type" {
@@ -308,7 +308,7 @@ datasource "special_pro" {
     normalized true
   }
   column "effective_date" {
-    kind "keyword"
+    kind "time"
     normalized true
   }
   column "charge_type" {
@@ -320,6 +320,10 @@ datasource "special_pro" {
 index "cpt" {
   schema "record"
   datasource "cpt"
+  lookup_rule "DOS" {
+    target_field "effective_date"
+    operator "gte"
+  }
   initial_capacity 1000000
   schema_field "code" {
     kind "keyword"
@@ -367,13 +371,13 @@ index "cpt" {
     lookup true
   }
   schema_field "effective_date" {
-    kind "keyword"
+    kind "time"
     indexed true
     stored true
     lookup true
   }
   schema_field "end_effective_date" {
-    kind "keyword"
+    kind "time"
     indexed true
     stored true
     lookup true
@@ -401,6 +405,10 @@ index "cpt" {
 index "hcpcs" {
   schema "record"
   datasource "hcpcs"
+  lookup_rule "DOS" {
+    target_field "effective_date"
+    operator "gte"
+  }
   initial_capacity 1000000
   schema_field "code" {
     kind "keyword"
@@ -448,13 +456,13 @@ index "hcpcs" {
     lookup true
   }
   schema_field "effective_date" {
-    kind "keyword"
+    kind "time"
     indexed true
     stored true
     lookup true
   }
   schema_field "end_effective_date" {
-    kind "keyword"
+    kind "time"
     indexed true
     stored true
     lookup true
@@ -600,6 +608,10 @@ index "dx-fac3" {
 index "dx-icd10" {
   schema "record"
   datasource "dx_icd10"
+  lookup_rule "DOS" {
+    target_field "effective_date"
+    operator "gte"
+  }
     schema_field "code" {
     kind "keyword"
     indexed true
@@ -639,7 +651,7 @@ index "dx-icd10" {
     lowercase true
   }
   schema_field "effective_date" {
-    kind "keyword"
+    kind "time"
     indexed true
     stored true
     lookup true
@@ -652,6 +664,10 @@ index "dx-icd10" {
 index "dx-icd10-pcs" {
   schema "record"
   datasource "dx_icd10_pcs"
+  lookup_rule "DOS" {
+    target_field "effective_date"
+    operator "gte"
+  }
     schema_field "code" {
     kind "keyword"
     indexed true
@@ -684,7 +700,7 @@ index "dx-icd10-pcs" {
     term_search true
   }
   schema_field "effective_date" {
-    kind "keyword"
+    kind "time"
     indexed true
     stored true
     lookup true
@@ -697,6 +713,10 @@ index "dx-icd10-pcs" {
 index "special-fac" {
   schema "record"
   datasource "special_fac"
+  lookup_rule "DOS" {
+    target_field "effective_date"
+    operator "gte"
+  }
     schema_field "code" {
     kind "keyword"
     indexed true
@@ -743,7 +763,7 @@ index "special-fac" {
     lookup true
   }
   schema_field "effective_date" {
-    kind "keyword"
+    kind "time"
     indexed true
     stored true
     lookup true
@@ -762,6 +782,10 @@ index "special-fac" {
 index "special-pro" {
   schema "record"
   datasource "special_pro"
+  lookup_rule "DOS" {
+    target_field "effective_date"
+    operator "gte"
+  }
     schema_field "code" {
     kind "keyword"
     indexed true
@@ -808,7 +832,7 @@ index "special-pro" {
     lookup true
   }
   schema_field "effective_date" {
-    kind "keyword"
+    kind "time"
     indexed true
     stored true
     lookup true

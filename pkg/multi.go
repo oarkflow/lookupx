@@ -571,7 +571,7 @@ func (s *MultiServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		mi, _ := s.Manager.Managed(id)
 		writeJSON(w, map[string]any{"id": id, "stats": ix.Stats(), "latency": mi.Latency, "resources": readResourceUsage(), "generation": mi.Generation, "reloading": mi.Reloading})
 	case r.Method == http.MethodGet && action == "schema":
-		writeJSON(w, map[string]any{"id": id, "fields": schemaFieldsWire(ix.SchemaFields())})
+		writeJSON(w, map[string]any{"id": id, "fields": schemaFieldsWire(ix.SchemaFields()), "lookup_rules": ix.cfg.LookupRules})
 	case r.Method == http.MethodPost && action == "search":
 		var q WireQuery
 		dec := json.NewDecoder(r.Body)

@@ -77,6 +77,14 @@ type IndexDef struct {
 	DatasourceID    string           `bcl:"datasource" json:"datasource,omitempty"`
 	Bulk            BulkDef          `bcl:"bulk"      json:"bulk"`
 	Fields          []SchemaFieldDef `bcl:"schema_field,block" json:"fields,omitempty"`
+	LookupRules     []LookupRuleDef  `bcl:"lookup_rule,block" json:"lookup_rules,omitempty"`
+}
+
+// LookupRuleDef declares a generic request-parameter-to-filter mapping.
+type LookupRuleDef struct {
+	Parameter   string `bcl:",id" json:"parameter"`
+	TargetField string `bcl:"target_field" json:"field"`
+	Operator    string `bcl:"operator" json:"operator"`
 }
 
 // SchemaFieldDef configures one field in an index schema.
@@ -155,8 +163,13 @@ func (idx IndexDef) ToConfig() Config {
 			schema.Fields[field.ID] = FieldOptions{Kind: kind, Indexed: field.Indexed, Stored: field.Stored, StoredOnly: field.StoredOnly, IndexAlias: field.IndexAlias, StoredAlias: field.StoredAlias, Lookup: field.Lookup, TermSearch: field.TermSearch, Lowercase: field.Lowercase, Prefix: field.Prefix, Sortable: field.Sortable, Facetable: field.Facetable}
 		}
 	}
+	rules := make([]LookupRule, 0, len(idx.LookupRules))
+	for _, rule := range idx.LookupRules {
+		rules = append(rules, LookupRule{Parameter: rule.Parameter, Field: rule.TargetField, Operator: rule.Operator})
+	}
 	return Config{
 		Schema:          schema,
+		LookupRules:     rules,
 		DisableSource:   !idx.StoreSource,
 		InitialCapacity: idx.InitialCapacity,
 	}

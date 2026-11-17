@@ -219,6 +219,18 @@ type Range struct {
 
 func (q Range) eval(ix *Index) *Bitmap { return ix.rangeBitmap(q.Field, q.GTE, q.GT, q.LTE, q.LT) }
 
+func evalQueryWithin(ix *Index, q Query, candidates *Bitmap) *Bitmap {
+	switch v := q.(type) {
+	case Range:
+		return ix.rangeBitmapWithin(v.Field, v.GTE, v.GT, v.LTE, v.LT, candidates)
+	case *Range:
+		if v != nil {
+			return ix.rangeBitmapWithin(v.Field, v.GTE, v.GT, v.LTE, v.LT, candidates)
+		}
+	}
+	return candidates.Clone().AndInPlace(q.eval(ix))
+}
+
 type And []Query
 
 func (q And) eval(ix *Index) *Bitmap {
@@ -231,7 +243,7 @@ func (q And) eval(ix *Index) *Bitmap {
 	}
 	r := items[0].eval(ix).Clone()
 	for i := 1; i < len(items); i++ {
-		r = r.AndInPlace(items[i].eval(ix))
+		r = evalQueryWithin(ix, items[i], r)
 		if r.Empty() {
 			break
 		}
@@ -265,21 +277,19 @@ type Bool struct {
 
 func (q Bool) eval(ix *Index) *Bitmap {
 	var r *Bitmap
-	for _, m := range q.Must {
-		if r == nil {
-			r = m.eval(ix).Clone()
-		} else {
-			r = r.AndInPlace(m.eval(ix))
-		}
-		if r.Empty() {
-			return r
-		}
+	required := make([]Query, 0, len(q.Must)+len(q.Filter))
+	required = append(required, q.Must...)
+	required = append(required, q.Filter...)
+	if len(required) > 1 {
+		sort.SliceStable(required, func(i, j int) bool {
+			return ix.estimateCardinality(required[i]) < ix.estimateCardinality(required[j])
+		})
 	}
-	for _, f := range q.Filter {
+	for _, f := range required {
 		if r == nil {
 			r = f.eval(ix).Clone()
 		} else {
-			r = r.AndInPlace(f.eval(ix))
+			r = evalQueryWithin(ix, f, r)
 		}
 		if r.Empty() {
 			return r

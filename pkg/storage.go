@@ -342,8 +342,10 @@ func (ix *Index) indexSourceBatch(batch []SourceRecord, skipBad bool) (indexed, 
 				} else {
 					w.Text(v.Field, v.String)
 				}
-			case ValueNumber, ValueTimeUnix:
+			case ValueNumber:
 				w.Float(v.Field, v.Number)
+			case ValueTimeUnix:
+				w.timeValue(v.Field, v.Number, v.Source)
 			case ValueVector:
 				if int(v.Field) < len(ix.fieldList) {
 					name := ix.fieldList[v.Field].name
@@ -428,8 +430,10 @@ func (ix *Index) indexSourceRecord(rec *SourceRecord) error {
 			} else {
 				w.Text(v.Field, v.String)
 			}
-		case ValueNumber, ValueTimeUnix:
+		case ValueNumber:
 			w.Float(v.Field, v.Number)
+		case ValueTimeUnix:
+			w.timeValue(v.Field, v.Number, v.Source)
 		case ValueVector:
 			if int(v.Field) < len(ix.fieldList) {
 				name := ix.fieldList[v.Field].name
@@ -1003,6 +1007,12 @@ func (ix *Index) CompileDatasourceLookup(raw string) (Query, error) {
 			}
 		}
 		name, operator := lookupFieldOperator(field)
+		for _, rule := range ix.cfg.LookupRules {
+			if strings.EqualFold(field, rule.Parameter) {
+				name, operator = rule.Field, strings.ToLower(rule.Operator)
+				break
+			}
+		}
 		opt, ok := ix.cfg.Schema.Fields[name]
 		if !ok {
 			return nil, fmt.Errorf("unknown filter field %q", name)
@@ -1075,6 +1085,10 @@ func compileDatasourceFilter(field, op, value string, opt FieldOptions) (Query, 
 		return Not{Q: q}, err
 	case "exists":
 		return Exists{Field: field}, nil
+	case "not_null", "is_not_null":
+		return Exists{Field: field}, nil
+	case "null", "is_null":
+		return Missing{Field: field}, nil
 	case "missing", "not_exists":
 		return Missing{Field: field}, nil
 	case "not_zero":

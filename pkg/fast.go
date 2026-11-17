@@ -1,6 +1,9 @@
 package pkg
 
-import "errors"
+import (
+	"errors"
+	"time"
+)
 
 type FieldID uint16
 
@@ -192,8 +195,28 @@ func (w *RowWriter) number(fid FieldID, value float64) {
 	}
 	sf.fi.exists.AddUnsafe(w.did)
 	w.ix.setNumericLocked(sf.name, w.did, value)
+	if sf.opt.Kind == FieldTime && sf.stringsCol != nil {
+		w.ix.setStringColumnLocked(sf.name, w.did, time.Unix(int64(value), 0).UTC().Format(time.RFC3339))
+	}
 	if sf.opt.TTLField {
 		w.ix.expires[w.did] = int64(value)
+	}
+}
+
+// timeValue indexes a Unix time while retaining the source representation in
+// the stored column so result documents can display it when source documents
+// are disabled.
+func (w *RowWriter) timeValue(fid FieldID, value float64, source any) {
+	w.number(fid, value)
+	if w.err != nil {
+		return
+	}
+	sf := w.ix.fieldByID(fid)
+	if sf == nil || sf.stringsCol == nil || source == nil {
+		return
+	}
+	if raw, ok := source.(string); ok && raw != "" {
+		w.ix.setStringColumnLocked(sf.name, w.did, raw)
 	}
 }
 

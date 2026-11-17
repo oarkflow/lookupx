@@ -373,6 +373,40 @@ func TestLookupGlobalTermAcrossColumnsAndStructuredFilters(t *testing.T) {
 	}
 }
 
+func TestConfiguredLookupRulesMapGenericParametersToFilters(t *testing.T) {
+	ix, err := New(Config{DisableSource: true, LookupRules: []LookupRule{{Parameter: "DOS", Field: "effective_date", Operator: "gte"}}, Schema: Schema{Fields: map[string]FieldOptions{
+		"work_item_uid":  {Kind: FieldKeyword, Indexed: true, Lookup: true},
+		"charge_type":    {Kind: FieldKeyword, Indexed: true, Lookup: true},
+		"effective_date": {Kind: FieldTime, Indexed: true, Lookup: true},
+	}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	date := func(v string) int64 {
+		parsed, e := parseSourceTime(v, "")
+		if e != nil {
+			t.Fatal(e)
+		}
+		return parsed
+	}
+	records := []SourceRecord{
+		{ID: "old", Values: []SourceValue{{Field: ix.FieldID("work_item_uid"), Kind: ValueKeyword, String: "114"}, {Field: ix.FieldID("charge_type"), Kind: ValueKeyword, String: "ED_PROFEE"}, {Field: ix.FieldID("effective_date"), Kind: ValueTimeUnix, Number: float64(date("2015-06-23"))}}},
+		{ID: "new", Values: []SourceValue{{Field: ix.FieldID("work_item_uid"), Kind: ValueKeyword, String: "114"}, {Field: ix.FieldID("charge_type"), Kind: ValueKeyword, String: "ED_PROFEE"}, {Field: ix.FieldID("effective_date"), Kind: ValueTimeUnix, Number: float64(date("2017-01-01"))}}},
+		{ID: "wrong-item", Values: []SourceValue{{Field: ix.FieldID("work_item_uid"), Kind: ValueKeyword, String: "999"}, {Field: ix.FieldID("charge_type"), Kind: ValueKeyword, String: "ED_PROFEE"}, {Field: ix.FieldID("effective_date"), Kind: ValueTimeUnix, Number: float64(date("2018-01-01"))}}},
+	}
+	if _, err := ix.IndexFrom(context.Background(), SliceSource{Records: records}, BulkOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	q, err := ix.CompileDatasourceLookup("work_item_uid=114&charge_type=ED_PROFEE&DOS=2016-01-01")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, hits := ix.SearchInto(SearchRequest{Query: q, Limit: 10}, nil)
+	if len(hits) != 1 || hits[0].ID != "new" {
+		t.Fatalf("configured rule returned %#v", hits)
+	}
+}
+
 func TestConfiguredTermSearchFieldsRestrictGlobalSearch(t *testing.T) {
 	ix, err := New(Config{DisableSource: true, Schema: Schema{Fields: map[string]FieldOptions{
 		"code":        {Kind: FieldKeyword, Indexed: true, Lowercase: true, TermSearch: true},

@@ -89,6 +89,7 @@ func (c StaticClock) UnixNano() int64 { return c.Now().UnixNano() }
 
 type Config struct {
 	Schema         Schema        `json:"schema"`
+	LookupRules    []LookupRule  `json:"lookup_rules,omitempty"`
 	WALPath        string        `json:"wal_path"`
 	SnapshotPath   string        `json:"snapshot_path"`
 	AutoFlushEvery time.Duration `json:"auto_flush_every"`
@@ -122,6 +123,15 @@ type Config struct {
 	InitialCapacity int   `json:"initial_capacity,omitempty"`
 	Clock           Clock `json:"-"`
 	CollectTook     bool  `json:"collect_took,omitempty"`
+}
+
+// LookupRule maps a request parameter to a normal schema field filter.
+// It lets an index expose domain-specific query parameters without embedding
+// those rules in application code.
+type LookupRule struct {
+	Parameter string `json:"parameter"`
+	Field     string `json:"field"`
+	Operator  string `json:"operator"`
 }
 
 type Stats struct {

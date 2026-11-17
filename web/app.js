@@ -128,6 +128,7 @@ const App = (() => {
   // POST /v1/indexes/{id}/search            full query DSL (WireQuery)
 
   let searchSchema = {};
+  let lookupRules = [];
   let filterRowSeq = 0;
   let columnFilterValues = {};
 
@@ -140,7 +141,7 @@ const App = (() => {
       <section class="search-panel" aria-label="Search controls">
         <form class="search-bar" onsubmit="event.preventDefault(); App.doLookup()">
           <div class="search-control search-index"><label class="control-label" for="lookup-index">INDEX</label>${indexSelect('lookup-index')}</div>
-          <div class="search-control term-control"><label class="control-label" for="lookup-term">SEARCH TERM</label><div class="term-input-row"><input id="lookup-term" type="search" placeholder="Search all fields or enter code=99213" aria-label="Full-text search term" /><select id="lookup-term-field" aria-label="Search term field"><option value="">All searchable fields</option></select></div></div>
+          <div class="search-control term-control"><label class="control-label" for="lookup-term">SEARCH TERM</label><div class="term-input-row"><input id="lookup-term" type="search" placeholder="Search text" aria-label="Full-text search term" /><select id="lookup-term-field" aria-label="Search term field"><option value="">All searchable fields</option></select></div></div>
           <label class="search-fuzzy"><input id="lookup-fuzzy" type="checkbox" /> Fuzzy</label>
           <label class="search-fuzzy"><input id="lookup-profile" type="checkbox" /> Profile</label>
           <div class="search-control limit-control"><label class="control-label" for="lookup-limit">LIMIT</label><input id="lookup-limit" type="number" min="1" max="500" value="25" aria-label="Result limit" /></div>
@@ -148,6 +149,9 @@ const App = (() => {
         </form>
         <div class="filter-toolbar"><span class="filter-toolbar-label">Refine with field filters</span><button class="btn btn-secondary" type="button" onclick="App.addFilter()">+ Add filter</button></div>
         <div id="filter-rows" class="filter-rows"></div>
+        <div class="filter-toolbar"><span class="filter-toolbar-label">Field values (exact match or configured rule)</span><button class="btn btn-secondary" type="button" onclick="App.addFieldValue()">+ Add field value</button></div>
+        <datalist id="field-value-name-options"></datalist>
+        <div id="field-value-rows" class="filter-rows"></div>
       </section>
       <div id="search-results"><div class="empty-state"><p>Select an index and enter filters.</p></div></div>
     `;
@@ -162,6 +166,10 @@ const App = (() => {
     try {
       const data = await api('GET', `/v1/indexes/${encodeURIComponent(id)}/schema`);
       searchSchema = data.fields || {};
+      lookupRules = Array.isArray(data.lookup_rules) ? data.lookup_rules : [];
+      const fieldNameOptions = [...Object.keys(searchSchema), ...lookupRules.map(rule => rule.parameter)];
+      $('#field-value-name-options').innerHTML = [...new Set(fieldNameOptions)].sort((a, b) => a.localeCompare(b))
+        .map(name => `<option value="${escHtml(name)}"></option>`).join('');
       const termField = $('#lookup-term-field');
       if (termField) {
         const hasConfiguredTermFields = Object.values(searchSchema).some(info => info.term_search);
@@ -178,6 +186,8 @@ const App = (() => {
       const rows = $('#filter-rows');
       rows.innerHTML = '';
       addFilter();
+      $('#field-value-rows').innerHTML = '';
+      addFieldValue();
     } catch { searchSchema = {}; }
   }
 
@@ -230,6 +240,24 @@ const App = (() => {
 
   function fieldKind(name) {
     return Number((searchSchema[name] || {}).kind);
+  }
+
+  let fieldValueRowSeq = 0;
+  function addFieldValue() {
+    const host = $('#field-value-rows');
+    if (!host) return;
+    const rowID = ++fieldValueRowSeq;
+    host.insertAdjacentHTML('beforeend', `
+      <div class="field-value-row" data-field-value-id="${rowID}">
+        <input class="field-value-name" type="text" list="field-value-name-options" placeholder="Field name" aria-label="Field name" onkeydown="if(event.key==='Enter'){event.preventDefault();App.doLookup()}" />
+        <input class="field-value-value" type="text" placeholder="Value" aria-label="Field value" onkeydown="if(event.key==='Enter'){event.preventDefault();App.doLookup()}" />
+        <button class="filter-remove" type="button" title="Remove field value" aria-label="Remove field value" onclick="App.removeFieldValue(${rowID})">×</button>
+      </div>`);
+  }
+
+  function removeFieldValue(rowID) {
+    const row = document.querySelector(`[data-field-value-id="${rowID}"]`);
+    if (row) row.remove();
   }
 
   function updateFilterValueState(id) {
@@ -331,13 +359,7 @@ const App = (() => {
     const limit = parseInt($('#lookup-limit').value) || 25;
     const params = new URLSearchParams();
 	const term = $('#lookup-term').value.trim();
-	const fieldValueAt = term.indexOf('=');
-	const fieldValueName = fieldValueAt > 0 ? term.slice(0, fieldValueAt).trim() : '';
-	const isFieldValue = !!fieldValueName && Object.prototype.hasOwnProperty.call(searchSchema, fieldValueName);
-	if (isFieldValue) {
-	  const fieldValue = term.slice(fieldValueAt + 1).trim();
-	  if (fieldValue) params.set(fieldValueName, fieldValue);
-	} else if (term) {
+	if (term) {
 	  params.set('term', term);
 	  const termField = $('#lookup-term-field').value;
 	  if (termField) params.set('term_field', termField);
@@ -361,6 +383,12 @@ const App = (() => {
       }
       if (operator !== 'between' && !input.disabled && !value) continue;
       params.append(`${fieldName}__${operator}`, value);
+    }
+    for (const row of $$('.field-value-row')) {
+      const fieldName = row.querySelector('.field-value-name').value.trim();
+      const value = row.querySelector('.field-value-value').value.trim();
+      if (!fieldName || !value) continue;
+      params.append(fieldName, value);
     }
     for (const input of $$('.column-filter')) {
       const fieldName = input.dataset.column;
@@ -884,7 +912,7 @@ const App = (() => {
 
   const handlers = {
     refresh, render,
-    doLookup, addFilter, updateFilterOperators, removeFilter,
+    doLookup, addFilter, updateFilterOperators, removeFilter, addFieldValue, removeFieldValue,
     addSchemaFieldRow, createIndex, reloadIndex, freezeIndex, persistIndex, deleteIndex,
     toggleDetail, upsertDoc, deleteDoc, listGenerations, validateIndex, repairIndex, compactIndex,
     loadSQLQuery, loadSQLTable, loadJSONRecords, loadFile, chooseIntegrationSource,

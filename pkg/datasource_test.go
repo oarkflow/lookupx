@@ -432,6 +432,11 @@ index "test_idx" {
   schema "record"
   datasource "test_ds"
 
+  lookup_rule "DOS" {
+    target_field "effective_date"
+    operator "gte"
+  }
+
   bulk {
     batch_size 1024
   }
@@ -472,6 +477,9 @@ index "test_idx" {
 	}
 	if idx.Bulk.BatchSize != 1024 {
 		t.Fatalf("expected bulk.batch_size=1024, got %d", idx.Bulk.BatchSize)
+	}
+	if len(idx.ToConfig().LookupRules) != 1 || idx.ToConfig().LookupRules[0] != (LookupRule{Parameter: "DOS", Field: "effective_date", Operator: "gte"}) {
+		t.Fatalf("lookup rule did not parse/map from BCL: %#v", idx.ToConfig().LookupRules)
 	}
 }
 
@@ -688,6 +696,7 @@ func TestClearBCLConfigDeclaresTermSearchFields(t *testing.T) {
 	if len(cfg.Indexes) == 0 {
 		t.Fatal("expected configured indexes")
 	}
+	dosRuleIndexes := map[string]bool{"cpt": true, "hcpcs": true, "dx-icd10": true, "dx-icd10-pcs": true, "special-fac": true, "special-pro": true}
 	for _, idx := range cfg.Indexes {
 		fields := idx.ToConfig().Schema.Fields
 		for _, name := range []string{"code", "code_no_period", "description", "fulltext"} {
@@ -697,6 +706,14 @@ func TestClearBCLConfigDeclaresTermSearchFields(t *testing.T) {
 		}
 		if opt := fields["work_item_uid"]; opt.TermSearch {
 			t.Errorf("index %q work_item_uid should remain a field-value filter, not a term-search field", idx.ID)
+		}
+		if dosRuleIndexes[idx.ID] {
+			if len(idx.ToConfig().LookupRules) != 1 || idx.ToConfig().LookupRules[0] != (LookupRule{Parameter: "DOS", Field: "effective_date", Operator: "gte"}) {
+				t.Errorf("index %q should map DOS to effective_date gte: %#v", idx.ID, idx.ToConfig().LookupRules)
+			}
+			if fields["effective_date"].Kind != FieldTime {
+				t.Errorf("index %q effective_date must be a time field", idx.ID)
+			}
 		}
 	}
 }

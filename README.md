@@ -76,7 +76,9 @@ Term-search fields are configured on each index with `term_search true` inside
 its `schema_field` block. The default `term` query and the browser field chooser
 use only these fields when any are declared. The CPT indexes enable `code`,
 `code_no_period`, `description`, and `fulltext`; other indexed fields remain
-available as exact `field=value` filters. `term_field` can narrow a term query
+available as exact `field=value` filters. The browser has a separate dynamic
+Field values section for arbitrary field/value parameters; these are separate
+from the operator-based field filters. `term_field` can narrow a term query
 to one of the configured fields. Both candidate retrieval and BM25 scoring use
 this field list, avoiding work on unrelated searchable fields.
 
@@ -85,6 +87,13 @@ schema_field "description" {
   kind "text"
   indexed true
   term_search true
+}
+
+# On an index block, lookup_rule maps any request parameter name to a normal
+# schema field/operator filter. Parameter names are case-insensitive.
+lookup_rule "DOS" {
+  target_field "effective_date"
+  operator "gte"
 }
 ```
 
@@ -143,6 +152,13 @@ curl 'localhost:8089/v1/indexes/cpt/lookup?code=99213&limit=10'
 
 Multiple term words can match across different fields, and can be combined
 with additional exact filters such as `charge_type=ED_FACILITY`.
+Configured `lookup_rule` parameters use the same `name=value` syntax and can
+map to any supported field operator, including `eq`, `between`, `gt`, `gte`,
+`lt`, `lte`, `contains`, `exists`, and `missing`. For example, a rule mapping
+`DOS` to a time field with `gte` can be combined with ordinary filters as
+`...?term=98925&work_item_uid=114&charge_type=ED_PROFEE&DOS=2016-01-01`.
+In the browser, add `DOS` and its date in the separate Field values section;
+the operator-based field filters remain available for schema fields.
 
 For a large fulltext corpus, Go's runtime memory target can lower RSS at some
 additional indexing CPU cost. On the nine-index Clear corpus,
