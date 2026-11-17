@@ -191,6 +191,8 @@ input:-webkit-autofill, input:-webkit-autofill:hover, input:-webkit-autofill:foc
 table { width: 100%; border-collapse: separate; border-spacing: 0; font-size: 12px; }
 .table-wrap { overflow: auto; max-height: min(68vh, 760px); border: 1px solid var(--line); border-radius: 6px; }
 th { position: sticky; z-index: 1; top: 0; padding: 10px 12px; border-bottom: 1px solid var(--line-strong); color: #68778b; background: #f7f9fb; text-align: left; font-size: 10px; font-weight: 700; letter-spacing: .035em; white-space: nowrap; }
+.column-filter-row th { top: 32px; padding: 5px 7px; background: #fbfcfd; }
+.column-filter { width: 100%; min-width: 92px; height: 30px; padding: 0 8px; font-size: 11px; font-weight: 400; letter-spacing: normal; }
 td { max-width: 320px; padding: 9px 12px; border-bottom: 1px solid #edf1f5; color: #425166; vertical-align: top; }
 tbody tr:last-child td { border-bottom: 0; }
 tbody tr:hover td { background: #f8fbfc; }

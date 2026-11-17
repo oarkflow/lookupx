@@ -129,6 +129,7 @@ const App = (() => {
 
   let searchSchema = {};
   let filterRowSeq = 0;
+  let columnFilterValues = {};
 
   async function renderSearch() {
     content().innerHTML = `
@@ -161,6 +162,7 @@ const App = (() => {
     try {
       const data = await api('GET', `/v1/indexes/${encodeURIComponent(id)}/schema`);
       searchSchema = data.fields || {};
+      columnFilterValues = {};
       const rows = $('#filter-rows');
       rows.innerHTML = '';
       addFilter();
@@ -290,7 +292,17 @@ const App = (() => {
     if (!anyDoc) {
       html += `<p class="text-xs text-gray-500 mb-2">This index doesn't store full documents (created with DisableSource), so only ID and score are available.</p>`;
     }
-    html += `<div class="table-wrap"><table><thead><tr><th>ID</th><th>Score</th>${fieldOrder.map(f => `<th>${escHtml(f)}</th>`).join('')}</tr></thead><tbody>`;
+    html += `<div class="table-wrap"><table><thead>
+      <tr><th>ID</th><th>Score</th>${fieldOrder.map(f => `<th>${escHtml(f)}</th>`).join('')}</tr>
+      <tr class="column-filter-row"><th></th><th></th>${fieldOrder.map(f => {
+        const kind = fieldKind(f);
+        const numeric = [2, 3].includes(kind);
+        const type = numeric ? 'number' : kind === 5 ? 'date' : 'search';
+        const operator = numeric || kind === 4 || kind === 5 ? 'eq' : 'contains';
+        const value = columnFilterValues[f] || '';
+        return `<th><input class="column-filter" data-column="${escHtml(f)}" data-operator="${operator}" type="${type}" value="${escHtml(value)}" placeholder="Filter…" aria-label="Filter ${escHtml(f)}" onkeydown="if(event.key==='Enter'){event.preventDefault();App.doLookup()}" /></th>`;
+      }).join('')}</tr>
+    </thead><tbody>`;
     for (const h of hits) {
       html += `<tr>
         <td class="font-mono text-sm">${escHtml(h.id)}</td>
@@ -320,13 +332,21 @@ const App = (() => {
       if (operator === 'between') {
         const v1 = input.value.trim();
         const v2 = input2.value.trim();
+        if (!v1 && !v2) continue;
         if (!v1 || !v2) { toast(`Both values required for ${fieldName} between`, false); input.focus(); return; }
         value = `${v1},${v2}`;
       } else {
         value = input.disabled ? '' : input.value.trim();
       }
-      if (operator !== 'between' && !input.disabled && !value) { toast(`Value required for ${fieldName}`, false); input.focus(); return; }
+      if (operator !== 'between' && !input.disabled && !value) continue;
       params.append(`${fieldName}__${operator}`, value);
+    }
+    for (const input of $$('.column-filter')) {
+      const fieldName = input.dataset.column;
+      const value = input.value.trim();
+      columnFilterValues[fieldName] = value;
+      if (!value) continue;
+      params.append(`${fieldName}__${input.dataset.operator}`, value);
     }
     params.set('limit', String(limit));
     const res = $('#search-results');
