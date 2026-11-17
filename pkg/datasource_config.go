@@ -31,68 +31,85 @@ import "strings"
 
 // LookupXConfig is the root configuration parsed from a BCL file.
 type LookupXConfig struct {
-	Addr       string           `bcl:"addr"        json:"addr,omitempty"`
-	DataDir    string           `bcl:"data_dir"    json:"data_dir,omitempty"`
-	APIKeys    []string         `bcl:"api_keys"    json:"api_keys,omitempty"`
+	Addr        string          `bcl:"addr"        json:"addr,omitempty"`
+	DataDir     string          `bcl:"data_dir"    json:"data_dir,omitempty"`
+	APIKeys     []string        `bcl:"api_keys"    json:"api_keys,omitempty"`
 	Datasources []DatasourceDef `bcl:"datasource,block" json:"datasources"`
-	Indexes    []IndexDef       `bcl:"index,block"      json:"indexes"`
+	Indexes     []IndexDef      `bcl:"index,block"      json:"indexes"`
 }
 
 // DatasourceDef represents a single datasource block in the BCL config.
 // The block ID is captured from the BCL block syntax: datasource "products" { ... }
 type DatasourceDef struct {
-	ID       string              `bcl:",id"       json:"id"`
-	Kind     string              `bcl:"kind"     json:"kind"`
-	Driver   string              `bcl:"driver"   json:"driver,omitempty"`
-	DSN      string              `bcl:"dsn"      json:"dsn,omitempty"`
-	Table    string              `bcl:"table"    json:"table,omitempty"`
-	View     string              `bcl:"view"     json:"view,omitempty"`
-	Query    string              `bcl:"query"    json:"query,omitempty"`
-	QueryFile string             `bcl:"query_file" json:"query_file,omitempty"`
-	File     string              `bcl:"file"     json:"file,omitempty"`
-	URL      string              `bcl:"url"      json:"url,omitempty"`
-	Method   string              `bcl:"method"   json:"method,omitempty"`
-	Auth     string              `bcl:"auth"     json:"auth,omitempty"`
-	IDColumn string              `bcl:"id_column"  json:"id_column,omitempty"`
-	IDField  string              `bcl:"id_field"   json:"id_field,omitempty"`
-	SeqColumn string             `bcl:"seq_column" json:"seq_column,omitempty"`
-	OrderColumn string           `bcl:"order_column" json:"order_column,omitempty"`
-	Where    string              `bcl:"where"    json:"where,omitempty"`
-	PageSize int                 `bcl:"page_size" json:"page_size,omitempty"`
-	PageParam string             `bcl:"page_param" json:"page_param,omitempty"`
-	LimitParam int               `bcl:"limit_param" json:"limit_param,omitempty"`
-	TimeoutSeconds int           `bcl:"timeout_seconds" json:"timeout_seconds,omitempty"`
-	Headers  map[string]string   `bcl:"headers"  json:"headers,omitempty"`
-	Params   map[string]any      `bcl:"params"   json:"params,omitempty"`
-	Columns  []ColumnDef         `bcl:"column,block" json:"columns"`
+	ID             string            `bcl:",id"       json:"id"`
+	Kind           string            `bcl:"kind"     json:"kind"`
+	Driver         string            `bcl:"driver"   json:"driver,omitempty"`
+	DSN            string            `bcl:"dsn"      json:"dsn,omitempty"`
+	Table          string            `bcl:"table"    json:"table,omitempty"`
+	View           string            `bcl:"view"     json:"view,omitempty"`
+	Query          string            `bcl:"query"    json:"query,omitempty"`
+	QueryFile      string            `bcl:"query_file" json:"query_file,omitempty"`
+	File           string            `bcl:"file"     json:"file,omitempty"`
+	URL            string            `bcl:"url"      json:"url,omitempty"`
+	Method         string            `bcl:"method"   json:"method,omitempty"`
+	Auth           string            `bcl:"auth"     json:"auth,omitempty"`
+	IDColumn       string            `bcl:"id_column"  json:"id_column,omitempty"`
+	IDField        string            `bcl:"id_field"   json:"id_field,omitempty"`
+	SeqColumn      string            `bcl:"seq_column" json:"seq_column,omitempty"`
+	OrderColumn    string            `bcl:"order_column" json:"order_column,omitempty"`
+	Where          string            `bcl:"where"    json:"where,omitempty"`
+	PageSize       int               `bcl:"page_size" json:"page_size,omitempty"`
+	PageParam      string            `bcl:"page_param" json:"page_param,omitempty"`
+	LimitParam     int               `bcl:"limit_param" json:"limit_param,omitempty"`
+	TimeoutSeconds int               `bcl:"timeout_seconds" json:"timeout_seconds,omitempty"`
+	Headers        map[string]string `bcl:"headers"  json:"headers,omitempty"`
+	Params         map[string]any    `bcl:"params"   json:"params,omitempty"`
+	Columns        []ColumnDef       `bcl:"column,block" json:"columns"`
 }
 
 // IndexDef represents an index block in the BCL config.
 type IndexDef struct {
-	ID              string      `bcl:",id"        json:"id"`
-	Schema          string      `bcl:"schema"    json:"schema,omitempty"`
-	InitialCapacity int         `bcl:"initial_capacity" json:"initial_capacity,omitempty"`
-	Persistent      bool        `bcl:"persistent" json:"persistent,omitempty"`
-	DatasourceID    string      `bcl:"datasource" json:"datasource,omitempty"`
-	Bulk            BulkDef     `bcl:"bulk"      json:"bulk"`
+	ID              string           `bcl:",id"        json:"id"`
+	Schema          string           `bcl:"schema"    json:"schema,omitempty"`
+	InitialCapacity int              `bcl:"initial_capacity" json:"initial_capacity,omitempty"`
+	Persistent      bool             `bcl:"persistent" json:"persistent,omitempty"`
+	StoreSource     bool             `bcl:"store_source" json:"store_source,omitempty"`
+	DatasourceID    string           `bcl:"datasource" json:"datasource,omitempty"`
+	Bulk            BulkDef          `bcl:"bulk"      json:"bulk"`
+	Fields          []SchemaFieldDef `bcl:"schema_field,block" json:"fields,omitempty"`
+}
+
+// SchemaFieldDef configures one field in an index schema.
+type SchemaFieldDef struct {
+	ID        string `bcl:",id" json:"id"`
+	Kind      string `bcl:"kind" json:"kind,omitempty"`
+	Indexed   bool   `bcl:"indexed" json:"indexed,omitempty"`
+	Stored    bool   `bcl:"stored" json:"stored,omitempty"`
+	Lookup    bool   `bcl:"lookup" json:"lookup,omitempty"`
+	Lowercase bool   `bcl:"lowercase" json:"lowercase,omitempty"`
+	Prefix    bool   `bcl:"prefix" json:"prefix,omitempty"`
+	Sortable  bool   `bcl:"sortable" json:"sortable,omitempty"`
+	Facetable bool   `bcl:"facetable" json:"facetable,omitempty"`
 }
 
 // BulkDef holds bulk ingestion parameters for an index.
 type BulkDef struct {
-	BatchSize        int    `bcl:"batch_size"        json:"batch_size,omitempty"`
-	CheckpointEvery  int    `bcl:"checkpoint_every"  json:"checkpoint_every,omitempty"`
-	CheckpointPath   string `bcl:"checkpoint_path"   json:"checkpoint_path,omitempty"`
-	Resume           bool   `bcl:"resume"            json:"resume,omitempty"`
-	SkipBadRecords   bool   `bcl:"skip_bad_records"  json:"skip_bad_records,omitempty"`
+	BatchSize       int    `bcl:"batch_size"        json:"batch_size,omitempty"`
+	CheckpointEvery int    `bcl:"checkpoint_every"  json:"checkpoint_every,omitempty"`
+	CheckpointPath  string `bcl:"checkpoint_path"   json:"checkpoint_path,omitempty"`
+	Resume          bool   `bcl:"resume"            json:"resume,omitempty"`
+	SkipBadRecords  bool   `bcl:"skip_bad_records"  json:"skip_bad_records,omitempty"`
 }
 
 // ColumnDef maps a source column/field to an index field.
 type ColumnDef struct {
-	Column     string `bcl:"column"     json:"column,omitempty"`
-	Field      string `bcl:"field"      json:"field,omitempty"`
-	Kind       string `bcl:"kind"       json:"kind,omitempty"`
-	Normalized bool   `bcl:"normalized" json:"normalized,omitempty"`
-	Layout     string `bcl:"layout"     json:"layout,omitempty"`
+	ID          string `bcl:",id"       json:"id,omitempty"`
+	Column      string `bcl:"column"     json:"column,omitempty"`
+	TargetField string `bcl:"target_field" json:"target_field,omitempty"`
+	Field       string `bcl:"field"      json:"field,omitempty"`
+	Kind        string `bcl:"kind"       json:"kind,omitempty"`
+	Normalized  bool   `bcl:"normalized" json:"normalized,omitempty"`
+	Layout      string `bcl:"layout"     json:"layout,omitempty"`
 }
 
 // ToBulkOptions converts BulkDef to the internal BulkOptions.
@@ -118,9 +135,25 @@ func (b BulkDef) ToBulkOptions() BulkOptions {
 // ToConfig converts IndexDef to the internal Config.
 func (idx IndexDef) ToConfig() Config {
 	schema := resolveSchema(idx.Schema)
+	if len(idx.Fields) > 0 {
+		schema = Schema{Fields: make(map[string]FieldOptions, len(idx.Fields))}
+		for _, field := range idx.Fields {
+			kind := FieldKeyword
+			if strings.EqualFold(field.Kind, "text") {
+				kind = FieldText
+			} else if strings.EqualFold(field.Kind, "number") || strings.EqualFold(field.Kind, "numeric") || strings.EqualFold(field.Kind, "float") {
+				kind = FieldFloat
+			} else if strings.EqualFold(field.Kind, "int") || strings.EqualFold(field.Kind, "integer") {
+				kind = FieldInt
+			} else if strings.EqualFold(field.Kind, "time") {
+				kind = FieldTime
+			}
+			schema.Fields[field.ID] = FieldOptions{Kind: kind, Indexed: field.Indexed, Stored: field.Stored, Lookup: field.Lookup, Lowercase: field.Lowercase, Prefix: field.Prefix, Sortable: field.Sortable, Facetable: field.Facetable}
+		}
+	}
 	return Config{
 		Schema:          schema,
-		DisableSource:   true,
+		DisableSource:   !idx.StoreSource,
 		InitialCapacity: idx.InitialCapacity,
 	}
 }
@@ -141,14 +174,21 @@ func (d *DatasourceDef) ResolveColumns() []SQLColumn {
 	for _, c := range d.Columns {
 		col := c.Column
 		if col == "" {
+			col = c.ID
+		}
+		if col == "" {
 			col = c.Field
 		}
-		field := c.Field
+		field := c.TargetField
+		if field == "" {
+			field = c.Field
+		}
 		if field == "" {
 			field = col
 		}
 		out = append(out, SQLColumn{
 			Column:     col,
+			FieldName:  field,
 			Field:      FieldID(0), // resolved later
 			Kind:       parseValueKind(c.Kind),
 			Normalized: c.Normalized,
@@ -232,11 +272,19 @@ func (d *DatasourceDef) ToMap() map[string]any {
 		cols := make([]any, 0, len(d.Columns))
 		for _, c := range d.Columns {
 			cm := map[string]any{}
-			if c.Column != "" {
-				cm["column"] = c.Column
+			column := c.Column
+			if column == "" {
+				column = c.ID
 			}
-			if c.Field != "" {
-				cm["field"] = c.Field
+			if column != "" {
+				cm["column"] = column
+			}
+			field := c.TargetField
+			if field == "" {
+				field = c.Field
+			}
+			if field != "" {
+				cm["field"] = field
 			}
 			if c.Kind != "" {
 				cm["kind"] = c.Kind

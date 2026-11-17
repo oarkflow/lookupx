@@ -9,6 +9,7 @@ require (
 	github.com/oarkflow/squealx/drivers/postgres v0.0.82
 	github.com/oarkflow/squealx/drivers/sqlite v0.0.82
 	github.com/xuri/excelize/v2 v2.11.1
+	modernc.org/sqlite v1.62.0
 )
 
 require (
@@ -39,5 +40,4 @@ require (
 	modernc.org/libc v1.81.2 // indirect
 	modernc.org/mathutil v1.7.1 // indirect
 	modernc.org/memory v1.13.0 // indirect
-	modernc.org/sqlite v1.62.0 // indirect
 )

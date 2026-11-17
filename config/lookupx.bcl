@@ -2,316 +2,771 @@ bcl {
   version "1.0"
 }
 
-// ---------------------------------------------------------------------------
-// Server configuration
-// ---------------------------------------------------------------------------
-addr "0.0.0.0:8089"
-data_dir "./data"
-api_keys [env("LOOKUPX_API_KEY", "dev-key-123")]
+# Clear fulltext replacement index configuration.
+# Set MYSQL_DSN to a MySQL DSN for a user that can SELECT the Clear lookup views
+# and charge-master tables. The mysql driver is registered by cmd/lookupx.
+addr env("ADDR", ":8089")
+data_dir env("LOOKUPX_DATA_DIR", "./data/indexes")
+api_keys [env("LOOKUPX_API_KEY", "")]
 
-// ---------------------------------------------------------------------------
-// Datasources — each block defines a data source for an index.
-// ---------------------------------------------------------------------------
-
-// SQL Table datasource with keyset pagination for large tables.
-datasource "products" {
-  kind "sql_table"
-  driver "postgres"
-  dsn env("DATABASE_URL", "postgres://localhost:5432/lookupx?sslmode=disable")
-  table "products"
-  id_column "sku"
-  order_column "id"
-  page_size 50000
-  where "active = true"
-
-  column "sku" {
-    field "sku"
-    kind "keyword"
-  }
-  column "name" {
-    field "name"
-    kind "text"
-  }
-  column "price" {
-    field "price"
-    kind "number"
-  }
-  column "category" {
-    field "category"
+datasource "cpt" {
+  kind "sql_query"
+  driver "mysql"
+  dsn env("MYSQL_DSN", "root:password@tcp(localhost:3306)/clear")
+  id_column "record_id"
+  query "SELECT CONCAT_WS(':', work_item, charge_type, effective_date, cpt_code) AS record_id, cpt_code AS code, REPLACE(LOWER(cpt_code), '.', '') AS code_no_period, ld AS description, ld AS fulltext, work_item AS work_item_uid, work_item, effective_date, end_effective_date, patient_status, charge_type FROM vw_cpt_master"
+  column "code" {
     kind "keyword"
     normalized true
   }
-  column "stock" {
-    field "stock"
-    kind "number"
-  }
-  column "updated_at" {
-    field "updated_at"
-    kind "time_unix"
-    layout "2006-01-02T15:04:05Z"
-  }
-
-  params {
-    batch_size 65536
-    checkpoint_every 10000
-  }
-}
-
-// SQL View datasource for pre-joined/read-optimized views.
-datasource "members" {
-  kind "sql_view"
-  driver "mysql"
-  dsn env("MYSQL_DSN", "root:password@tcp(localhost:3306)/members_db")
-  view "v_member_summary"
-  id_column "member_id"
-  where "status = 'active'"
-
-  column "member_id" {
-    field "member_id"
+  column "code_no_period" {
     kind "keyword"
-  }
-  column "full_name" {
-    field "full_name"
-    kind "text"
-  }
-  column "email" {
-    field "email"
-    kind "keyword"
-  }
-  column "plan" {
-    field "plan"
-    kind "keyword"
-  }
-  column "created_at" {
-    field "created_at"
-    kind "time_unix"
-    layout "2006-01-02"
-  }
-}
-
-// SQL Query datasource for complex joins and CTEs.
-datasource "claims" {
-  kind "sql_query"
-  driver "postgres"
-  dsn env("DATABASE_URL")
-  query "SELECT c.claim_id, c.member_id, c.provider_name, c.service_date, c.amount, c.status, p.plan_name FROM claims c JOIN providers p ON c.provider_id = p.id WHERE c.service_date >= '${start_date}' AND c.service_date <= '${end_date}'"
-  id_column "claim_id"
-
-  column "claim_id" {
-    field "claim_id"
-    kind "keyword"
-  }
-  column "member_id" {
-    field "member_id"
-    kind "keyword"
-  }
-  column "provider_name" {
-    field "provider_name"
-    kind "text"
-  }
-  column "service_date" {
-    field "service_date"
-    kind "time_unix"
-    layout "2006-01-02"
-  }
-  column "amount" {
-    field "amount"
-    kind "number"
-  }
-  column "status" {
-    field "status"
-    kind "keyword"
-  }
-  column "plan_name" {
-    field "plan_name"
-    kind "keyword"
-  }
-
-  params {
-    start_date "2025-01-01"
-    end_date "2025-12-31"
-  }
-}
-
-// SQL File datasource — loads query from a .sql file with parameter substitution.
-datasource "analytics" {
-  kind "sql_file"
-  driver "sqlite3"
-  dsn "./data/analytics.db"
-  file "./queries/analytics.sql"
-  id_column "event_id"
-
-  column "event_id" {
-    field "event_id"
-    kind "keyword"
-  }
-  column "user_id" {
-    field "user_id"
-    kind "keyword"
-  }
-  column "event_type" {
-    field "event_type"
-    kind "keyword"
-  }
-  column "timestamp" {
-    field "timestamp"
-    kind "time_unix"
-  }
-  column "payload" {
-    field "payload"
-    kind "text"
-  }
-}
-
-// CSV file datasource for bulk imports.
-datasource "charge_master" {
-  kind "csv"
-  file "./data/charge_master.csv"
-  id_column "sku"
-
-  column "sku" {
-    field "sku"
-    kind "keyword"
+    normalized true
   }
   column "description" {
-    field "description"
     kind "text"
+    normalized true
   }
-  column "price" {
-    field "price"
-    kind "number"
-  }
-  column "category" {
-    field "category"
-    kind "keyword"
-  }
-
-  params {
-    batch_size 32768
-  }
-}
-
-// JSONL file datasource for log/event streaming.
-datasource "events" {
-  kind "jsonl"
-  file "./data/events.jsonl"
-  id_field "event_id"
-
-  column "event_id" {
-    field "event_id"
-    kind "keyword"
-  }
-  column "user_id" {
-    field "user_id"
-    kind "keyword"
-  }
-  column "action" {
-    field "action"
-    kind "keyword"
-  }
-  column "timestamp" {
-    field "timestamp"
-    kind "time_unix"
-  }
-  column "metadata" {
-    field "metadata"
+  column "fulltext" {
     kind "text"
+    normalized true
+  }
+  column "work_item" {
+    kind "keyword"
+    normalized true
+  }
+  column "work_item_uid" {
+    kind "keyword"
+    normalized true
+  }
+  column "effective_date" {
+    kind "keyword"
+    normalized true
+  }
+  column "end_effective_date" {
+    kind "keyword"
+    normalized true
+  }
+  column "patient_status" {
+    kind "keyword"
+    normalized true
+  }
+  column "charge_type" {
+    kind "keyword"
+    normalized true
   }
 }
 
-// HTTP/REST API datasource for external integrations.
-datasource "inventory_api" {
-  kind "http"
-  url env("INVENTORY_API_URL", "https://api.example.com/v1/inventory")
-  method "GET"
-  auth env("INVENTORY_API_TOKEN", "")
-  id_field "product_id"
-  timeout_seconds 60
-  page_param "page"
-  limit_param 100
-
-  headers {
-    Accept "application/json"
-    X_Source "lookupx"
-  }
-
-  column "product_id" {
-    field "product_id"
+datasource "hcpcs" {
+  kind "sql_query"
+  driver "mysql"
+  dsn env("MYSQL_DSN", "root:password@tcp(localhost:3306)/clear")
+  id_column "record_id"
+  query "SELECT CONCAT_WS(':', work_item, charge_type, effective_date, cpt_code) AS record_id, cpt_code AS code, REPLACE(LOWER(cpt_code), '.', '') AS code_no_period, ld AS description, ld AS fulltext, work_item AS work_item_uid, work_item, effective_date, end_effective_date, patient_status, charge_type FROM vw_cpt_master WHERE is_cpt = 0"
+  column "code" {
     kind "keyword"
+    normalized true
   }
-  column "sku" {
-    field "sku"
+  column "code_no_period" {
     kind "keyword"
+    normalized true
   }
-  column "quantity" {
-    field "quantity"
-    kind "number"
+  column "description" {
+    kind "text"
+    normalized true
   }
-  column "warehouse" {
-    field "warehouse"
+  column "fulltext" {
+    kind "text"
+    normalized true
+  }
+  column "work_item" {
     kind "keyword"
+    normalized true
   }
-  column "updated_at" {
-    field "updated_at"
-    kind "time_unix"
+  column "work_item_uid" {
+    kind "keyword"
+    normalized true
+  }
+  column "effective_date" {
+    kind "keyword"
+    normalized true
+  }
+  column "end_effective_date" {
+    kind "keyword"
+    normalized true
+  }
+  column "patient_status" {
+    kind "keyword"
+    normalized true
+  }
+  column "charge_type" {
+    kind "keyword"
+    normalized true
   }
 }
 
-// ---------------------------------------------------------------------------
-// Indexes — each block defines a search index bound to a datasource.
-// ---------------------------------------------------------------------------
+datasource "cpt_reference" {
+  kind "sql_query"
+  driver "mysql"
+  dsn env("MYSQL_DSN", "root:password@tcp(localhost:3306)/clear")
+  id_column "record_id"
+  query "SELECT cpt_code AS record_id, cpt_code AS code, REPLACE(LOWER(cpt_code), '.', '') AS code_no_period, ld AS description, COALESCE(fd, ld) AS fulltext FROM vw_cpt WHERE cpt_code NOT REGEXP '^[A-Za-z][0-9]{4}$'"
+  column "code" {
+    kind "keyword"
+    normalized true
+  }
+  column "code_no_period" {
+    kind "keyword"
+    normalized true
+  }
+  column "description" {
+    kind "text"
+    normalized true
+  }
+  column "fulltext" {
+    kind "text"
+    normalized true
+  }
+}
 
-index "products" {
+datasource "dx_fac1" {
+  kind "sql_query"
+  driver "mysql"
+  dsn env("MYSQL_DSN", "root:password@tcp(localhost:3306)/clear")
+  id_column "record_id"
+  query "SELECT ICD9_CODE AS record_id, ICD9_CODE AS code, REPLACE(LOWER(ICD9_CODE), '.', '') AS code_no_period, LONG_DESCRIPTION AS description, COALESCE(FULL_DESCRIPTION, LONG_DESCRIPTION) AS fulltext FROM vw_icd9_fac_1"
+  column "code" {
+    kind "keyword"
+    normalized true
+  }
+  column "code_no_period" {
+    kind "keyword"
+    normalized true
+  }
+  column "description" {
+    kind "text"
+    normalized true
+  }
+  column "fulltext" {
+    kind "text"
+    normalized true
+  }
+}
+
+datasource "dx_fac3" {
+  kind "sql_query"
+  driver "mysql"
+  dsn env("MYSQL_DSN", "root:password@tcp(localhost:3306)/clear")
+  id_column "record_id"
+  query "SELECT ICD9_CODE AS record_id, ICD9_CODE AS code, REPLACE(LOWER(ICD9_CODE), '.', '') AS code_no_period, LONG_DESCRIPTION AS description, COALESCE(FULL_DESCRIPTION, LONG_DESCRIPTION) AS fulltext FROM vw_icd9_fac_3"
+  column "code" {
+    kind "keyword"
+    normalized true
+  }
+  column "code_no_period" {
+    kind "keyword"
+    normalized true
+  }
+  column "description" {
+    kind "text"
+    normalized true
+  }
+  column "fulltext" {
+    kind "text"
+    normalized true
+  }
+}
+
+datasource "dx_icd10" {
+  kind "sql_query"
+  driver "mysql"
+  dsn env("MYSQL_DSN", "root:password@tcp(localhost:3306)/clear")
+  id_column "record_id"
+  query "SELECT id AS record_id, code_with_period AS code, REPLACE(LOWER(code_with_period), '.', '') AS code_no_period, med_desc AS description, COALESCE(long_desc, med_desc) AS fulltext, header, effective_date FROM vw_icd10_cm"
+  column "code" {
+    kind "keyword"
+    normalized true
+  }
+  column "code_no_period" {
+    kind "keyword"
+    normalized true
+  }
+  column "description" {
+    kind "text"
+    normalized true
+  }
+  column "fulltext" {
+    kind "text"
+    normalized true
+  }
+  column "header" {
+    kind "keyword"
+    normalized true
+  }
+  column "effective_date" {
+    kind "keyword"
+    normalized true
+  }
+}
+
+datasource "dx_icd10_pcs" {
+  kind "sql_query"
+  driver "mysql"
+  dsn env("MYSQL_DSN", "root:password@tcp(localhost:3306)/clear")
+  id_column "record_id"
+  query "SELECT id AS record_id, code_with_period AS code, REPLACE(LOWER(code_with_period), '.', '') AS code_no_period, med_desc AS description, COALESCE(long_desc, med_desc) AS fulltext, effective_date FROM vw_icd10_pcs"
+  column "code" {
+    kind "keyword"
+    normalized true
+  }
+  column "code_no_period" {
+    kind "keyword"
+    normalized true
+  }
+  column "description" {
+    kind "text"
+    normalized true
+  }
+  column "fulltext" {
+    kind "text"
+    normalized true
+  }
+  column "effective_date" {
+    kind "keyword"
+    normalized true
+  }
+}
+
+datasource "special_fac" {
+  kind "sql_query"
+  driver "mysql"
+  dsn env("MYSQL_DSN", "root:password@tcp(localhost:3306)/clear")
+  id_column "record_id"
+  query "SELECT CONCAT_WS(':', cm.work_item_uid, cm.charge_type, cm.effective_date, cm.cpt_hcpcs_code) AS record_id, cm.cpt_hcpcs_code AS code, REPLACE(LOWER(cm.cpt_hcpcs_code), '.', '') AS code_no_period, cm.client_proc_desc AS description, cm.client_proc_desc AS fulltext, cm.work_item_uid AS work_item_uid, cm.work_item_uid AS work_item, cm.effective_date, cm.charge_type FROM tbl_charge_master cm JOIN (SELECT work_item_uid, charge_type, MAX(effective_date) AS effective_date FROM tbl_charge_master WHERE charge_type = 'ED_FACILITY' GROUP BY work_item_uid, charge_type) latest USING (work_item_uid, charge_type, effective_date) LEFT JOIN lu_cpt ON lu_cpt.cpt_code = LEFT(cm.cpt_hcpcs_code, 5) LEFT JOIN tbl_work_item_em_level em ON em.work_item_uid = cm.work_item_uid AND em.charge_type = cm.charge_type AND em.code = cm.cpt_hcpcs_code WHERE lu_cpt.cpt_code IS NULL AND em.code IS NULL AND cm.client_internal_code <> ''"
+  column "code" {
+    kind "keyword"
+    normalized true
+  }
+  column "code_no_period" {
+    kind "keyword"
+    normalized true
+  }
+  column "description" {
+    kind "text"
+    normalized true
+  }
+  column "fulltext" {
+    kind "text"
+    normalized true
+  }
+  column "work_item" {
+    kind "keyword"
+    normalized true
+  }
+  column "work_item_uid" {
+    kind "keyword"
+    normalized true
+  }
+  column "effective_date" {
+    kind "keyword"
+    normalized true
+  }
+  column "charge_type" {
+    kind "keyword"
+    normalized true
+  }
+}
+
+datasource "special_pro" {
+  kind "sql_query"
+  driver "mysql"
+  dsn env("MYSQL_DSN", "root:password@tcp(localhost:3306)/clear")
+  id_column "record_id"
+  query "SELECT CONCAT_WS(':', cm.work_item_uid, cm.charge_type, cm.effective_date, cm.cpt_hcpcs_code) AS record_id, cm.cpt_hcpcs_code AS code, REPLACE(LOWER(cm.cpt_hcpcs_code), '.', '') AS code_no_period, cm.client_proc_desc AS description, cm.client_proc_desc AS fulltext, cm.work_item_uid AS work_item_uid, cm.work_item_uid AS work_item, cm.effective_date, cm.charge_type FROM tbl_charge_master cm JOIN (SELECT work_item_uid, charge_type, MAX(effective_date) AS effective_date FROM tbl_charge_master WHERE charge_type = 'ED_PROFEE' GROUP BY work_item_uid, charge_type) latest USING (work_item_uid, charge_type, effective_date) LEFT JOIN lu_cpt ON lu_cpt.cpt_code = LEFT(cm.cpt_hcpcs_code, 5) LEFT JOIN tbl_work_item_em_level em ON em.work_item_uid = cm.work_item_uid AND em.charge_type = cm.charge_type AND em.code = cm.cpt_hcpcs_code WHERE lu_cpt.cpt_code IS NULL AND em.code IS NULL AND cm.client_internal_code <> ''"
+  column "code" {
+    kind "keyword"
+    normalized true
+  }
+  column "code_no_period" {
+    kind "keyword"
+    normalized true
+  }
+  column "description" {
+    kind "text"
+    normalized true
+  }
+  column "fulltext" {
+    kind "text"
+    normalized true
+  }
+  column "work_item" {
+    kind "keyword"
+    normalized true
+  }
+  column "work_item_uid" {
+    kind "keyword"
+    normalized true
+  }
+  column "effective_date" {
+    kind "keyword"
+    normalized true
+  }
+  column "charge_type" {
+    kind "keyword"
+    normalized true
+  }
+}
+
+index "cpt" {
   schema "record"
-  initial_capacity 500000
-  datasource "products"
-
+  datasource "cpt"
+  initial_capacity 1000000
+  store_source true
+  schema_field "code" {
+    kind "keyword"
+    indexed true
+    stored true
+    lookup true
+    lowercase true
+    prefix true
+  }
+  schema_field "code_no_period" {
+    kind "keyword"
+    indexed true
+    lowercase true
+    prefix true
+  }
+  schema_field "description" {
+    kind "text"
+    indexed true
+    stored true
+    lowercase true
+  }
+  schema_field "fulltext" {
+    kind "text"
+    indexed true
+    lowercase true
+  }
+  schema_field "work_item" {
+    kind "keyword"
+    indexed true
+    stored true
+    lookup true
+  }
+  schema_field "work_item_uid" {
+    kind "keyword"
+    indexed true
+    stored true
+    lookup true
+  }
+  schema_field "effective_date" {
+    kind "keyword"
+    indexed true
+    stored true
+    lookup true
+  }
+  schema_field "end_effective_date" {
+    kind "keyword"
+    indexed true
+    stored true
+    lookup true
+  }
+  schema_field "patient_status" {
+    kind "keyword"
+    indexed true
+    stored true
+    lookup true
+  }
+  schema_field "charge_type" {
+    kind "keyword"
+    indexed true
+    stored true
+    lookup true
+  }
   bulk {
-    batch_size 65536
+    batch_size 32768
     checkpoint_every 10000
-    checkpoint_path "./data/checkpoint_products.json"
+    checkpoint_path "./data/checkpoints/cpt.json"
     resume true
   }
 }
 
-index "members" {
+index "hcpcs" {
   schema "record"
-  initial_capacity 100000
-  datasource "members"
-}
-
-index "claims" {
-  schema "record"
-  datasource "claims"
-
+  datasource "hcpcs"
+  initial_capacity 1000000
+  store_source true
+  schema_field "code" {
+    kind "keyword"
+    indexed true
+    stored true
+    lookup true
+    lowercase true
+    prefix true
+  }
+  schema_field "code_no_period" {
+    kind "keyword"
+    indexed true
+    lowercase true
+    prefix true
+  }
+  schema_field "description" {
+    kind "text"
+    indexed true
+    stored true
+    lowercase true
+  }
+  schema_field "fulltext" {
+    kind "text"
+    indexed true
+    lowercase true
+  }
+  schema_field "work_item" {
+    kind "keyword"
+    indexed true
+    stored true
+    lookup true
+  }
+  schema_field "work_item_uid" {
+    kind "keyword"
+    indexed true
+    stored true
+    lookup true
+  }
+  schema_field "effective_date" {
+    kind "keyword"
+    indexed true
+    stored true
+    lookup true
+  }
+  schema_field "end_effective_date" {
+    kind "keyword"
+    indexed true
+    stored true
+    lookup true
+  }
+  schema_field "patient_status" {
+    kind "keyword"
+    indexed true
+    stored true
+    lookup true
+  }
+  schema_field "charge_type" {
+    kind "keyword"
+    indexed true
+    stored true
+    lookup true
+  }
   bulk {
     batch_size 32768
-    checkpoint_every 5000
+    checkpoint_every 10000
+    checkpoint_path "./data/checkpoints/hcpcs.json"
+    resume true
   }
 }
 
-index "analytics" {
+index "cpt-hm" {
   schema "record"
-  datasource "analytics"
-}
-
-index "charge_master" {
-  schema "record"
-  initial_capacity 200000
-  datasource "charge_master"
-
+  datasource "cpt_reference"
+  initial_capacity 50000
+  store_source true
+  schema_field "code" {
+    kind "keyword"
+    indexed true
+    stored true
+    lookup true
+    lowercase true
+    prefix true
+  }
+  schema_field "code_no_period" {
+    kind "keyword"
+    indexed true
+    lowercase true
+    prefix true
+  }
+  schema_field "description" {
+    kind "text"
+    indexed true
+    stored true
+    lowercase true
+  }
+  schema_field "fulltext" {
+    kind "text"
+    indexed true
+    lowercase true
+  }
   bulk {
     batch_size 32768
   }
 }
 
-index "events" {
+index "dx-fac1" {
   schema "record"
-  datasource "events"
+  datasource "dx_fac1"
+  store_source true
+  schema_field "code" {
+    kind "keyword"
+    indexed true
+    stored true
+    lookup true
+    lowercase true
+    prefix true
+  }
+  schema_field "code_no_period" {
+    kind "keyword"
+    indexed true
+    lowercase true
+    prefix true
+  }
+  schema_field "description" {
+    kind "text"
+    indexed true
+    stored true
+    lowercase true
+  }
+  schema_field "fulltext" {
+    kind "text"
+    indexed true
+    lowercase true
+  }
+  bulk {
+    batch_size 32768
+  }
 }
 
-index "inventory" {
+index "dx-fac3" {
   schema "record"
-  initial_capacity 100000
-  datasource "inventory_api"
+  datasource "dx_fac3"
+  store_source true
+  schema_field "code" {
+    kind "keyword"
+    indexed true
+    stored true
+    lookup true
+    lowercase true
+    prefix true
+  }
+  schema_field "code_no_period" {
+    kind "keyword"
+    indexed true
+    lowercase true
+    prefix true
+  }
+  schema_field "description" {
+    kind "text"
+    indexed true
+    stored true
+    lowercase true
+  }
+  schema_field "fulltext" {
+    kind "text"
+    indexed true
+    lowercase true
+  }
+  bulk {
+    batch_size 32768
+  }
+}
+
+index "dx-icd10" {
+  schema "record"
+  datasource "dx_icd10"
+  store_source true
+  schema_field "code" {
+    kind "keyword"
+    indexed true
+    stored true
+    lookup true
+    lowercase true
+    prefix true
+  }
+  schema_field "code_no_period" {
+    kind "keyword"
+    indexed true
+    lowercase true
+    prefix true
+  }
+  schema_field "description" {
+    kind "text"
+    indexed true
+    stored true
+    lowercase true
+  }
+  schema_field "fulltext" {
+    kind "text"
+    indexed true
+    lowercase true
+  }
+  schema_field "header" {
+    kind "keyword"
+    indexed true
+    stored true
+    lookup true
+    lowercase true
+  }
+  schema_field "effective_date" {
+    kind "keyword"
+    indexed true
+    stored true
+    lookup true
+  }
+  bulk {
+    batch_size 32768
+  }
+}
+
+index "dx-icd10-pcs" {
+  schema "record"
+  datasource "dx_icd10_pcs"
+  store_source true
+  schema_field "code" {
+    kind "keyword"
+    indexed true
+    stored true
+    lookup true
+    lowercase true
+    prefix true
+  }
+  schema_field "code_no_period" {
+    kind "keyword"
+    indexed true
+    lowercase true
+    prefix true
+  }
+  schema_field "description" {
+    kind "text"
+    indexed true
+    stored true
+    lowercase true
+  }
+  schema_field "fulltext" {
+    kind "text"
+    indexed true
+    lowercase true
+  }
+  schema_field "effective_date" {
+    kind "keyword"
+    indexed true
+    stored true
+    lookup true
+  }
+  bulk {
+    batch_size 32768
+  }
+}
+
+index "special-fac" {
+  schema "record"
+  datasource "special_fac"
+  store_source true
+  schema_field "code" {
+    kind "keyword"
+    indexed true
+    stored true
+    lookup true
+    lowercase true
+    prefix true
+  }
+  schema_field "code_no_period" {
+    kind "keyword"
+    indexed true
+    lowercase true
+    prefix true
+  }
+  schema_field "description" {
+    kind "text"
+    indexed true
+    stored true
+    lowercase true
+  }
+  schema_field "fulltext" {
+    kind "text"
+    indexed true
+    lowercase true
+  }
+  schema_field "work_item" {
+    kind "keyword"
+    indexed true
+    stored true
+    lookup true
+  }
+  schema_field "work_item_uid" {
+    kind "keyword"
+    indexed true
+    stored true
+    lookup true
+  }
+  schema_field "effective_date" {
+    kind "keyword"
+    indexed true
+    stored true
+    lookup true
+  }
+  schema_field "charge_type" {
+    kind "keyword"
+    indexed true
+    stored true
+    lookup true
+  }
+  bulk {
+    batch_size 16384
+  }
+}
+
+index "special-pro" {
+  schema "record"
+  datasource "special_pro"
+  store_source true
+  schema_field "code" {
+    kind "keyword"
+    indexed true
+    stored true
+    lookup true
+    lowercase true
+    prefix true
+  }
+  schema_field "code_no_period" {
+    kind "keyword"
+    indexed true
+    lowercase true
+    prefix true
+  }
+  schema_field "description" {
+    kind "text"
+    indexed true
+    stored true
+    lowercase true
+  }
+  schema_field "fulltext" {
+    kind "text"
+    indexed true
+    lowercase true
+  }
+  schema_field "work_item" {
+    kind "keyword"
+    indexed true
+    stored true
+    lookup true
+  }
+  schema_field "work_item_uid" {
+    kind "keyword"
+    indexed true
+    stored true
+    lookup true
+  }
+  schema_field "effective_date" {
+    kind "keyword"
+    indexed true
+    stored true
+    lookup true
+  }
+  schema_field "charge_type" {
+    kind "keyword"
+    indexed true
+    stored true
+    lookup true
+  }
+  bulk {
+    batch_size 16384
+  }
 }

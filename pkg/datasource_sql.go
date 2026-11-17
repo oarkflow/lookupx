@@ -17,11 +17,11 @@ import (
 // SQLTableDatasource streams a database table using keyset pagination. It wraps
 // PagedSQLSource with config-driven column binding and parameter support.
 type SQLTableDatasource struct {
-	id       string
-	src      PagedSQLSource
-	driver   string
-	dsn      string
-	params   map[string]any
+	id     string
+	src    PagedSQLSource
+	driver string
+	dsn    string
+	params map[string]any
 }
 
 func init() {
@@ -436,8 +436,10 @@ func parseColumnBindings(config map[string]any) ([]SQLColumn, error) {
 		kind := ConfigStringOr(m, "kind", "keyword")
 		normalized, _ := ConfigBool(m, "normalized")
 		layout := ConfigStringOr(m, "layout", "")
+		fieldName := ConfigStringOr(m, "target_field", ConfigStringOr(m, "field", col))
 		out = append(out, SQLColumn{
 			Column:     col,
+			FieldName:  fieldName,
 			Field:      FieldID(0), // resolved later by the index
 			Kind:       parseValueKind(kind),
 			Normalized: normalized,
@@ -475,7 +477,11 @@ func ResolveSQLColumns(cols []SQLColumn, fieldResolver func(string) FieldID) []S
 	out := make([]SQLColumn, len(cols))
 	for i, c := range cols {
 		out[i] = c
-		out[i].Field = fieldResolver(c.Column)
+		name := c.FieldName
+		if name == "" {
+			name = c.Column
+		}
+		out[i].Field = fieldResolver(name)
 	}
 	return out
 }

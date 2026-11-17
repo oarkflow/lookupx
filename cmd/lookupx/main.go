@@ -23,7 +23,7 @@ import (
 
 func main() {
 	if len(os.Args) < 2 {
-		usage()
+		serveCmd(nil)
 		return
 	}
 	switch os.Args[1] {
@@ -98,6 +98,7 @@ HTTP API:
 func serveCmd(args []string) {
 	fs := flag.NewFlagSet("serve", flag.ExitOnError)
 	addr := fs.String("addr", getenv("ADDR", ":8089"), "listen address")
+	configPath := fs.String("config", getenv("LOOKUPX_CONFIG", "config/lookupx.bcl"), "BCL configuration file; set empty to start without configured indexes")
 	apiKey := fs.String("api-key", getenv("LOOKUPX_API_KEY", ""), "optional API key")
 	webDir := fs.String("web", getenv("LOOKUPX_WEB_DIR", ""), "directory for static web frontend files")
 	dataDir := fs.String("data", getenv("LOOKUPX_DATA_DIR", "./data/indexes"), "persistent index directory")
@@ -108,17 +109,58 @@ func serveCmd(args []string) {
 		log.Fatal("-storage must be memory or disk")
 	}
 
-	mgr := lookup.NewMultiIndexManager()
-	if *storage == "disk" {
-		if err := mgr.RestorePersistent(context.Background(), lookup.FileSegmentStore{Root: *dataDir}); err != nil {
-			log.Fatalf("restore persistent indexes: %v", err)
+	ctx := context.Background()
+	var mgr *lookup.MultiIndexManager
+	keys := []string{}
+	if strings.TrimSpace(*configPath) != "" {
+		cfg, err := lookup.LoadBCLConfig(*configPath, nil)
+		if err != nil {
+			log.Fatalf("load BCL config %s: %v", *configPath, err)
+		}
+		mgr, err = lookup.BuildFromBCLConfig(ctx, cfg, nil)
+		if err != nil {
+			log.Fatalf("build indexes from BCL config: %v", err)
+		}
+		if *addr == ":8089" && cfg.Addr != "" {
+			*addr = cfg.Addr
+		}
+		if *dataDir == "./data/indexes" && cfg.DataDir != "" {
+			*dataDir = cfg.DataDir
+		}
+		for _, key := range cfg.APIKeys {
+			if strings.TrimSpace(key) != "" {
+				keys = append(keys, key)
+			}
+		}
+		for _, info := range mgr.List() {
+			if _, err := mgr.Reload(ctx, info.ID); err != nil {
+				log.Fatalf("initial index load %s: %v", info.ID, err)
+			}
+			if *storage == "disk" {
+				mi, ok := mgr.Get(info.ID)
+				if !ok {
+					log.Fatalf("loaded index %s disappeared", info.ID)
+				}
+				if err := mi.Freeze(); err != nil {
+					log.Fatalf("freeze index %s: %v", info.ID, err)
+				}
+				if _, err := mi.SavePersistent(ctx, lookup.FileSegmentStore{Root: *dataDir}, info.ID); err != nil {
+					log.Fatalf("persist index %s: %v", info.ID, err)
+				}
+			}
+		}
+	} else {
+		mgr = lookup.NewMultiIndexManager()
+		if *storage == "disk" {
+			if err := mgr.RestorePersistent(ctx, lookup.FileSegmentStore{Root: *dataDir}); err != nil {
+				log.Fatalf("restore persistent indexes: %v", err)
+			}
 		}
 	}
-	keys := []string{}
 	if *apiKey != "" {
 		keys = append(keys, *apiKey)
 	}
-	log.Printf("lookupx server listening on %s (storage=%s)", *addr, *storage)
+	log.Printf("lookupx server listening on %s (storage=%s, indexes=%d)", *addr, *storage, len(mgr.List()))
 	log.Fatal(http.ListenAndServe(*addr, &lookup.MultiServer{Manager: mgr, APIKeys: keys, WebDir: *webDir, DataDir: *dataDir, Storage: *storage}))
 }
 

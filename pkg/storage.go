@@ -509,6 +509,7 @@ func (c *channelCursor) Close() error { return nil }
 // SQLColumn binds a database query column to an index field.
 type SQLColumn struct {
 	Column     string
+	FieldName  string // schema field name; empty preserves the column-name default
 	Field      FieldID
 	Kind       ValueKind
 	Normalized bool

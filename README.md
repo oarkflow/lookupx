@@ -39,11 +39,64 @@ go run ./examples/basic
 go run ./cmd/lookupx
 ```
 
-The CLI starts on `:8089` by default.
+The server starts on `:8089` by default. To start without a config file, run `go run ./cmd/lookupx serve -config ""`.
 
 ```bash
-ADDR=:8089 go run ./cmd/lookupx
+ADDR=:8089 go run ./cmd/lookupx serve
 ```
+
+## Clear fulltext indexes from BCL
+
+`config/lookupx.bcl` defines the nine Clear fulltext indexes and their MySQL
+queries: `cpt`, `hcpcs`, `cpt-hm`, `dx-fac1`, `dx-fac3`, `dx-icd10`,
+`dx-icd10-pcs`, `special-fac`, and `special-pro`. Set `MYSQL_DSN` to a MySQL
+DSN with read access to the Clear lookup views and charge-master tables, then
+start the server. It loads the BCL file and streams each source into its index
+before accepting requests. The database needs the Clear views, including the
+`vw_cpt_master.is_cpt` column exposed by the latest lookup-view migration.
+
+```bash
+export MYSQL_DSN='user:password@tcp(db-host:3306)/clear?parseTime=true'
+go run ./cmd/lookupx serve -config config/lookupx.bcl
+```
+
+The same BCL file is the default for `serve`; `-config` selects another file.
+Use `-config ""` for an empty server, or `-storage disk` to persist the loaded
+indexes under `data_dir`. Set `LOOKUPX_API_KEY` to protect the HTTP endpoints.
+
+List configured indexes and check their indexed row counts:
+
+```bash
+curl localhost:8089/v1/indexes
+curl localhost:8089/v1/indexes/cpt/stats
+```
+
+Each index can be rebuilt from its configured SQL source:
+
+```bash
+curl -X POST localhost:8089/v1/indexes/dx-icd10/reload
+```
+
+Search a code prefix or description text. Search results include the original
+indexed fields by default, including the canonical code and description.
+
+```bash
+curl -X POST localhost:8089/v1/indexes/cpt/search \
+  -H 'Content-Type: application/json' \
+  -d '{"type":"bool","should":[{"type":"prefix","field":"code","value":"992"},{"type":"prefix","field":"fulltext","value":"office"}],"min_should_match":1,"limit":10,"with_docs":true}'
+```
+
+For a compact lookup, `term` searches across every keyword and text field in
+the index. Its words are ANDed; each other query parameter is an exact field
+filter ANDed with the term search. For example, this searches CPT codes and
+descriptions for `office` within work item 33:
+
+```bash
+curl 'localhost:8089/v1/indexes/cpt/lookup?work_item_uid=33&term=office&limit=10'
+```
+
+Multiple term words can match across different fields, and can be combined
+with additional exact filters such as `charge_type=ED_FACILITY`.
 
 ## HTTP examples
 
