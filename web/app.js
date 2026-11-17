@@ -17,8 +17,12 @@ const App = (() => {
   async function api(method, path, body) {
     const opts = { method, headers: {} };
     if (body !== undefined) {
-      opts.headers['Content-Type'] = 'application/json';
-      opts.body = JSON.stringify(body);
+      if (body instanceof FormData) {
+        opts.body = body;
+      } else {
+        opts.headers['Content-Type'] = 'application/json';
+        opts.body = JSON.stringify(body);
+      }
     }
     const res = await fetch(apiBase() + path, opts);
     const text = await res.text();
@@ -78,6 +82,10 @@ const App = (() => {
     return `<select id="${inputId}"><option value="">Loading…</option></select>`;
   }
 
+  function indexNameField(inputId) {
+    return `<div class="form-field"><label for="${inputId}">Index name</label><input id="${inputId}" type="text" list="existing-index-names" placeholder="Choose an index or enter a new name" autocomplete="off" /></div>`;
+  }
+
   async function populateIndexSelect(inputId, selected) {
     const list = await fetchIndexes();
     const el = $(`#${inputId}`);
@@ -87,7 +95,14 @@ const App = (() => {
       : '<option value="">— no indexes —</option>';
   }
 
+  async function populateIndexNames() {
+    const list = await fetchIndexes();
+    const datalist = $('#existing-index-names');
+    if (datalist) datalist.innerHTML = list.map(i => `<option value="${escHtml(i.id)}"></option>`).join('');
+  }
+
   let currentTab = 'search';
+  let activeIntegrationSource = 'sql-query';
 
   function switchTab(tab) {
     currentTab = tab;
@@ -117,21 +132,23 @@ const App = (() => {
 
   async function renderSearch() {
     content().innerHTML = `
-      <form class="search-bar" onsubmit="event.preventDefault(); App.doLookup()">
-        <div class="search-index">${indexSelect('lookup-index')}</div>
-		<input id="lookup-term" type="search" placeholder="Search all text columns…" aria-label="Full-text search term" />
-		<label class="search-fuzzy"><input id="lookup-fuzzy" type="checkbox" /> Fuzzy</label>
-		<label class="search-fuzzy"><input id="lookup-profile" type="checkbox" /> Profile</label>
-        <input id="lookup-limit" type="number" min="1" max="500" value="25" aria-label="Result limit" />
-        <button class="btn btn-primary" type="submit">Search</button>
-      </form>
-      <div class="filter-toolbar">
-        <button class="btn btn-secondary" type="button" onclick="App.addFilter()">+ Add filter</button>
+      <div class="page-heading">
+        <div><div class="eyebrow">QUERY WORKSPACE</div><h1>Search records</h1><p>Run a lookup across an index and inspect matching documents.</p></div>
+        <div class="heading-note">API <code>/v1/indexes/{id}/lookup</code></div>
       </div>
-      <div id="filter-rows" class="filter-rows"></div>
-      <div id="search-results" class="mt-4">
-        <div class="empty-state"><p>Select an index and enter filters.</p></div>
-      </div>
+      <section class="search-panel" aria-label="Search controls">
+        <form class="search-bar" onsubmit="event.preventDefault(); App.doLookup()">
+          <div class="search-control search-index"><label class="control-label" for="lookup-index">INDEX</label>${indexSelect('lookup-index')}</div>
+          <div class="search-control term-control"><label class="control-label" for="lookup-term">SEARCH TERM</label><input id="lookup-term" type="search" placeholder="Search all text columns…" aria-label="Full-text search term" /></div>
+          <label class="search-fuzzy"><input id="lookup-fuzzy" type="checkbox" /> Fuzzy</label>
+          <label class="search-fuzzy"><input id="lookup-profile" type="checkbox" /> Profile</label>
+          <div class="search-control limit-control"><label class="control-label" for="lookup-limit">LIMIT</label><input id="lookup-limit" type="number" min="1" max="500" value="25" aria-label="Result limit" /></div>
+          <button class="btn btn-primary" type="submit">Search</button>
+        </form>
+        <div class="filter-toolbar"><span class="filter-toolbar-label">Refine with field filters</span><button class="btn btn-secondary" type="button" onclick="App.addFilter()">+ Add filter</button></div>
+        <div id="filter-rows" class="filter-rows"></div>
+      </section>
+      <div id="search-results"><div class="empty-state"><p>Select an index and enter filters.</p></div></div>
     `;
     await populateIndexSelect('lookup-index');
     $('#lookup-index').addEventListener('change', loadSearchFields);
@@ -229,7 +246,7 @@ const App = (() => {
       input2.placeholder = 'Maximum';
       input.type = isTime ? 'date' : isNumeric ? 'number' : 'text';
       input2.type = isTime ? 'date' : isNumeric ? 'number' : 'text';
-      row.style.gridTemplateColumns = 'minmax(150px, 1fr) minmax(160px, 220px) minmax(90px, 1fr) minmax(90px, 1fr) 2.5rem';
+      row.style.gridTemplateColumns = '';
     } else {
       input.disabled = false;
       input2.disabled = true;
@@ -269,11 +286,11 @@ const App = (() => {
       }
     }
 
-    let html = `<div class="card"><div class="card-header">${hits.length} result(s)</div>`;
+    let html = `<div class="card results-card"><div class="card-header">Matching documents <span class="results-count">${hits.length}</span></div>`;
     if (!anyDoc) {
       html += `<p class="text-xs text-gray-500 mb-2">This index doesn't store full documents (created with DisableSource), so only ID and score are available.</p>`;
     }
-    html += `<div class="overflow-x-auto"><table><thead><tr><th>ID</th><th>Score</th>${fieldOrder.map(f => `<th>${escHtml(f)}</th>`).join('')}</tr></thead><tbody>`;
+    html += `<div class="table-wrap"><table><thead><tr><th>ID</th><th>Score</th>${fieldOrder.map(f => `<th>${escHtml(f)}</th>`).join('')}</tr></thead><tbody>`;
     for (const h of hits) {
       html += `<tr>
         <td class="font-mono text-sm">${escHtml(h.id)}</td>
@@ -339,30 +356,35 @@ const App = (() => {
     for (const mi of list) totalDocs += (mi.stats && mi.stats.docs) || 0;
 
     let html = `
+      <div class="page-heading">
+        <div><div class="eyebrow">INDEX MANAGEMENT</div><h1>Indexes</h1><p>Review index health, manage lifecycle actions, and inspect stored data.</p></div>
+        <div class="heading-note">${list.length ? `${fmtNum(list.length)} active index${list.length === 1 ? '' : 'es'}` : 'No indexes configured'}</div>
+      </div>
       <div class="grid-3 mb-6">
-        <div class="card"><div class="card-header">Indexes</div><div class="text-3xl font-bold">${fmtNum(list.length)}</div></div>
-        <div class="card"><div class="card-header">Total Documents</div><div class="text-3xl font-bold">${fmtNum(totalDocs)}</div></div>
-        <div class="card"><div class="card-header">Server</div><div id="server-status" class="text-sm text-green-400 mt-1">checking…</div></div>
+        <div class="card metric-card"><div><div class="metric-label">Indexes</div><div class="metric-value">${fmtNum(list.length)}</div></div><span class="metric-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><ellipse cx="12" cy="5" rx="8" ry="3"></ellipse><path d="M4 5v7c0 1.7 3.6 3 8 3s8-1.3 8-3V5M4 12v7c0 1.7 3.6 3 8 3s8-1.3 8-3v-7"></path></svg></span></div>
+        <div class="card metric-card"><div><div class="metric-label">Total documents</div><div class="metric-value">${fmtNum(totalDocs)}</div></div><span class="metric-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7 3h7l5 5v13H7a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2Z"></path><path d="M14 3v6h6M9 14h6M9 17h6"></path></svg></span></div>
+        <div class="card metric-card"><div><div class="metric-label">Server status</div><div id="server-status" class="metric-value server-pending">Checking</div></div><span class="metric-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3a9 9 0 1 0 9 9"></path><path d="M12 7v5l3 2M16 3h5v5"></path></svg></span></div>
       </div>
 
-      <div class="card max-w-2xl mb-6">
-        <div class="card-header">Create Index</div>
-        <div class="space-y-3 mt-2">
+      <div class="card create-index-card mb-6">
+        <div class="section-heading"><div><div class="card-header">Create an index</div><p>Choose a starting schema. You can connect a data source after creation.</p></div></div>
+        <div class="create-index-form">
           ${field('new-index-id', { label: 'Index ID', placeholder: 'e.g. claims, members, products' })}
           <div class="space-y-1">
             <label class="text-xs font-medium text-gray-400">Schema</label>
             <select id="new-index-schema">
-              <option value="record">Built-in record schema (term + group_id + date_key + partition_id)</option>
+              <option value="record">Built-in record schema</option>
               <option value="custom">Custom fields</option>
             </select>
+            <p class="schema-help">term · group_id · date_key · partition_id</p>
           </div>
           <div id="custom-schema-rows" class="hidden space-y-2"></div>
-          <button id="add-field-btn" class="btn btn-secondary text-xs hidden" onclick="App.addSchemaFieldRow()">+ Add field</button>
-          <button class="btn btn-primary" onclick="App.createIndex()">Create</button>
+          <div class="create-index-actions"><button id="add-field-btn" class="btn btn-secondary text-xs hidden" onclick="App.addSchemaFieldRow()">+ Add field</button>
+          <button class="btn btn-primary" onclick="App.createIndex()">Create index</button></div>
         </div>
       </div>
 
-      <div class="space-y-4">`;
+      <div class="index-list-heading"><h2>Available indexes</h2><span>${fmtNum(list.length)} total</span></div><div class="space-y-4">`;
 
     if (!list.length) {
       html += empty('No indexes yet. Create one above.');
@@ -371,26 +393,26 @@ const App = (() => {
         const st = mi.stats || {};
         const lat = mi.latency || {};
         html += `
-          <div class="card">
-            <div class="flex items-center justify-between mb-3">
-              <div class="flex items-center gap-2">
-                <span class="font-semibold">${escHtml(mi.id)}</span>
+          <div class="card index-card">
+            <div class="index-card-top">
+              <div class="index-identity">
+                <span class="index-name">${escHtml(mi.id)}</span>
                 ${mi.reloading ? '<span class="badge badge-yellow">Reloading</span>' : ''}
-                <span class="text-xs text-gray-500">gen ${fmtNum(mi.generation)}</span>
+                <span class="index-generation">Generation ${fmtNum(mi.generation)}</span>
               </div>
-              <div class="flex gap-2 flex-wrap justify-end">
-                <button class="btn btn-primary text-xs" onclick="App.reloadIndex('${escHtml(mi.id)}')">Reload</button>
-                <button class="btn btn-secondary text-xs" onclick="App.freezeIndex('${escHtml(mi.id)}')">Freeze</button>
-                <button class="btn btn-secondary text-xs" onclick="App.persistIndex('${escHtml(mi.id)}')">Persist</button>
-                <button class="btn btn-secondary text-xs" onclick="App.toggleDetail('${escHtml(mi.id)}')">Detail</button>
-                <button class="btn btn-danger text-xs" onclick="App.deleteIndex('${escHtml(mi.id)}')">Delete</button>
+              <div class="index-actions">
+                <button class="btn btn-secondary" onclick="App.reloadIndex('${escHtml(mi.id)}')">Reload</button>
+                <button class="btn btn-secondary" onclick="App.freezeIndex('${escHtml(mi.id)}')">Freeze</button>
+                <button class="btn btn-secondary" onclick="App.persistIndex('${escHtml(mi.id)}')">Persist</button>
+                <button class="btn btn-secondary" onclick="App.toggleDetail('${escHtml(mi.id)}')">Details</button>
+                <button class="btn btn-danger" onclick="App.deleteIndex('${escHtml(mi.id)}')">Delete</button>
               </div>
             </div>
-            <div class="grid grid-cols-4 gap-3 text-sm">
-              <div class="text-gray-500">Docs: <span class="text-gray-200">${fmtNum(st.docs)}</span></div>
-              <div class="text-gray-500">Fields: <span class="text-gray-200">${fmtNum(st.fields)}</span></div>
-              <div class="text-gray-500">Terms: <span class="text-gray-200">${fmtNum(st.terms)}</span></div>
-              <div class="text-gray-500">Rows/s: <span class="text-gray-200">${lat.last_rows_per_second ? fmtNum(Math.round(lat.last_rows_per_second)) : '—'}</span></div>
+            <div class="index-stats">
+              <div class="index-stat">DOCUMENTS<strong>${fmtNum(st.docs)}</strong></div>
+              <div class="index-stat">FIELDS<strong>${fmtNum(st.fields)}</strong></div>
+              <div class="index-stat">TERMS<strong>${fmtNum(st.terms)}</strong></div>
+              <div class="index-stat">LAST INGEST RATE<strong>${lat.last_rows_per_second ? `${fmtNum(Math.round(lat.last_rows_per_second))} rows/s` : '—'}</strong></div>
             </div>
             ${lat.last_error ? `<div class="text-xs text-red-400 mt-2">Last error: ${escHtml(lat.last_error)}</div>` : ''}
             <div id="detail-${escHtml(mi.id)}" class="mt-4 hidden"></div>
@@ -409,10 +431,10 @@ const App = (() => {
 
     api('GET', '/health').then(() => {
       const el = $('#server-status');
-      if (el) { el.textContent = 'Connected'; el.className = 'text-sm text-green-400 mt-1'; }
+      if (el) { el.textContent = 'Connected'; el.className = 'metric-value server-connected'; }
     }).catch(() => {
       const el = $('#server-status');
-      if (el) { el.textContent = 'Unreachable'; el.className = 'text-sm text-red-400 mt-1'; }
+      if (el) { el.textContent = 'Unreachable'; el.className = 'metric-value server-unreachable'; }
     });
   }
 
@@ -597,68 +619,138 @@ const App = (() => {
   }
 
   // ── Integrations ───────────────────────────────────────────────────────────
-  // POST /v1/indexes/{id}/reload-sql, /reload-table, /reload — attach a data
-  // source to an already-created index.
+  // POST /v1/indexes/{id}/reload-sql, /reload-table, /reload-file — infer a
+  // schema and create the named index when needed, or replace an existing one.
+
+  const integrationSources = [
+    { id: 'sql-query', title: 'SQL query', detail: 'Import results from a query', icon: 'SQL' },
+    { id: 'sql-table', title: 'SQL table', detail: 'Paged table scan', icon: 'DB' },
+    { id: 'file', title: 'File upload', detail: 'CSV, TSV, XLSX, JSONL', icon: 'FILE' },
+    { id: 'json', title: 'JSON data', detail: 'Paste an object or array', icon: '{}' },
+  ];
+
+  function integrationFormMarkup(source) {
+    if (source === 'sql-query') return `
+      <div class="integration-source-heading"><div><div class="eyebrow">DATABASE</div><h2>Import from a SQL query</h2><p>Run a query and stream its result rows into the index.</p></div></div>
+      <div class="integration-form">
+        ${indexNameField('sql-index')}
+        <div class="form-grid">
+          <div class="space-y-1"><label for="sql-driver">Database driver</label><select id="sql-driver"><option value="postgres">PostgreSQL</option><option value="mysql">MySQL</option><option value="sqlite3">SQLite</option></select></div>
+          ${field('sql-id-col', { label: 'Primary key field (optional)', placeholder: 'Leave blank to generate row IDs' })}
+        </div>
+        ${field('sql-dsn', { label: 'Connection string', placeholder: 'host=localhost user=postgres dbname=mydb' })}
+        <div class="form-field"><label for="sql-query">SQL query</label><textarea id="sql-query" rows="4" class="font-mono" placeholder="SELECT id, name, category FROM products"></textarea></div>
+        <div class="upload-note">Fields and types are inferred from up to 200 sample rows. A blank primary key generates row IDs.</div>
+        <div class="integration-actions"><button class="btn btn-primary" onclick="App.loadSQLQuery()">Import query results</button></div>
+      </div>`;
+
+    if (source === 'sql-table') return `
+      <div class="integration-source-heading"><div><div class="eyebrow">DATABASE</div><h2>Import from a SQL table</h2><p>Scan a table in pages to keep memory use bounded.</p></div></div>
+      <div class="integration-form">
+        ${indexNameField('tbl-index')}
+        <div class="form-grid">
+          <div class="space-y-1"><label for="tbl-driver">Database driver</label><select id="tbl-driver"><option value="postgres">PostgreSQL</option><option value="mysql">MySQL</option><option value="sqlite3">SQLite</option></select></div>
+          ${field('tbl-name', { label: 'Table name', placeholder: 'products' })}
+        </div>
+        ${field('tbl-dsn', { label: 'Connection string', placeholder: 'host=localhost user=postgres dbname=mydb' })}
+        <div class="form-grid">
+          ${field('tbl-id-col', { label: 'Primary key field (optional)', placeholder: 'Leave blank to generate row IDs' })}
+          ${field('tbl-page-size', { label: 'Rows per page', type: 'number', default: '10000' })}
+        </div>
+        ${field('tbl-where', { label: 'Filter (optional)', placeholder: 'active = true' })}
+        <div class="upload-note">A selected key uses keyset paging. Without one, rows are read in offset pages; keep the table stable during import.</div>
+        <div class="integration-actions"><button class="btn btn-primary" onclick="App.loadSQLTable()">Import table</button></div>
+      </div>`;
+
+    if (source === 'file') return `
+      <div class="integration-source-heading"><div><div class="eyebrow">FILE</div><h2>Import a file</h2><p>Upload a tabular file or structured JSON document.</p></div></div>
+      <div class="integration-form">
+        ${indexNameField('file-index')}
+        <div class="form-grid">
+          <div class="space-y-1"><label for="file-format">File format</label><select id="file-format"><option value="auto">Detect from filename</option><option value="csv">CSV</option><option value="tsv">Tab-separated text</option><option value="xlsx">Excel workbook (.xlsx)</option><option value="json">JSON object or array</option><option value="jsonl">JSON Lines</option></select></div>
+          ${field('file-id-field', { label: 'Primary key field (optional)', placeholder: 'Leave blank to generate row IDs' })}
+        </div>
+        <div class="form-grid">
+          <div class="form-field"><label for="index-file">Choose file</label><input id="index-file" type="file" accept=".csv,.tsv,.xlsx,.json,.jsonl,.ndjson" /></div>
+          ${field('xlsx-sheet', { label: 'Worksheet (optional)', placeholder: 'Uses the first worksheet' })}
+        </div>
+        <div class="upload-note">Headers and value types are inferred from a sample. Uploads can be up to 1 GiB.</div>
+        <div class="integration-actions"><button id="upload-file-btn" class="btn btn-primary" onclick="App.loadFile()">Import file</button></div>
+      </div>`;
+
+    return `
+      <div class="integration-source-heading"><div><div class="eyebrow">JSON</div><h2>Import JSON data</h2><p>Paste one object or an array of objects for bulk indexing.</p></div></div>
+      <div class="integration-form">
+        ${indexNameField('json-index')}
+        ${field('json-id-field', { label: 'Primary key field (optional)', placeholder: 'Leave blank to generate row IDs' })}
+        <div class="form-field"><label for="json-data">JSON object or array</label><textarea id="json-data" rows="8" class="font-mono" placeholder='[{"id":"1","name":"Example"}]'></textarea></div>
+        <div class="upload-note">Fields and types are inferred from the JSON data. Imports replace the selected index generation.</div>
+        <div class="integration-actions"><button class="btn btn-primary" onclick="App.loadJSONRecords()">Import JSON</button></div>
+      </div>`;
+  }
+
+  function chooseIntegrationSource(source) {
+    if (!integrationSources.some(item => item.id === source)) return;
+    activeIntegrationSource = source;
+    $$('.source-option').forEach(button => {
+      const active = button.dataset.source === source;
+      button.classList.toggle('active', active);
+      button.setAttribute('aria-pressed', String(active));
+    });
+    const panel = $('#integration-source-panel');
+    if (panel) panel.innerHTML = integrationFormMarkup(source);
+    const result = $('#integration-result');
+    if (result) result.innerHTML = '';
+  }
 
   async function renderIntegrations() {
     content().innerHTML = `
-      <div class="space-y-6">
-        <div class="card max-w-3xl">
-          <div class="card-header">SQL Query</div>
-          <p class="text-xs text-gray-500 mb-3">POST /reload-sql — run one SQL query and load every row.</p>
-          <div class="space-y-3">
-            <div>${indexSelect('sql-index')}</div>
-            <div class="grid grid-cols-2 gap-3">
-              ${field('sql-driver', { label: 'Driver', placeholder: 'postgres / mysql / sqlite3' })}
-              ${field('sql-id-col', { label: 'ID Column', default: 'id' })}
-            </div>
-            ${field('sql-dsn', { label: 'DSN', placeholder: 'host=localhost user=postgres password=… dbname=mydb' })}
-            <div class="space-y-1">
-              <label class="text-xs font-medium text-gray-400">Query</label>
-              <textarea id="sql-query" rows="3" class="font-mono text-sm" placeholder="SELECT id, name, category, created_at FROM my_table WHERE active = true"></textarea>
-            </div>
-            <button class="btn btn-primary" onclick="App.loadSQLQuery()">Load</button>
-          </div>
-        </div>
-
-        <div class="card max-w-3xl">
-          <div class="card-header">SQL Table (paged)</div>
-          <p class="text-xs text-gray-500 mb-3">POST /reload-table — keyset-paginated full table scan, safe for very large tables.</p>
-          <div class="space-y-3">
-            <div>${indexSelect('tbl-index')}</div>
-            <div class="grid grid-cols-2 gap-3">
-              ${field('tbl-driver', { label: 'Driver', placeholder: 'postgres / mysql / sqlite3' })}
-              ${field('tbl-name', { label: 'Table', placeholder: 'my_table' })}
-            </div>
-            ${field('tbl-dsn', { label: 'DSN', placeholder: 'host=localhost user=postgres password=… dbname=mydb' })}
-            <div class="grid grid-cols-2 gap-3">
-              ${field('tbl-id-col', { label: 'ID Column', default: 'id' })}
-              ${field('tbl-page-size', { label: 'Page Size', type: 'number', default: '10000' })}
-            </div>
-            ${field('tbl-where', { label: 'Where (optional, raw SQL)', placeholder: 'active = true' })}
-            <button class="btn btn-primary" onclick="App.loadSQLTable()">Load</button>
-          </div>
-        </div>
-
-        <div class="card max-w-3xl">
-          <div class="card-header">Inline JSON Records</div>
-          <p class="text-xs text-gray-500 mb-3">PUT /docs/{id} per record — upserts each object into the index (each needs an "id" field).</p>
-          <div class="space-y-3">
-            <div>${indexSelect('json-index')}</div>
-            <div class="space-y-1">
-              <label class="text-xs font-medium text-gray-400">Records</label>
-              <textarea id="json-data" rows="6" class="font-mono text-sm" placeholder='[{"id":"1","term":"foo","group_id":"1","date_key":"2026-01-01","partition_id":"1"}]'></textarea>
-            </div>
-            <button class="btn btn-primary" onclick="App.loadJSONRecords()">Load</button>
-          </div>
-        </div>
+      <div class="page-heading">
+        <div><div class="eyebrow">DATA SOURCES</div><h1>Index data</h1><p>Choose a source, name the index, and import your data.</p></div>
+        <div class="heading-note">Imports replace the current index generation.</div>
       </div>
+      <div class="integration-workspace">
+        <section class="source-picker" aria-label="Choose a data source">
+          <div class="source-picker-heading"><strong>Data source</strong><span>Choose one to configure</span></div>
+          <div class="source-options">${integrationSources.map(item => `
+            <button type="button" class="source-option${item.id === activeIntegrationSource ? ' active' : ''}" data-source="${item.id}" aria-pressed="${item.id === activeIntegrationSource}" onclick="App.chooseIntegrationSource('${item.id}')">
+              <span class="source-option-icon" aria-hidden="true">${item.icon}</span><span class="source-option-copy"><strong>${item.title}</strong><small>${item.detail}</small></span><span class="source-option-chevron" aria-hidden="true">›</span>
+            </button>`).join('')}</div>
+        </section>
+        <section id="integration-source-panel" class="integration-source-panel"></section>
+      </div>
+      <datalist id="existing-index-names"></datalist>
       <div id="integration-result" class="mt-4"></div>`;
-    await Promise.all([
-      populateIndexSelect('sql-index'),
-      populateIndexSelect('tbl-index'),
-      populateIndexSelect('json-index'),
-    ]);
+    chooseIntegrationSource(activeIntegrationSource);
+    await populateIndexNames();
+  }
+
+  async function loadFile() {
+    const id = $('#file-index').value.trim();
+    if (!id) { toast('Enter or select an index name.', false); return; }
+    const fileInput = $('#index-file');
+    const file = fileInput.files && fileInput.files[0];
+    if (!file) { toast('Choose a file to index.', false); fileInput.focus(); return; }
+    const form = new FormData();
+    form.append('file', file);
+    form.append('format', $('#file-format').value);
+    form.append('id_field', $('#file-id-field').value.trim());
+    form.append('sheet', $('#xlsx-sheet').value.trim());
+    const button = $('#upload-file-btn');
+    button.disabled = true;
+    button.textContent = 'Uploading and indexing…';
+    try {
+      const data = await api('POST', `/v1/indexes/${encodeURIComponent(id)}/reload-file`, form);
+      toast(`Indexed ${fmtNum(data.stats && data.stats.indexed)} rows into ${id}`);
+      const result = $('#integration-result');
+      result.innerHTML = json(data);
+    } catch (e) {
+      toast('File import failed: ' + e.message, false);
+      $('#integration-result').innerHTML = `<div class="card text-red-400 text-sm">${escHtml(e.message)}</div>`;
+    } finally {
+      button.disabled = false;
+      button.textContent = 'Import file';
+    }
   }
 
   function showIntegrationResult(promise, doneMsg) {
@@ -675,14 +767,14 @@ const App = (() => {
 
   function loadSQLQuery() {
     const id = $('#sql-index').value.trim();
-    if (!id) { toast('Select an index.', false); return; }
+    if (!id) { toast('Enter or select an index name.', false); return; }
     const driver = $('#sql-driver').value.trim();
     const dsn = $('#sql-dsn').value.trim();
     const query = $('#sql-query').value.trim();
     if (!driver || !dsn || !query) { toast('Driver, DSN, and query required.', false); return; }
     const body = {
       driver, dsn, query,
-      id_column: $('#sql-id-col').value.trim() || 'id',
+      id_column: $('#sql-id-col').value.trim(),
     };
     showIntegrationResult(
       api('POST', `/v1/indexes/${encodeURIComponent(id)}/reload-sql`, body),
@@ -691,7 +783,7 @@ const App = (() => {
 
   function loadSQLTable() {
     const id = $('#tbl-index').value.trim();
-    if (!id) { toast('Select an index.', false); return; }
+    if (!id) { toast('Enter or select an index name.', false); return; }
     const driver = $('#tbl-driver').value.trim();
     const dsn = $('#tbl-dsn').value.trim();
     const table = $('#tbl-name').value.trim();
@@ -699,7 +791,7 @@ const App = (() => {
     const body = {
       driver, dsn, table,
       where: $('#tbl-where').value.trim(),
-      id_column: $('#tbl-id-col').value.trim() || 'id',
+      id_column: $('#tbl-id-col').value.trim(),
       page_size: parseInt($('#tbl-page-size').value) || 10000,
     };
     showIntegrationResult(
@@ -709,30 +801,17 @@ const App = (() => {
 
   async function loadJSONRecords() {
     const id = $('#json-index').value.trim();
-    if (!id) { toast('Select an index.', false); return; }
+    if (!id) { toast('Enter or select an index name.', false); return; }
     const raw = $('#json-data').value.trim();
     if (!raw) { toast('Provide JSON records.', false); return; }
-    let records;
-    try { records = JSON.parse(raw); } catch (e) { toast('Invalid JSON: ' + e.message, false); return; }
-    if (!Array.isArray(records)) records = [records];
-    // There is no bulk "load raw JSON" endpoint on the server, so each record
-    // is upserted individually via the per-document endpoint.
-    const res = $('#integration-result');
-    res.innerHTML = loading();
-    let ok = 0;
-    const errors = [];
-    for (const r of records) {
-      const docId = r.id !== undefined ? String(r.id) : '';
-      if (!docId) { errors.push('record missing "id" field: ' + JSON.stringify(r)); continue; }
-      try {
-        await api('PUT', `/v1/indexes/${encodeURIComponent(id)}/docs/${encodeURIComponent(docId)}`, r);
-        ok++;
-      } catch (e) {
-        errors.push(`${docId}: ${e.message}`);
-      }
-    }
-    toast(`Loaded ${ok}/${records.length} record(s) for ${id}`, errors.length === 0);
-    res.innerHTML = json({ loaded: ok, total: records.length, errors });
+    try { JSON.parse(raw); } catch (e) { toast('Invalid JSON: ' + e.message, false); return; }
+    const form = new FormData();
+    form.append('file', new Blob([raw], { type: 'application/json' }), 'records.json');
+    form.append('format', 'json');
+    form.append('id_field', $('#json-id-field').value.trim());
+    return showIntegrationResult(
+      api('POST', `/v1/indexes/${encodeURIComponent(id)}/reload-file`, form),
+      `Indexed JSON data into ${id}`);
   }
 
   function refresh() { render(); }
@@ -767,7 +846,7 @@ const App = (() => {
     doLookup, addFilter, updateFilterOperators, removeFilter,
     addSchemaFieldRow, createIndex, reloadIndex, freezeIndex, persistIndex, deleteIndex,
     toggleDetail, upsertDoc, deleteDoc, listGenerations, validateIndex, repairIndex, compactIndex,
-    loadSQLQuery, loadSQLTable, loadJSONRecords,
+    loadSQLQuery, loadSQLTable, loadJSONRecords, loadFile, chooseIntegrationSource,
   };
   for (const k of Object.keys(handlers)) handlers[k] = safe(handlers[k]);
   return handlers;

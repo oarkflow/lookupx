@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestSearchAfterDocIDPagesWithoutDuplicates(t *testing.T) {
@@ -132,5 +133,33 @@ func TestHTTPKeysetPaginationCanSkipTotal(t *testing.T) {
 	}
 	if got.Total != -1 || len(got.Hits) != 2 || got.Hits[0].DocID != 3 {
 		t.Fatalf("result=%+v", got)
+	}
+}
+
+func TestDateOnlyRangeBoundsMatchTimeField(t *testing.T) {
+	ix, err := New(Config{Schema: Schema{Fields: map[string]FieldOptions{
+		"event_dos": {Kind: FieldTime, Sortable: true},
+	}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	fid := ix.FieldID("event_dos")
+	var records []SourceRecord
+	for i, value := range []string{"2024-12-31", "2025-01-01", "2025-01-15", "2025-02-01"} {
+		day, err := time.Parse("2006-01-02", value)
+		if err != nil {
+			t.Fatal(err)
+		}
+		record := SourceRecord{ID: value}
+		record.AddUnixTime(fid, day.Unix())
+		record.Seq = uint64(i + 1)
+		records = append(records, record)
+	}
+	if _, err := ix.IndexFrom(context.Background(), SliceSource{Records: records}, BulkOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	res := ix.Search(SearchRequest{Query: Range{Field: "event_dos", GTE: "2025-01-01", LTE: "2025-01-31"}, Limit: 10})
+	if res.Total != 2 {
+		t.Fatalf("date range total=%d, want 2", res.Total)
 	}
 }

@@ -1633,6 +1633,11 @@ func toFloatScalar(v any) (float64, bool) {
 		if t, err := time.Parse(time.RFC3339, x); err == nil {
 			return float64(t.Unix()), true
 		}
+		for _, layout := range autoTimeLayouts {
+			if t, err := time.Parse(layout, x); err == nil {
+				return float64(t.Unix()), true
+			}
+		}
 	}
 	return 0, false
 }

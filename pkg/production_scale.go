@@ -1009,6 +1009,9 @@ func (s *MultiServer) ServeProductionHTTP(w http.ResponseWriter, r *http.Request
 	if len(parts) >= 4 && parts[0] == "v1" && parts[1] == "indexes" {
 		id := parts[2]
 		action := parts[3]
+		if (action == "reload-file" || action == "reload-sql" || action == "reload-table") && r.Method == http.MethodPost {
+			return false
+		}
 		if action == "reload-async" && r.Method == http.MethodPost {
 			tid := s.Manager.Tasks().StartReload(r.Context(), s.Manager, id)
 			writeJSON(w, map[string]any{"task_id": tid})

@@ -84,6 +84,7 @@ HTTP API:
   POST /v1/indexes/{id}/reload             Reload from registered source
   POST /v1/indexes/{id}/reload-sql         Reload from SQL connection
   POST /v1/indexes/{id}/reload-table       Reload from SQL table (paged)
+  POST /v1/indexes/{id}/reload-file        Reload from CSV, TSV, XLSX, JSON, or JSON Lines upload
   GET  /v1/indexes/{id}/generations        List persisted generations
   POST /v1/indexes/{id}/restore            Restore a generation
   POST /v1/indexes/{id}/freeze             Freeze index for read acceleration

@@ -80,3 +80,7 @@ Both runners exclude 100 warmup queries before timing the configured loop count.
 
 A recorded 1M-row local baseline and its hardware/configuration limitations are
 in [`results/lookupx-vs-elasticsearch-2026-11-16.md`](results/lookupx-vs-elasticsearch-2026-11-16.md).
+
+## Charge master query-type benchmark
+
+`python3 bench/cpt_charge_master.py --out /tmp/lookupx-cpt-bench` projects the synthetic 10K fixture into the shared runner format and creates a common manifest for exact, prefix, substring, phrase, full-text, numeric range, date range, and offset-page searches. The three runners accept these query types and use the same input/manifest. A three-run report, raw results, setup, and caveats are in [`results/charge-master-10k-2026-11-16`](results/charge-master-10k-2026-11-16/README.md).

@@ -1,2 +1,4 @@
 .DS_Store
 data
+!examples/charge_master_ingest/data/
+!examples/charge_master_ingest/data/**

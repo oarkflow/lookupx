@@ -152,6 +152,49 @@ func TestMultiServerSearchReturnsBulkDatasourceRecordsByDefault(t *testing.T) {
 	}
 }
 
+func TestMultiServerSearchSupportsCursorPagination(t *testing.T) {
+	mgr := NewMultiIndexManager()
+	ix, err := New(Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 1; i <= 5; i++ {
+		if err := ix.Upsert(fmt.Sprintf("row-%d", i), Document{}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := mgr.AddIndex("records", ix); err != nil {
+		t.Fatal(err)
+	}
+	server := &MultiServer{Manager: mgr}
+	search := func(body string) (int, Result) {
+		req := httptest.NewRequest(http.MethodPost, "/v1/indexes/records/search?with_docs=false", strings.NewReader(body))
+		res := httptest.NewRecorder()
+		server.ServeHTTP(res, req)
+		var response struct {
+			Result Result `json:"result"`
+		}
+		if res.Code == http.StatusOK {
+			if err := json.Unmarshal(res.Body.Bytes(), &response); err != nil {
+				t.Fatal(err)
+			}
+		}
+		return res.Code, response.Result
+	}
+	status, first := search(`{"type":"all","limit":2,"skip_total":true}`)
+	if status != http.StatusOK || first.Total != 5 || len(first.Hits) != 2 || first.Hits[0].DocID != 1 || first.Hits[1].DocID != 2 {
+		t.Fatalf("first page status=%d result=%+v", status, first)
+	}
+	status, second := search(`{"type":"all","limit":2,"after_doc_id":2,"skip_total":true}`)
+	if status != http.StatusOK || second.Total != -1 || len(second.Hits) != 2 || second.Hits[0].DocID != 3 || second.Hits[1].DocID != 4 {
+		t.Fatalf("second page status=%d result=%+v", status, second)
+	}
+	status, _ = search(`{"type":"all","limit":2,"after_doc_id":2,"sort":[{"field":"event_dos"}]}`)
+	if status != http.StatusBadRequest {
+		t.Fatalf("cursor with sort status=%d, want 400", status)
+	}
+}
+
 func TestReloadWithConfigReplacesOldDatasourceSchema(t *testing.T) {
 	mgr := NewMultiIndexManager()
 	if _, err := mgr.Register(IndexDefinition{ID: "cpt", Config: Config{Schema: TupleLookupSchema()}}); err != nil {

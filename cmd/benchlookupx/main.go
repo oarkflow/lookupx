@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"runtime"
+	"strconv"
 	"strings"
 	"time"
 
@@ -22,6 +23,11 @@ type query struct {
 	Type   string            `json:"type"`
 	Name   string            `json:"name"`
 	Fields map[string]string `json:"fields"`
+	Field  string            `json:"field,omitempty"`
+	Value  string            `json:"value,omitempty"`
+	GTE    string            `json:"gte,omitempty"`
+	LTE    string            `json:"lte,omitempty"`
+	Offset int               `json:"offset,omitempty"`
 	Limit  int               `json:"limit"`
 }
 type result struct {
@@ -51,12 +57,27 @@ func main() {
 	runtime.GC()
 	var before runtime.MemStats
 	runtime.ReadMemStats(&before)
-	schemaFields := map[string]lookup.FieldKind{}
+	schemaFields := map[string]lookup.FieldOptions{}
 	for _, f := range fields {
-		schemaFields[f] = lookup.FieldKeyword
+		switch f {
+		case "event_dos":
+			schemaFields[f] = lookup.FieldOptions{Kind: lookup.FieldTime, Sortable: true}
+		case "work_item_id":
+			schemaFields[f] = lookup.FieldOptions{Kind: lookup.FieldInt, Sortable: true}
+		case "charge_amount":
+			schemaFields[f] = lookup.FieldOptions{Kind: lookup.FieldFloat, Sortable: true}
+		case "client_proc_desc":
+			schemaFields[f] = lookup.FieldOptions{Kind: lookup.FieldText, Indexed: true, Lowercase: true, Phrase: true}
+		default:
+			opt := lookup.FieldOptions{Kind: lookup.FieldKeyword, Lookup: true, Prefix: true, Lowercase: true}
+			if f == "cpt_code" {
+				opt.Ngram = true
+			}
+			schemaFields[f] = opt
+		}
 	}
-	schemaFields["__composite"] = lookup.FieldKeyword
-	ix, err := lookup.New(lookup.Config{Schema: lookup.GenericLookupSchema(schemaFields), DisableSource: true, InitialCapacity: 1024, Clock: lookup.StaticClock{T: time.Unix(0, 0)}})
+	schemaFields["__composite"] = lookup.FieldOptions{Kind: lookup.FieldKeyword, Lookup: true, Lowercase: true}
+	ix, err := lookup.New(lookup.Config{Schema: lookup.Schema{Fields: schemaFields}, DisableSource: true, InitialCapacity: 1024, Clock: lookup.StaticClock{T: time.Unix(0, 0)}})
 	if err != nil {
 		panic(err)
 	}
@@ -90,27 +111,53 @@ func main() {
 			q.Limit = 10
 		}
 		var query lookup.Query
-		if q.Type == "term" {
+		field, value := q.Field, strings.ToLower(q.Value)
+		if field == "" {
 			for _, f := range fields {
 				if v, ok := q.Fields[f]; ok {
-					query = lookup.Term{Field: f, Value: strings.ToLower(v)}
+					field, value = f, strings.ToLower(v)
 					break
 				}
 			}
-		} else {
+		}
+		switch q.Type {
+		case "term", "page":
+			query = lookup.Term{Field: field, Value: value}
+		case "prefix":
+			query = lookup.Prefix{Field: field, Value: value}
+		case "contains":
+			query = lookup.Contains{Field: field, Value: value}
+		case "phrase":
+			query = lookup.Phrase{Field: field, Value: q.Value}
+		case "text":
+			// Match the OR semantics used by Lucene's SHOULD clauses and
+			// Elasticsearch's match query with operator=or.
+			terms := strings.Fields(strings.ToLower(q.Value))
+			should := make([]lookup.Query, 0, len(terms))
+			for _, term := range terms {
+				should = append(should, lookup.Term{Field: field, Value: term})
+			}
+			query = lookup.Bool{Should: should, MinShouldMatch: 1}
+		case "range":
+			query = lookup.Range{Field: field, GTE: q.GTE, LTE: q.LTE}
+		default:
 			vals := make([]string, len(fields))
 			for i, f := range fields {
 				vals[i] = strings.ToLower(q.Fields[f])
 			}
 			query = lookup.Term{Field: "__composite", Value: strings.Join(vals, "\x1f")}
 		}
+		offset := 0
+		if q.Type == "page" {
+			offset = q.Offset
+		}
 		for i := 0; i < warmupLoops; i++ {
-			_, dst = ix.SearchInto(lookup.SearchRequest{Query: query, Limit: q.Limit}, dst[:0])
+			_, dst = ix.SearchInto(lookup.SearchRequest{Query: query, Limit: q.Limit, Offset: offset}, dst[:0])
 		}
 		start := time.Now()
 		hits := 0
 		for i := 0; i < *loops; i++ {
-			_, dst = ix.SearchInto(lookup.SearchRequest{Query: query, Limit: q.Limit}, dst[:0])
+			_, dst = ix.SearchInto(lookup.SearchRequest{Query: query, Limit: q.Limit, Offset: offset}, dst[:0])
 			hits = len(dst)
 		}
 		qr = append(qr, qresult{Name: q.Name, AvgNanos: time.Since(start).Nanoseconds() / int64(*loops), Hits: hits, Loops: *loops})
@@ -170,7 +217,26 @@ func (s *jsonlSource) Next(ctx context.Context, dst *lookup.SourceRecord) bool {
 	values := make([]string, len(s.fields))
 	for i, f := range s.fields {
 		values[i] = strings.ToLower(rw.Fields[f])
-		dst.AddKeyword(s.fieldIDs[i], values[i], true)
+		switch f {
+		case "event_dos":
+			parsed, err := time.Parse("2006-01-02", values[i])
+			if err != nil {
+				s.err = err
+				return false
+			}
+			dst.AddUnixTime(s.fieldIDs[i], parsed.Unix())
+		case "work_item_id", "charge_amount":
+			n, err := strconv.ParseFloat(values[i], 64)
+			if err != nil {
+				s.err = err
+				return false
+			}
+			dst.AddNumber(s.fieldIDs[i], n)
+		case "client_proc_desc":
+			dst.AddText(s.fieldIDs[i], values[i], true)
+		default:
+			dst.AddKeyword(s.fieldIDs[i], values[i], true)
+		}
 	}
 	dst.AddKeyword(s.compositeFieldID, strings.Join(values, "\x1f"), true)
 	return true

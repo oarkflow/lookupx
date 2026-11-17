@@ -1,4 +1,4 @@
-// benchelasticsearch runs the shared JSONL exact-composite workload against an
+// benchelasticsearch runs the shared JSONL search workload against an
 // Elasticsearch endpoint. It uses only the standard library.
 package main
 
@@ -23,6 +23,11 @@ type query struct {
 	Type   string            `json:"type"`
 	Name   string            `json:"name"`
 	Fields map[string]string `json:"fields"`
+	Field  string            `json:"field,omitempty"`
+	Value  string            `json:"value,omitempty"`
+	GTE    string            `json:"gte,omitempty"`
+	LTE    string            `json:"lte,omitempty"`
+	Offset int               `json:"offset,omitempty"`
 	Limit  int               `json:"limit"`
 }
 type qresult struct {
@@ -96,7 +101,16 @@ func main() {
 	}
 	props := map[string]any{"id": map[string]any{"type": "keyword"}, "__composite": map[string]any{"type": "keyword"}}
 	for _, f := range fields {
-		props[f] = map[string]any{"type": "keyword"}
+		typ := "keyword"
+		switch f {
+		case "event_dos":
+			typ = "date"
+		case "work_item_id", "charge_amount":
+			typ = "long"
+		case "client_proc_desc":
+			typ = "text"
+		}
+		props[f] = map[string]any{"type": typ}
 	}
 	settings, _ := json.Marshal(map[string]any{"settings": map[string]any{"number_of_replicas": 0, "refresh_interval": "-1"}, "mappings": map[string]any{"_source": map[string]any{"enabled": false}, "properties": props}})
 	do("PUT", "/"+*index, settings, "application/json")
@@ -168,26 +182,45 @@ func main() {
 	qr := make([]qresult, 0, len(qs))
 	const warmupLoops = 100
 	for _, q := range qs {
-		field, value := "__composite", ""
-		if q.Type == "term" {
+		field, value := q.Field, strings.ToLower(q.Value)
+		if field == "" && q.Fields != nil {
 			for _, f := range fields {
 				if v, ok := q.Fields[f]; ok {
 					field, value = f, strings.ToLower(v)
 					break
 				}
 			}
-		} else {
+		}
+		var queryDSL any
+		switch q.Type {
+		case "term", "page":
+			queryDSL = map[string]any{"term": map[string]any{field: value}}
+		case "prefix":
+			queryDSL = map[string]any{"prefix": map[string]any{field: value}}
+		case "contains":
+			queryDSL = map[string]any{"wildcard": map[string]any{field: map[string]any{"value": "*" + value + "*"}}}
+		case "phrase":
+			queryDSL = map[string]any{"match_phrase": map[string]any{field: q.Value}}
+		case "text":
+			queryDSL = map[string]any{"match": map[string]any{field: map[string]any{"query": q.Value, "operator": "or"}}}
+		case "range":
+			queryDSL = map[string]any{"range": map[string]any{field: map[string]any{"gte": q.GTE, "lte": q.LTE}}}
+		default:
 			vals := make([]string, len(fields))
 			for i, f := range fields {
 				vals[i] = strings.ToLower(q.Fields[f])
 			}
-			value = strings.Join(vals, "\x1f")
+			queryDSL = map[string]any{"term": map[string]any{"__composite": strings.Join(vals, "\x1f")}}
 		}
 		limit := q.Limit
 		if limit <= 0 {
 			limit = 10
 		}
-		body, _ := json.Marshal(map[string]any{"size": limit, "track_total_hits": false, "query": map[string]any{"term": map[string]any{field: value}}})
+		offset := 0
+		if q.Type == "page" {
+			offset = q.Offset
+		}
+		body, _ := json.Marshal(map[string]any{"size": limit, "from": offset, "track_total_hits": false, "query": queryDSL})
 		for i := 0; i < warmupLoops; i++ {
 			do("POST", "/"+*index+"/_search", body, "application/json")
 		}

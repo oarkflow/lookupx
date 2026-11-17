@@ -542,10 +542,14 @@ func (s SQLSource) Open(ctx context.Context) (Cursor, error) {
 	for i, c := range cols {
 		colIndex[strings.ToLower(c)] = i
 	}
-	idIdx, ok := colIndex[strings.ToLower(s.IDColumn)]
-	if !ok {
-		rows.Close()
-		return nil, fmt.Errorf("id column %q not found", s.IDColumn)
+	idIdx := -1
+	if strings.TrimSpace(s.IDColumn) != "" {
+		var ok bool
+		idIdx, ok = colIndex[strings.ToLower(s.IDColumn)]
+		if !ok {
+			rows.Close()
+			return nil, fmt.Errorf("id column %q not found", s.IDColumn)
+		}
 	}
 	seqIdx := -1
 	if s.SeqColumn != "" {
@@ -594,10 +598,13 @@ func (c *sqlCursor) Next(ctx context.Context, dst *SourceRecord) bool {
 	}
 	c.n++
 	dst.Reset()
-	if c.vals[c.idIdx].Valid {
+	if c.idIdx >= 0 && c.vals[c.idIdx].Valid {
 		dst.ID = c.vals[c.idIdx].String
 	}
 	dst.Seq = c.n
+	if dst.ID == "" {
+		dst.ID = "row-" + strconv.FormatUint(c.n, 10)
+	}
 	if c.seqIdx >= 0 && c.vals[c.seqIdx].Valid {
 		if u, err := strconv.ParseUint(c.vals[c.seqIdx].String, 10, 64); err == nil {
 			dst.Seq = u
@@ -719,8 +726,13 @@ func (c *jsonlCursor) Next(ctx context.Context, dst *SourceRecord) bool {
 	c.seq++
 	dst.Reset()
 	dst.Seq = c.seq
-	if v, ok := m[c.idField].(string); ok {
-		dst.ID = v
+	if c.idField != "" {
+		if v, ok := m[c.idField]; ok && v != nil {
+			dst.ID = fmt.Sprint(v)
+		}
+	}
+	if dst.ID == "" {
+		dst.ID = "row-" + strconv.FormatUint(c.seq, 10)
 	}
 	for _, b := range c.bindings {
 		v, ok := m[b.FieldName]
@@ -795,9 +807,13 @@ func (s CSVSource) Open(ctx context.Context) (Cursor, error) {
 	for i, h := range header {
 		idx[strings.ToLower(h)] = i
 	}
-	idIdx, ok := idx[strings.ToLower(s.IDColumn)]
-	if !ok {
-		return nil, fmt.Errorf("id column %q not found", s.IDColumn)
+	idIdx := -1
+	if strings.TrimSpace(s.IDColumn) != "" {
+		var ok bool
+		idIdx, ok = idx[strings.ToLower(s.IDColumn)]
+		if !ok {
+			return nil, fmt.Errorf("id column %q not found", s.IDColumn)
+		}
 	}
 	bs := make([]csvBinding, 0, len(s.Bindings))
 	for _, b := range s.Bindings {
@@ -834,8 +850,11 @@ func (c *csvCursor) Next(ctx context.Context, dst *SourceRecord) bool {
 	c.seq++
 	dst.Reset()
 	dst.Seq = c.seq
-	if c.idIdx < len(row) {
+	if c.idIdx >= 0 && c.idIdx < len(row) {
 		dst.ID = row[c.idIdx]
+	}
+	if dst.ID == "" {
+		dst.ID = "row-" + strconv.FormatUint(c.seq, 10)
 	}
 	for _, b := range c.bindings {
 		if b.idx >= len(row) || row[b.idx] == "" {
@@ -1127,9 +1146,10 @@ func compileDatasourceFilter(field, op, value string, opt FieldOptions) (Query, 
 	}
 }
 
-// PagedSQLSource streams very large database tables with keyset pagination.
-// It repeatedly executes SELECT ... WHERE order_column > last ORDER BY order_column LIMIT page_size.
-// Use this for 10M/100M+ rows instead of OFFSET pagination.
+// PagedSQLSource streams database tables with keyset pagination when an order
+// column is available. Without an order key it falls back to offset pages and
+// assigns synthetic row IDs; keyset pagination is preferable for very large
+// tables and stable ordering.
 type PagedSQLSource struct {
 	DB             *sql.DB
 	Table          string
@@ -1150,35 +1170,46 @@ func (s PagedSQLSource) Open(ctx context.Context) (Cursor, error) {
 	if s.Table == "" {
 		return nil, errors.New("table required")
 	}
-	if s.OrderColumn == "" {
-		s.OrderColumn = "id"
+	if s.OrderColumn == "" && s.IDColumn != "" {
+		s.OrderColumn = s.IDColumn
 	}
-	if s.IDColumn == "" {
+	if s.IDColumn == "" && s.OrderColumn != "" {
 		s.IDColumn = s.OrderColumn
 	}
-	if s.SeqColumn == "" {
+	if s.SeqColumn == "" && s.OrderColumn != "" {
 		s.SeqColumn = s.OrderColumn
 	}
 	if s.PageSize <= 0 {
 		s.PageSize = 100000
 	}
-	return &pagedSQLCursor{src: s, ctx: ctx, last: s.StartAfter}, nil
+	return &pagedSQLCursor{src: s, ctx: ctx, last: s.StartAfter, offset: s.StartAfter}, nil
 }
 
 type pagedSQLCursor struct {
-	src  PagedSQLSource
-	ctx  context.Context
-	last uint64
-	cur  Cursor
-	done bool
-	err  error
+	src    PagedSQLSource
+	ctx    context.Context
+	last   uint64
+	lastID string
+	offset uint64
+	cur    Cursor
+	done   bool
+	err    error
 }
 
 func (c *pagedSQLCursor) Next(ctx context.Context, dst *SourceRecord) bool {
 	for {
 		if c.cur != nil && c.cur.Next(ctx, dst) {
-			if dst.Seq > c.last {
-				c.last = dst.Seq
+			if c.src.OrderColumn == "" {
+				c.offset++
+				dst.Seq = c.offset
+				dst.ID = "row-" + strconv.FormatUint(c.offset, 10)
+			} else {
+				if c.src.OrderColumn == c.src.IDColumn {
+					c.lastID = dst.ID
+				}
+				if dst.Seq > c.last {
+					c.last = dst.Seq
+				}
 			}
 			return true
 		}
@@ -1212,8 +1243,17 @@ func (c *pagedSQLCursor) Next(ctx context.Context, dst *SourceRecord) bool {
 			return false
 		}
 		c.cur = cur
-		if dst.Seq > c.last {
-			c.last = dst.Seq
+		if c.src.OrderColumn == "" {
+			c.offset++
+			dst.Seq = c.offset
+			dst.ID = "row-" + strconv.FormatUint(c.offset, 10)
+		} else {
+			if c.src.OrderColumn == c.src.IDColumn {
+				c.lastID = dst.ID
+			}
+			if dst.Seq > c.last {
+				c.last = dst.Seq
+			}
 		}
 		return true
 	}
@@ -1224,8 +1264,20 @@ func (c *pagedSQLCursor) nextQuery() (string, []any) {
 		cols = strings.Join(c.src.Columns, ", ")
 	}
 	where := strings.TrimSpace(c.src.Where)
+	if c.src.OrderColumn == "" {
+		if where != "" {
+			where = " WHERE " + where
+		}
+		return fmt.Sprintf("SELECT %s FROM %s%s LIMIT %d OFFSET %d", cols, c.src.Table, where, c.src.PageSize, c.offset), nil
+	}
 	args := []any{}
-	if c.last > 0 {
+	if c.src.OrderColumn == c.src.IDColumn && c.lastID != "" {
+		if where != "" {
+			where += " AND "
+		}
+		where += c.src.OrderColumn + " > ?"
+		args = append(args, c.lastID)
+	} else if c.last > 0 {
 		if where != "" {
 			where += " AND "
 		}

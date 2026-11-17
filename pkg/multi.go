@@ -139,6 +139,35 @@ func (m *MultiIndexManager) AddIndex(id string, ix *Index) error {
 	return nil
 }
 
+// EnsureIndex creates an empty index only when the name is unused. It is used
+// by integrations that infer a schema while loading a new index.
+func (m *MultiIndexManager) EnsureIndex(id string, cfg Config) (*ManagedIndex, bool, error) {
+	id = cleanIndexID(id)
+	if id == "" {
+		return nil, false, errors.New("index id required")
+	}
+	m.mu.RLock()
+	current := m.indexes[id]
+	m.mu.RUnlock()
+	if current != nil {
+		return current, false, nil
+	}
+	ix, err := New(cfg)
+	if err != nil {
+		return nil, false, err
+	}
+	m.mu.Lock()
+	if current = m.indexes[id]; current != nil {
+		m.mu.Unlock()
+		_ = ix.Close()
+		return current, false, nil
+	}
+	current = &ManagedIndex{ID: id, Index: ix, Config: cfg, Generation: 1}
+	m.indexes[id] = current
+	m.mu.Unlock()
+	return current, true, nil
+}
+
 func (m *MultiIndexManager) Get(id string) (*Index, bool) {
 	m.mu.RLock()
 	mi := m.indexes[cleanIndexID(id)]
@@ -464,14 +493,32 @@ func (s *MultiServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	id := parts[2]
+	action := ""
+	if len(parts) > 3 {
+		action = parts[3]
+	}
+	if r.Method == http.MethodPost && (action == "reload-file" || action == "reload-sql" || action == "reload-table") {
+		var stats BulkStats
+		var err error
+		switch action {
+		case "reload-file":
+			stats, err = s.reloadFile(r.Context(), id, w, r)
+		case "reload-sql":
+			stats, err = s.reloadSQL(r.Context(), id, r)
+		case "reload-table":
+			stats, err = s.reloadTable(r.Context(), id, r)
+		}
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		s.writeReloadResult(w, r.Context(), id, stats)
+		return
+	}
 	ix, ok := s.Manager.Get(id)
 	if !ok {
 		http.Error(w, "index not found", 404)
 		return
-	}
-	action := ""
-	if len(parts) > 3 {
-		action = parts[3]
 	}
 	switch {
 	case r.Method == http.MethodGet && action == "stats":
@@ -491,6 +538,14 @@ func (s *MultiServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if limit <= 0 {
 			limit = 20
 		}
+		if q.AfterDocID > 0 && len(q.Sort) > 0 {
+			http.Error(w, "after_doc_id pagination cannot be combined with sort", http.StatusBadRequest)
+			return
+		}
+		if q.AfterDocID > 0 && q.Offset > 0 {
+			http.Error(w, "after_doc_id pagination cannot be combined with offset", http.StatusBadRequest)
+			return
+		}
 		started := time.Now()
 		// Search APIs are record-oriented by default. Clients can opt out with
 		// ?with_docs=false for the lowest-allocation ID-only hot path.
@@ -498,7 +553,7 @@ func (s *MultiServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if raw := r.URL.Query().Get("with_docs"); raw != "" {
 			withDocs, _ = strconv.ParseBool(raw)
 		}
-		res, hits := ix.SearchInto(SearchRequest{Query: q.ToQuery(), Limit: limit, Offset: q.Offset, WithDocs: withDocs, Sort: q.Sort, Facets: q.Facets}, nil)
+		res, hits := ix.SearchInto(SearchRequest{Query: q.ToQuery(), Limit: limit, Offset: q.Offset, AfterDocID: q.AfterDocID, SkipTotal: q.SkipTotal, WithDocs: withDocs, Sort: q.Sort, Facets: q.Facets}, nil)
 		res.Hits = hits
 		writeJSON(w, map[string]any{"result": res, "latency_ns": time.Since(started).Nanoseconds()})
 	case r.Method == http.MethodGet && action == "lookup":
@@ -534,20 +589,6 @@ func (s *MultiServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, map[string]any{"count": c, "latency_ns": time.Since(started).Nanoseconds()})
 	case r.Method == http.MethodPost && action == "reload":
 		stats, err := s.Manager.Reload(r.Context(), id)
-		if err != nil {
-			http.Error(w, err.Error(), 500)
-			return
-		}
-		s.writeReloadResult(w, r.Context(), id, stats)
-	case r.Method == http.MethodPost && action == "reload-sql":
-		stats, err := s.reloadSQL(r.Context(), id, r)
-		if err != nil {
-			http.Error(w, err.Error(), 500)
-			return
-		}
-		s.writeReloadResult(w, r.Context(), id, stats)
-	case r.Method == http.MethodPost && action == "reload-table":
-		stats, err := s.reloadTable(r.Context(), id, r)
 		if err != nil {
 			http.Error(w, err.Error(), 500)
 			return
@@ -672,13 +713,7 @@ func (s *MultiServer) reloadSQL(ctx context.Context, id string, r *http.Request)
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		return BulkStats{}, err
 	}
-	if req.IDColumn == "" {
-		req.IDColumn = "id"
-	}
 	mi, ok := s.Manager.Managed(id)
-	if !ok {
-		return BulkStats{}, errors.New("index not found")
-	}
 	db, err := squealx.Connect(squealxDriver(req.Driver), req.DSN, "")
 	if err != nil {
 		return BulkStats{}, err
@@ -689,9 +724,15 @@ func (s *MultiServer) reloadSQL(ctx context.Context, id string, r *http.Request)
 		return BulkStats{}, err
 	}
 	inferred = applySQLColumnSpecs(inferred, req.Columns)
-	cfg := mi.Config
+	cfg := Config{}
+	if ok {
+		cfg = mi.Config
+	}
 	cfg.Schema = AutoSchema(inferred)
 	cfg.DisableSource = false
+	if _, _, err := s.Manager.EnsureIndex(id, cfg); err != nil {
+		return BulkStats{}, err
+	}
 	opt := bulkFromSQLReq(id, req.BatchSize, req.CheckpointPath, req.Resume)
 	return s.Manager.ReloadWithConfig(ctx, id, cfg, func(ix *Index) (Source, error) {
 		return SQLQuerySource{DB: db.DB(), Query: req.Query, Args: req.Args, IDColumn: req.IDColumn, SeqColumn: req.SeqColumn, Columns: BindSQLColumns(ix, inferred)}, nil
@@ -703,16 +744,10 @@ func (s *MultiServer) reloadTable(ctx context.Context, id string, r *http.Reques
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		return BulkStats{}, err
 	}
-	if req.IDColumn == "" {
-		req.IDColumn = "id"
-	}
-	if req.OrderColumn == "" {
+	if req.OrderColumn == "" && req.IDColumn != "" {
 		req.OrderColumn = req.IDColumn
 	}
 	mi, ok := s.Manager.Managed(id)
-	if !ok {
-		return BulkStats{}, errors.New("index not found")
-	}
 	db, inferred, err := connectAndSample(ctx, sqlSampleRequest{
 		Driver: req.Driver, DSN: req.DSN, Source: "sql_table", Table: req.Table,
 		Where: req.Where, IDColumn: req.IDColumn, SeqColumn: req.SeqColumn,
@@ -723,10 +758,19 @@ func (s *MultiServer) reloadTable(ctx context.Context, id string, r *http.Reques
 	}
 	defer db.Close()
 	inferred = applySQLColumnSpecs(inferred, req.Columns)
-	cfg := mi.Config
+	cfg := Config{}
+	if ok {
+		cfg = mi.Config
+	}
 	cfg.Schema = AutoSchema(inferred)
 	cfg.DisableSource = false
-	selectColumns := []string{req.IDColumn}
+	if _, _, err := s.Manager.EnsureIndex(id, cfg); err != nil {
+		return BulkStats{}, err
+	}
+	selectColumns := []string{}
+	if req.IDColumn != "" {
+		selectColumns = append(selectColumns, req.IDColumn)
+	}
 	if req.SeqColumn != "" && !strings.EqualFold(req.SeqColumn, req.IDColumn) {
 		selectColumns = append(selectColumns, req.SeqColumn)
 	}

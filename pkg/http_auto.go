@@ -46,9 +46,6 @@ func connectAndSample(ctx context.Context, req sqlSampleRequest) (*squealx.DB, [
 	if req.Driver == "" || req.DSN == "" {
 		return nil, nil, errors.New("driver and dsn required")
 	}
-	if req.IDColumn == "" {
-		req.IDColumn = "id"
-	}
 	sampleSize := req.SampleSize
 	if sampleSize <= 0 {
 		sampleSize = 200
@@ -66,10 +63,7 @@ func connectAndSample(ctx context.Context, req sqlSampleRequest) (*squealx.DB, [
 			db.Close()
 			return nil, nil, errors.New("table required")
 		}
-		order := req.OrderColumn
-		if order == "" {
-			order = req.IDColumn
-		}
+		order := strings.TrimSpace(req.OrderColumn)
 		var b strings.Builder
 		b.WriteString("SELECT * FROM ")
 		b.WriteString(req.Table)
@@ -77,9 +71,12 @@ func connectAndSample(ctx context.Context, req sqlSampleRequest) (*squealx.DB, [
 			b.WriteString(" WHERE ")
 			b.WriteString(req.Where)
 		}
-		b.WriteString(" ORDER BY ")
-		b.WriteString(order)
-		b.WriteString(" ASC LIMIT ")
+		if order != "" {
+			b.WriteString(" ORDER BY ")
+			b.WriteString(order)
+			b.WriteString(" ASC")
+		}
+		b.WriteString(" LIMIT ")
 		b.WriteString(strconv.Itoa(sampleSize))
 		sampleQuery = b.String()
 	default:
@@ -94,10 +91,6 @@ func connectAndSample(ctx context.Context, req sqlSampleRequest) (*squealx.DB, [
 	if err != nil {
 		db.Close()
 		return nil, nil, err
-	}
-	if len(cols) == 0 {
-		db.Close()
-		return nil, nil, errors.New("no columns detected (empty result set or id_column matched every column)")
 	}
 	return db, cols, nil
 }

@@ -772,6 +772,11 @@ curl -X POST http://localhost:8089/v1/indexes/dataset_a/reload
 
 Reload from an arbitrary SQL query. The database driver must be imported/registered by the embedding application or custom server build:
 
+The reload endpoints infer fields from a sample and create the named index if
+it does not exist. If it already exists, a successful import replaces its
+current generation. `id_column` and `id_field` are optional: set one to use a
+source field as the primary key, or leave it blank to generate `row-N` IDs.
+
 ```bash
 curl -X POST http://localhost:8089/v1/indexes/dataset_a/reload-sql \
   -H 'Content-Type: application/json' \
@@ -793,7 +798,9 @@ curl -X POST http://localhost:8089/v1/indexes/dataset_a/reload-sql \
   }'
 ```
 
-Reload a large table with keyset pagination:
+Reload a large table with keyset pagination when a primary key or unique order
+column is available. If neither is supplied, LookupX reads offset pages and
+assigns generated row IDs; use a stable table during that import.
 
 ```bash
 curl -X POST http://localhost:8089/v1/indexes/dataset_a/reload-table \
@@ -819,6 +826,21 @@ curl -X POST http://localhost:8089/v1/indexes/dataset_a/reload-table \
     ]
   }'
 ```
+
+Reload from an uploaded file. CSV, TSV, XLSX, JSON object/array, and JSON Lines
+are supported. Tabular headers or JSON keys are sampled to infer the replacement
+index schema. XLSX reads the first worksheet unless `sheet` is supplied.
+
+```bash
+curl -X POST http://localhost:8089/v1/indexes/dataset_a/reload-file \
+  -F 'file=@./data/records.xlsx' \
+  -F 'format=xlsx' \
+  -F 'sheet=Records' \
+  -F 'id_field=id'
+```
+
+The same endpoint accepts `format=csv`, `tsv`, `json`, `jsonl`, or `ndjson`.
+Uploads are limited to 1 GiB. File imports replace the current index generation.
 
 Metrics:
 

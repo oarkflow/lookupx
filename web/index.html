@@ -3,9 +3,9 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>lookupx</title>
+  <title>LookupX — Search Console</title>
   <script src="https://cdn.tailwindcss.com"></script>
-  <link rel="stylesheet" href="styles.css?v=9" />
+  <link rel="stylesheet" href="styles.css?v=15" />
   <script>
     tailwind.config = {
       theme: {
@@ -18,39 +18,44 @@
     }
   </script>
 </head>
-<body class="h-full bg-gray-950 text-gray-100">
-  <div class="flex h-full">
-    <!-- Sidebar -->
-    <aside class="w-56 bg-gray-900 border-r border-gray-800 flex flex-col">
-      <div class="p-4 border-b border-gray-800">
-        <h1 class="text-xl font-bold text-brand-400">lookupx</h1>
-      </div>
-      <nav class="flex-1 p-2 space-y-1" id="sidebar-nav">
-        <button data-tab="search" class="nav-btn active w-full text-left px-3 py-2 rounded text-sm font-medium">
-          <span class="mr-2">⌕</span> Search
+<body class="h-full">
+  <div class="app-shell">
+    <aside class="sidebar">
+      <a class="brand" href="#search" aria-label="LookupX home">
+        <span class="brand-mark" aria-hidden="true"><i></i><i></i><i></i><i></i></span>
+        <span class="brand-copy"><strong>lookupx</strong><small>SEARCH CONSOLE</small></span>
+      </a>
+      <div class="nav-caption">WORKSPACE</div>
+      <nav id="sidebar-nav" aria-label="Main navigation">
+        <button data-tab="search" class="nav-btn active" aria-label="Search" title="Search">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="10.8" cy="10.8" r="6.8"></circle><path d="m16 16 4.2 4.2"></path></svg><span>Search</span>
         </button>
-        <button data-tab="indexes" class="nav-btn w-full text-left px-3 py-2 rounded text-sm font-medium">
-          <span class="mr-2">⊞</span> Indexes
+        <button data-tab="indexes" class="nav-btn" aria-label="Indexes" title="Indexes">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><ellipse cx="12" cy="5" rx="8" ry="3"></ellipse><path d="M4 5v7c0 1.7 3.6 3 8 3s8-1.3 8-3V5M4 12v7c0 1.7 3.6 3 8 3s8-1.3 8-3v-7"></path></svg><span>Indexes</span>
         </button>
-        <button data-tab="integrations" class="nav-btn w-full text-left px-3 py-2 rounded text-sm font-medium">
-          <span class="mr-2">⬡</span> Integrations
+        <button data-tab="integrations" class="nav-btn" aria-label="Integrations" title="Integrations">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8.5 15.5 6 18a3.5 3.5 0 0 1-5-5l4-4a3.5 3.5 0 0 1 5 0M15.5 8.5 18 6a3.5 3.5 0 0 1 5 5l-4 4a3.5 3.5 0 0 1-5 0M8 16l8-8"></path></svg><span>Integrations</span>
         </button>
       </nav>
+      <div class="sidebar-bottom">
+        <div class="engine-mark"><span class="engine-dot"></span><div><strong>LookupX engine</strong><small>Embedded search service</small></div></div>
+        <div class="sidebar-version">LOCAL CONSOLE</div>
+      </div>
     </aside>
 
-    <!-- Main content -->
-    <main class="flex-1 overflow-auto">
-      <header class="border-b border-gray-800 px-6 py-4 flex items-center justify-between bg-gray-900/50">
-        <h2 id="page-title" class="text-lg font-semibold">Search</h2>
-        <div class="flex items-center gap-3">
-          <input id="api-base" type="text" value="" placeholder="API base URL (e.g. http://localhost:8089)" class="bg-gray-800 border border-gray-700 rounded px-3 py-1.5 text-sm w-72 focus:outline-none focus:ring-2 focus:ring-brand-500" />
-          <button onclick="App.refresh()" class="px-3 py-1.5 bg-brand-600 hover:bg-brand-500 rounded text-sm font-medium transition">Refresh</button>
+    <main class="main-shell">
+      <header class="topbar">
+        <div class="topbar-title"><span class="topbar-kicker">LOOKUPX</span><span class="topbar-divider">/</span><h2 id="page-title">Search</h2></div>
+        <div class="topbar-actions">
+          <label class="api-label" for="api-base">API endpoint</label>
+          <input id="api-base" type="text" value="" placeholder="http://localhost:8089" />
+          <button onclick="App.refresh()" class="btn btn-secondary btn-refresh"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 7v5h-5M4 17v-5h5"></path><path d="M5.6 9A7 7 0 0 1 18 6l2 6M4 12l2 6a7 7 0 0 0 12.4-3"></path></svg><span>Refresh</span></button>
         </div>
       </header>
-      <div id="content" class="p-6"></div>
+      <div id="content"></div>
     </main>
   </div>
 
-  <script src="app.js?v=9"></script>
+  <script src="app.js?v=15"></script>
 </body>
 </html>

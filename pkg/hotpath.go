@@ -177,7 +177,7 @@ func (ix *Index) searchBitmapIntoFast(bm *Bitmap, req SearchRequest, dst []Hit, 
 			return true
 		}
 		if len(dst) >= req.Limit {
-			return false
+			return true
 		}
 		dst = append(dst, Hit{ID: ix.docToExt[id], DocID: id, Score: 1})
 		return true
