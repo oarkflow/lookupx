@@ -1,6 +1,7 @@
 package pkg
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -8,11 +9,13 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
+	lookupxweb "github.com/oarkflow/lookupx/web"
 	"github.com/oarkflow/squealx"
 )
 
@@ -77,21 +80,36 @@ func (m *MultiIndexManager) RestorePersistent(ctx context.Context, store FileSeg
 		if id == "" {
 			continue
 		}
-		ix, man, err := OpenPersistent(ctx, store, id, Config{})
-		if errors.Is(err, os.ErrNotExist) {
-			continue
-		}
-		if err != nil {
+		if err := m.RestorePersistentIndex(ctx, store, id, Config{}); err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				continue
+			}
 			return fmt.Errorf("restore index %q: %w", id, err)
 		}
-		mi := &ManagedIndex{ID: id, Index: ix, Config: ix.cfg, Generation: man.Generation}
-		m.mu.Lock()
-		old := m.indexes[id]
-		m.indexes[id] = mi
-		m.mu.Unlock()
-		if old != nil && old.Index != nil {
-			_ = old.Index.Close()
-		}
+	}
+	return nil
+}
+
+// RestorePersistentIndex replaces one configured index with its saved
+// generation while retaining the BCL datasource factory and reload settings.
+func (m *MultiIndexManager) RestorePersistentIndex(ctx context.Context, store FileSegmentStore, id string, cfg Config) error {
+	ix, man, err := OpenPersistent(ctx, store, id, cfg)
+	if errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	if err != nil {
+		return err
+	}
+	m.mu.Lock()
+	old := m.indexes[cleanIndexID(id)]
+	mi := &ManagedIndex{ID: cleanIndexID(id), Index: ix, Config: ix.cfg, Generation: man.Generation}
+	if old != nil {
+		mi.Source, mi.Bulk, mi.Latency = old.Source, old.Bulk, old.Latency
+	}
+	m.indexes[mi.ID] = mi
+	m.mu.Unlock()
+	if old != nil && old.Index != nil {
+		_ = old.Index.Close()
 	}
 	return nil
 }
@@ -350,6 +368,38 @@ type MultiServer struct {
 	Requests uint64
 }
 
+// wireQueryShape returns query structure without values, which can contain
+// sensitive search text. It keeps routine query logs useful without logging
+// the search payload.
+func wireQueryShape(q WireQuery) string {
+	types, fields := map[string]struct{}{}, map[string]struct{}{}
+	var visit func(WireQuery)
+	visit = func(node WireQuery) {
+		if node.Type != "" {
+			types[strings.ToLower(node.Type)] = struct{}{}
+		}
+		if node.Field != "" {
+			fields[node.Field] = struct{}{}
+		}
+		for _, children := range [][]WireQuery{node.Must, node.Should, node.Filter, node.MustNot} {
+			for _, child := range children {
+				visit(child)
+			}
+		}
+	}
+	visit(q)
+	typeList, fieldList := make([]string, 0, len(types)), make([]string, 0, len(fields))
+	for value := range types {
+		typeList = append(typeList, value)
+	}
+	for value := range fields {
+		fieldList = append(fieldList, value)
+	}
+	sort.Strings(typeList)
+	sort.Strings(fieldList)
+	return fmt.Sprintf("types=%s fields=%s", strings.Join(typeList, ","), strings.Join(fieldList, ","))
+}
+
 func (s *MultiServer) diskStorageEnabled() bool {
 	return strings.EqualFold(strings.TrimSpace(s.Storage), "disk")
 }
@@ -406,13 +456,9 @@ func (s *MultiServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	path := strings.Trim(r.URL.Path, "/")
-	// Non-API paths: serve static web files if WebDir is set
+	// Non-API paths serve the embedded console unless a custom WebDir is set.
 	if !strings.HasPrefix(path, "v1/") && path != "health" && path != "metrics" {
-		if s.WebDir != "" {
-			s.serveWebOrNotFound(w, r)
-			return
-		}
-		http.NotFound(w, r)
+		s.serveWebOrNotFound(w, r)
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
@@ -555,6 +601,7 @@ func (s *MultiServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		res, hits := ix.SearchInto(SearchRequest{Query: q.ToQuery(), Limit: limit, Offset: q.Offset, AfterDocID: q.AfterDocID, SkipTotal: q.SkipTotal, WithDocs: withDocs, Sort: q.Sort, Facets: q.Facets}, nil)
 		res.Hits = hits
+		LogKV("query_search", "index", id, "query", wireQueryShape(q), "limit", limit, "offset", q.Offset, "hits", len(hits), "total", res.Total, "latency", time.Since(started))
 		writeJSON(w, map[string]any{"result": res, "latency_ns": time.Since(started).Nanoseconds()})
 	case r.Method == http.MethodGet && action == "lookup":
 		profile, _ := strconv.ParseBool(r.URL.Query().Get("profile"))
@@ -571,6 +618,12 @@ func (s *MultiServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		started := time.Now()
 		result, hits := ix.SearchInto(SearchRequest{Query: query, Limit: limit, WithDocs: true}, nil)
+		fields := make([]string, 0, len(r.URL.Query()))
+		for key := range r.URL.Query() {
+			fields = append(fields, key)
+		}
+		sort.Strings(fields)
+		LogKV("query_lookup", "index", id, "filters", strings.Join(fields, ","), "limit", limit, "hits", len(hits), "total", result.Total, "latency", time.Since(started))
 		response := map[string]any{"hits": hits, "total": result.Total, "latency_ns": time.Since(started).Nanoseconds()}
 		if profile {
 			response["resources"] = usageDelta(usageBefore, readResourceUsage())
@@ -586,6 +639,7 @@ func (s *MultiServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		started := time.Now()
 		c := ix.Count(q.ToQuery())
+		LogKV("query_count", "index", id, "query", wireQueryShape(q), "count", c, "latency", time.Since(started))
 		writeJSON(w, map[string]any{"count": c, "latency_ns": time.Since(started).Nanoseconds()})
 	case r.Method == http.MethodPost && action == "reload":
 		stats, err := s.Manager.Reload(r.Context(), id)
@@ -630,10 +684,6 @@ func (s *MultiServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *MultiServer) serveWebOrNotFound(w http.ResponseWriter, r *http.Request) {
-	if s.WebDir == "" {
-		http.NotFound(w, r)
-		return
-	}
 	// Force revalidation on every request. Without this, browsers may serve a
 	// stale index.html/app.js/styles.css straight from disk cache (no request
 	// to the server at all) even on a normal reload, since Go's static file
@@ -642,10 +692,22 @@ func (s *MultiServer) serveWebOrNotFound(w http.ResponseWriter, r *http.Request)
 	w.Header().Set("Cache-Control", "no-cache")
 	path := strings.TrimPrefix(r.URL.Path, "/")
 	if path == "" || path == "index.html" {
-		http.ServeFile(w, r, filepath.Join(s.WebDir, "index.html"))
+		if s.WebDir != "" {
+			http.ServeFile(w, r, filepath.Join(s.WebDir, "index.html"))
+			return
+		}
+		path = "index.html"
+	}
+	if s.WebDir != "" {
+		http.FileServer(http.Dir(s.WebDir)).ServeHTTP(w, r)
 		return
 	}
-	http.FileServer(http.Dir(s.WebDir)).ServeHTTP(w, r)
+	asset, err := lookupxweb.Assets.ReadFile(path)
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	http.ServeContent(w, r, path, time.Time{}, bytes.NewReader(asset))
 }
 
 func (s *MultiServer) authorized(r *http.Request) bool {
@@ -793,18 +855,6 @@ func bulkFromSQLReq(id string, batch int, checkpointPath string, resume bool) Bu
 		opt.Checkpoint = FileCheckpoint{Path: checkpointPath}
 	}
 	return opt
-}
-
-func sqlColumnSpecs(ix *Index, specs []SQLColumnSpec) []SQLColumn {
-	cols := make([]SQLColumn, 0, len(specs))
-	for _, sp := range specs {
-		field := sp.Field
-		if field == "" {
-			field = sp.Column
-		}
-		cols = append(cols, SQLColumn{Column: sp.Column, Field: ix.FieldID(field), Kind: parseValueKind(sp.Kind), Normalized: sp.Normalized, Layout: sp.Layout})
-	}
-	return cols
 }
 
 func applySQLColumnSpecs(inferred []AutoColumn, specs []SQLColumnSpec) []AutoColumn {

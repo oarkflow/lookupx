@@ -54,6 +54,20 @@ func TestPersistentManagerRestoreKeepsRecordsAndFilters(t *testing.T) {
 	}
 }
 
+func TestMultiServerServesEmbeddedWebConsoleByDefault(t *testing.T) {
+	server := &MultiServer{Manager: NewMultiIndexManager()}
+	for _, path := range []string{"/", "/app.js", "/styles.css"} {
+		rec := httptest.NewRecorder()
+		server.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, path, nil))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("GET %s: status=%d body=%q", path, rec.Code, rec.Body.String())
+		}
+		if rec.Body.Len() == 0 {
+			t.Fatalf("GET %s returned an empty asset", path)
+		}
+	}
+}
+
 func TestHTTPReloadPersistsForServerRestart(t *testing.T) {
 	root := filepath.Join(t.TempDir(), "indexes")
 	mgr := NewMultiIndexManager()
@@ -338,6 +352,10 @@ func TestLookupGlobalTermAcrossColumnsAndStructuredFilters(t *testing.T) {
 		{"term=nail+repair", 2},
 		{"term=nail&work_item=37", 1},
 		{"term=naol&fuzzy=true", 2},
+		{"term=nail&term_field=description", 2},
+		{"term=11760&term_field=code", 2},
+		{"term=nail&term_field=code", 0},
+		{"code=11760", 2},
 	} {
 		q, err := ix.CompileDatasourceLookup(tc.raw)
 		if err != nil {
@@ -347,6 +365,54 @@ func TestLookupGlobalTermAcrossColumnsAndStructuredFilters(t *testing.T) {
 		if len(hits) != tc.want {
 			t.Fatalf("term query %q returned %d hits: %#v", tc.raw, len(hits), hits)
 		}
+	}
+	for _, raw := range []string{"term=nail&term_field=work_item", "term=nail&term_field=missing", "term_field=description"} {
+		if _, err := ix.CompileDatasourceLookup(raw); err == nil {
+			t.Fatalf("expected invalid term-field query %q to fail", raw)
+		}
+	}
+}
+
+func TestConfiguredTermSearchFieldsRestrictGlobalSearch(t *testing.T) {
+	ix, err := New(Config{DisableSource: true, Schema: Schema{Fields: map[string]FieldOptions{
+		"code":        {Kind: FieldKeyword, Indexed: true, Lowercase: true, TermSearch: true},
+		"description": {Kind: FieldText, Indexed: true, Lowercase: true, TermSearch: true},
+		"notes":       {Kind: FieldText, Indexed: true, Lowercase: true},
+	}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	wireFields := schemaFieldsWire(ix.SchemaFields())
+	if wireFields["description"].(map[string]any)["term_search"] != true {
+		t.Fatal("schema endpoint should expose term_search configuration")
+	}
+	records := []SourceRecord{
+		{ID: "a", Values: []SourceValue{{Field: ix.FieldID("code"), Kind: ValueKeyword, String: "11760"}, {Field: ix.FieldID("description"), Kind: ValueText, String: "Nail repair"}, {Field: ix.FieldID("notes"), Kind: ValueText, String: "internal note"}}},
+		{ID: "b", Values: []SourceValue{{Field: ix.FieldID("code"), Kind: ValueKeyword, String: "99213"}, {Field: ix.FieldID("description"), Kind: ValueText, String: "Office visit"}, {Field: ix.FieldID("notes"), Kind: ValueText, String: "secret phrase"}}},
+	}
+	if _, err := ix.IndexFrom(context.Background(), SliceSource{Records: records}, BulkOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		raw  string
+		want int
+	}{
+		{"term=11760", 1},
+		{"term=repair&term_field=description", 1},
+		{"term=secret", 0},
+		{"notes=secret", 1},
+	} {
+		q, err := ix.CompileDatasourceLookup(tc.raw)
+		if err != nil {
+			t.Fatalf("compile %q: %v", tc.raw, err)
+		}
+		_, hits := ix.SearchInto(SearchRequest{Query: q, Limit: 10}, nil)
+		if len(hits) != tc.want {
+			t.Fatalf("query %q got %d hits, want %d", tc.raw, len(hits), tc.want)
+		}
+	}
+	if _, err := ix.CompileDatasourceLookup("term=secret&term_field=notes"); err == nil {
+		t.Fatal("expected non-configured term field to be rejected")
 	}
 }
 
@@ -390,6 +456,9 @@ func TestPersistentGlobalTermPreservesBM25Statistics(t *testing.T) {
 	restored, _, err := store.LoadIndex(context.Background(), "bm25", cfg)
 	if err != nil {
 		t.Fatal(err)
+	}
+	if got := restored.Count(Term{Field: "body", Value: "nail"}); got != 2 {
+		t.Fatalf("restored term count=%d", got)
 	}
 	result, _ := restored.SearchInto(SearchRequest{Query: GlobalTerm{Words: []string{"nail"}}, Limit: 10, WithDocs: true}, nil)
 	if len(result.Hits) != 2 || result.Hits[0].ID != "dense" || result.Hits[0].Score <= result.Hits[1].Score {

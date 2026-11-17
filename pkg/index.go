@@ -29,6 +29,13 @@ type fieldIndex struct {
 	phraseOne                               map[string]DocID
 	unique                                  map[string]DocID
 	fuzzyTerms                              map[byte][]string
+	termKeys                                []string
+	termKeysDirty                           bool
+	patternCache                            map[string]*Bitmap
+	patternCacheOrder                       []string
+	patternCacheBytes                       int
+	patternCacheMu                          sync.Mutex
+	patternBuildMu                          sync.Mutex
 	exists                                  *Bitmap
 	capHint                                 DocID
 	docLengths                              []uint32
@@ -91,7 +98,7 @@ type schemaField struct {
 	fi           *fieldIndex
 	special      specialNormalizer
 	analyzeFn    func(text string, dst []string) []string
-	stringsCol   map[DocID]string
+	stringsCol   []string
 	numericDense []float64
 	numericEx    *Bitmap
 	noDerived    bool
@@ -127,37 +134,39 @@ type ipPair struct {
 }
 
 type Index struct {
-	mu            sync.RWMutex
-	cfg           Config
-	nextDocID     DocID
-	extToDoc      map[string]DocID
-	docToExt      []string
-	docs          []Document
-	deleted       *Bitmap
-	live          *Bitmap
-	expires       map[DocID]int64
-	hasTTL        bool
-	hasDeletes    bool
-	fields        map[string]*fieldIndex
-	fieldList     []schemaField
-	fieldIDs      map[string]FieldID
-	clock         Clock
-	numeric       map[string]map[DocID]float64
-	numericDense  map[string][]float64
-	numericExists map[string]*Bitmap
-	numSorted     map[string][]numPair
-	numDirty      map[string]bool
-	strings       map[string]map[DocID]string
-	vectors       map[string]map[DocID][]float64
-	anns          map[string]*VectorANN
-	ip4           map[string]map[DocID]uint32
-	ip4Sorted     map[string][]ipPair
-	ip4Dirty      map[string]bool
-	wal           *os.File
-	walSeq        uint64
-	tokens        []string
-	scratch       []string
-	valScratch    []string
+	mu                 sync.RWMutex
+	cfg                Config
+	nextDocID          DocID
+	extToDoc           map[string]DocID
+	docToExt           []string
+	docs               []Document
+	deleted            *Bitmap
+	live               *Bitmap
+	expires            map[DocID]int64
+	hasTTL             bool
+	hasDeletes         bool
+	fields             map[string]*fieldIndex
+	fieldList          []schemaField
+	termSearchFields   []string
+	globalSearchFields []string
+	fieldIDs           map[string]FieldID
+	clock              Clock
+	numeric            map[string]map[DocID]float64
+	numericDense       map[string][]float64
+	numericExists      map[string]*Bitmap
+	numSorted          map[string][]numPair
+	numDirty           map[string]bool
+	strings            map[string][]string
+	vectors            map[string]map[DocID][]float64
+	anns               map[string]*VectorANN
+	ip4                map[string]map[DocID]uint32
+	ip4Sorted          map[string][]ipPair
+	ip4Dirty           map[string]bool
+	wal                *os.File
+	walSeq             uint64
+	tokens             []string
+	scratch            []string
+	valScratch         []string
 }
 
 func New(cfg Config) (*Index, error) {
@@ -165,7 +174,7 @@ func New(cfg Config) (*Index, error) {
 	if capHint < 0 {
 		capHint = 0
 	}
-	ix := &Index{cfg: cfg, nextDocID: 1, deleted: NewBitmapCap(DocID(capHint + 1)), live: NewBitmapCap(DocID(capHint + 1)), expires: make(map[DocID]int64), fields: map[string]*fieldIndex{}, fieldIDs: map[string]FieldID{}, numeric: map[string]map[DocID]float64{}, numericDense: map[string][]float64{}, numericExists: map[string]*Bitmap{}, numSorted: map[string][]numPair{}, numDirty: map[string]bool{}, strings: map[string]map[DocID]string{}, vectors: map[string]map[DocID][]float64{}, anns: map[string]*VectorANN{}, ip4: map[string]map[DocID]uint32{}, ip4Sorted: map[string][]ipPair{}, ip4Dirty: map[string]bool{}, docToExt: make([]string, 1, capHint+1)}
+	ix := &Index{cfg: cfg, nextDocID: 1, deleted: NewBitmapCap(DocID(capHint + 1)), live: NewBitmapCap(DocID(capHint + 1)), expires: make(map[DocID]int64), fields: map[string]*fieldIndex{}, fieldIDs: map[string]FieldID{}, numeric: map[string]map[DocID]float64{}, numericDense: map[string][]float64{}, numericExists: map[string]*Bitmap{}, numSorted: map[string][]numPair{}, numDirty: map[string]bool{}, strings: map[string][]string{}, vectors: map[string]map[DocID][]float64{}, anns: map[string]*VectorANN{}, ip4: map[string]map[DocID]uint32{}, ip4Sorted: map[string][]ipPair{}, ip4Dirty: map[string]bool{}, docToExt: make([]string, 1, capHint+1)}
 	if !cfg.DisableSource {
 		ix.docs = make([]Document, 1, capHint+1)
 	}
@@ -185,6 +194,17 @@ func New(cfg Config) (*Index, error) {
 	sort.Strings(fieldNames)
 	for _, name := range fieldNames {
 		opt := cfg.Schema.Fields[name]
+		if opt.Kind == FieldText || opt.Kind == FieldKeyword || opt.Kind == FieldBool {
+			aliasTarget, hasAliasTarget := cfg.Schema.Fields[opt.IndexAlias]
+			deduplicateAlias := opt.IndexAlias != "" && opt.IndexAlias != name && hasAliasTarget &&
+				(aliasTarget.Kind == FieldText || aliasTarget.Kind == FieldKeyword || aliasTarget.Kind == FieldBool)
+			if !deduplicateAlias {
+				ix.globalSearchFields = append(ix.globalSearchFields, name)
+			}
+			if opt.TermSearch && !(deduplicateAlias && aliasTarget.TermSearch) {
+				ix.termSearchFields = append(ix.termSearchFields, name)
+			}
+		}
 		fi := newFieldIndex(capHint, opt)
 		sp := detectSpecial(name)
 		ix.fields[name] = fi
@@ -219,12 +239,48 @@ func New(cfg Config) (*Index, error) {
 			ix.numericExists[name] = NewBitmapCap(DocID(capHint + 1))
 		}
 		if opt.Facetable || opt.Stored || sp == specialDomain || sp == specialURL {
-			ix.strings[name] = make(map[DocID]string, capHint)
+			if opt.IndexAlias == "" && opt.StoredAlias == "" {
+				ix.strings[name] = make([]string, 1, capHint+1)
+			}
 		}
 		if opt.Kind == FieldVector || opt.Dim > 0 {
 			ix.vectors[name] = make(map[DocID][]float64, capHint)
 			ix.anns[name] = newVectorANNWithOptions(opt, capHint)
 		}
+	}
+	// Explicit text aliases share postings. Field values and result columns stay
+	// independent, while identical text fields avoid building duplicate term maps.
+	for i := range ix.fieldList {
+		sf := &ix.fieldList[i]
+		if sf.opt.IndexAlias == "" {
+			continue
+		}
+		target, ok := ix.fields[sf.opt.IndexAlias]
+		if !ok || sf.opt.IndexAlias == sf.name {
+			return nil, fmt.Errorf("field %q has invalid index_alias %q", sf.name, sf.opt.IndexAlias)
+		}
+		targetOpts := cfg.Schema.Fields[sf.opt.IndexAlias]
+		if sf.opt.Kind != FieldText || targetOpts.Kind != FieldText || targetOpts.IndexAlias != "" || sf.opt.Analyzer != targetOpts.Analyzer || sf.opt.Lowercase != targetOpts.Lowercase || sf.opt.Fuzzy != targetOpts.Fuzzy || sf.opt.Phrase != targetOpts.Phrase || sf.opt.Prefix != targetOpts.Prefix || sf.opt.Suffix != targetOpts.Suffix || sf.opt.Ngram != targetOpts.Ngram {
+			return nil, fmt.Errorf("field %q index_alias %q requires matching text-index options", sf.name, sf.opt.IndexAlias)
+		}
+		sf.fi = target
+		ix.fields[sf.name] = target
+		if targetColumn, ok := ix.strings[sf.opt.IndexAlias]; ok && (sf.opt.Stored || sf.opt.Facetable || sf.special == specialDomain || sf.special == specialURL) {
+			ix.strings[sf.name] = targetColumn
+		}
+	}
+	// Stored aliases share the dense DocID column for identical projected values.
+	for i := range ix.fieldList {
+		sf := &ix.fieldList[i]
+		if sf.opt.StoredAlias == "" {
+			continue
+		}
+		target := sf.opt.StoredAlias
+		column, ok := ix.strings[target]
+		if !ok || target == sf.name || !(sf.opt.Stored || sf.opt.Facetable || sf.special == specialDomain || sf.special == specialURL) {
+			return nil, fmt.Errorf("field %q has invalid stored_alias %q", sf.name, target)
+		}
+		ix.strings[sf.name] = column
 	}
 	for i, sf := range ix.fieldList {
 		if col, ok := ix.strings[sf.name]; ok {
@@ -398,10 +454,71 @@ func (ix *Index) Get(id string) (Document, bool) {
 	if !ok || ix.isDeletedOrExpiredLocked(did) {
 		return nil, false
 	}
-	if int(did) >= len(ix.docs) || ix.docs[did] == nil {
-		return nil, true
+	return ix.documentLocked(did), true
+}
+
+// documentLocked returns the source document when retained, otherwise it
+// reconstructs a result document from configured stored columns. Callers hold
+// at least the index read lock.
+func (ix *Index) documentLocked(id DocID) Document {
+	if int(id) < len(ix.docs) && ix.docs[id] != nil {
+		return cloneDoc(ix.docs[id])
 	}
-	return cloneDoc(ix.docs[did]), true
+	doc := make(Document, len(ix.fieldList))
+	for _, field := range ix.fieldList {
+		doc[field.name] = nil
+	}
+	for field, column := range ix.strings {
+		if value, ok := stringColumnValue(column, id); ok {
+			doc[field] = value
+		}
+	}
+	return doc
+}
+
+func stringColumnValue(col []string, id DocID) (string, bool) {
+	if id == 0 || uint64(id) >= uint64(len(col)) || col[id] == "" {
+		return "", false
+	}
+	return col[id], true
+}
+
+// setStringColumnLocked stores a value in a dense DocID-aligned column. Dense
+// columns avoid the hash-bucket and key overhead of one map entry per stored
+// field per document. Callers hold ix.mu for writing.
+func (ix *Index) setStringColumnLocked(field string, id DocID, value string) {
+	col, ok := ix.strings[field]
+	if !ok || id == 0 {
+		return
+	}
+	need := int(id) + 1
+	if need > cap(col) {
+		newCap := cap(col) * 2
+		if newCap < need {
+			newCap = need
+		}
+		next := make([]string, len(col), newCap)
+		copy(next, col)
+		col = next
+	}
+	if need > len(col) {
+		col = col[:need]
+	}
+	col[id] = value
+	root := field
+	opt := ix.cfg.Schema.Fields[field]
+	if opt.StoredAlias != "" {
+		root = opt.StoredAlias
+	} else if opt.IndexAlias != "" {
+		root = opt.IndexAlias
+	}
+	for i := range ix.fieldList {
+		sf := &ix.fieldList[i]
+		if sf.name == root || sf.opt.IndexAlias == root || sf.opt.StoredAlias == root {
+			sf.stringsCol = col
+			ix.strings[sf.name] = col
+		}
+	}
 }
 func (ix *Index) Count(q Query) int {
 	if q == nil {
@@ -455,9 +572,12 @@ func (ix *Index) countLiveLocked(bm *Bitmap) int {
 	if bm == nil {
 		return 0
 	}
+	if !ix.hasTTL {
+		return ix.live.Clone().AndInPlace(bm).Count()
+	}
 	n := 0
 	bm.Each(func(id DocID) bool {
-		if ix.live.Has(id) {
+		if !ix.isDeletedOrExpiredLocked(id) {
 			n++
 		}
 		return true
@@ -489,8 +609,8 @@ func (ix *Index) Search(req SearchRequest) Result {
 				return true
 			}
 			h := Hit{ID: ix.docToExt[id], DocID: id, Score: 1}
-			if req.WithDocs && int(id) < len(ix.docs) && ix.docs[id] != nil {
-				h.Doc = cloneDoc(ix.docs[id])
+			if req.WithDocs {
+				h.Doc = ix.documentLocked(id)
 			}
 			hits = append(hits, h)
 			return len(hits) < req.Limit
@@ -542,8 +662,8 @@ func (ix *Index) Search(req SearchRequest) Result {
 		for _, rankedDoc := range ranked[from:to] {
 			id := rankedDoc.id
 			h := Hit{ID: ix.docToExt[id], DocID: id, Score: rankedDoc.score}
-			if req.WithDocs && int(id) < len(ix.docs) && ix.docs[id] != nil {
-				h.Doc = cloneDoc(ix.docs[id])
+			if req.WithDocs {
+				h.Doc = ix.documentLocked(id)
 			}
 			hits = append(hits, h)
 		}
@@ -555,12 +675,15 @@ func (ix *Index) Search(req SearchRequest) Result {
 	}
 	if len(req.Sort) == 0 && len(req.Facets) == 0 {
 		hits := make([]Hit, 0, req.Limit)
-		skipped, total := 0, 0
+		skipped := 0
+		total := -1
+		if !req.SkipTotal || req.AfterDocID == 0 {
+			total = ix.countLiveLocked(bm)
+		}
 		bm.Each(func(id DocID) bool {
 			if ix.isDeletedOrExpiredLocked(id) {
 				return true
 			}
-			total++
 			if skipped < req.Offset {
 				skipped++
 				return true
@@ -569,11 +692,11 @@ func (ix *Index) Search(req SearchRequest) Result {
 				return false
 			}
 			h := Hit{ID: ix.docToExt[id], DocID: id, Score: 1}
-			if req.WithDocs && int(id) < len(ix.docs) && ix.docs[id] != nil {
-				h.Doc = cloneDoc(ix.docs[id])
+			if req.WithDocs {
+				h.Doc = ix.documentLocked(id)
 			}
 			hits = append(hits, h)
-			return true
+			return len(hits) < req.Limit
 		})
 		return Result{Total: total, Hits: hits, Took: ix.elapsed(start)}
 	}
@@ -602,8 +725,8 @@ func (ix *Index) Search(req SearchRequest) Result {
 	hits := make([]Hit, 0, to-from)
 	for _, id := range ids[from:to] {
 		h := Hit{ID: ix.docToExt[id], DocID: id, Score: 1}
-		if req.WithDocs && int(id) < len(ix.docs) && ix.docs[id] != nil {
-			h.Doc = cloneDoc(ix.docs[id])
+		if req.WithDocs {
+			h.Doc = ix.documentLocked(id)
 		}
 		hits = append(hits, h)
 	}
@@ -640,8 +763,13 @@ func (ix *Index) globalBM25ScoresLocked(q GlobalTerm, ws *globalScoreWorkspace) 
 		ws.scores[id] += score
 	}
 	n := float64(ix.live.Count())
+	fields := ix.globalTermFields(q)
 	for _, word := range q.Words {
-		for field, opt := range ix.cfg.Schema.Fields {
+		for _, field := range fields {
+			opt, ok := ix.cfg.Schema.Fields[field]
+			if !ok {
+				continue
+			}
 			if opt.Kind != FieldText && opt.Kind != FieldKeyword && opt.Kind != FieldBool {
 				continue
 			}
@@ -771,8 +899,8 @@ func (ix *Index) sortIDsLocked(ids []DocID, fields []SortField) {
 				}
 				return av < bv
 			}
-			av, aok := ix.strings[sf.Field][a]
-			bv, bok := ix.strings[sf.Field][b]
+			av, aok := stringColumnValue(ix.strings[sf.Field], a)
+			bv, bok := stringColumnValue(ix.strings[sf.Field], b)
 			if !aok || !bok {
 				if aok == bok {
 					continue
@@ -812,7 +940,7 @@ func (ix *Index) facetsLocked(bm *Bitmap, names []string) map[string][]FacetBuck
 			if ix.isDeletedOrExpiredLocked(id) {
 				return true
 			}
-			if v, ok := ix.strings[field][id]; ok {
+			if v, ok := stringColumnValue(ix.strings[field], id); ok {
 				counts[v]++
 			} else if n, ok := ix.numeric[field][id]; ok {
 				counts[strconv.FormatFloat(n, 'f', -1, 64)]++
@@ -863,7 +991,12 @@ func (ix *Index) Stats() Stats {
 			}
 		}
 	}
+	seen := make(map[*fieldIndex]struct{}, len(ix.fields))
 	for _, fi := range ix.fields {
+		if _, ok := seen[fi]; ok {
+			continue
+		}
+		seen[fi] = struct{}{}
 		s.Terms += len(fi.terms) + len(fi.termOne)
 		s.Prefixes += len(fi.prefix) + len(fi.prefixOne)
 		s.Suffixes += len(fi.suffix) + len(fi.suffixOne)
@@ -891,6 +1024,11 @@ func (ix *Index) Analyze(field, text string) []AnalyzeToken {
 
 func (ix *Index) indexDocLocked(id DocID, doc Document) {
 	for _, sf := range ix.fieldList {
+		// The target field owns indexing for an explicit identical-text alias.
+		// Indexing both names would double term frequency and document length.
+		if sf.opt.IndexAlias != "" {
+			continue
+		}
 		field, opt, fi := sf.name, sf.opt, sf.fi
 		v, ok := doc[field]
 		if !ok || v == nil {
@@ -933,8 +1071,8 @@ func (ix *Index) indexDocLocked(id DocID, doc Document) {
 				continue
 			}
 			if first {
-				if col := sf.stringsCol; col != nil {
-					col[id] = val
+				if sf.stringsCol != nil {
+					ix.setStringColumnLocked(sf.name, id, val)
 				}
 				if sf.special == specialIP {
 					if ip := net.ParseIP(val); ip != nil {
@@ -954,6 +1092,9 @@ func (ix *Index) indexDocLocked(id DocID, doc Document) {
 					}
 				}
 				first = false
+			}
+			if opt.StoredOnly {
+				continue
 			}
 			if opt.Lookup || opt.Kind == FieldKeyword || opt.Kind == FieldBool || opt.Kind == FieldInt || opt.Kind == FieldFloat || opt.Kind == FieldTime {
 				if opt.Unique {
@@ -1054,23 +1195,23 @@ func addTerm(fi *fieldIndex, term string, id DocID, fuzzy bool) {
 	if term == "" {
 		return
 	}
+	if len(fi.patternCache) > 0 {
+		fi.patternCacheMu.Lock()
+		fi.patternCache = nil
+		fi.patternCacheOrder = nil
+		fi.patternCacheBytes = 0
+		fi.patternCacheMu.Unlock()
+	}
+	if fi.terms[term] == nil && fi.termOne[term] == 0 {
+		fi.termKeysDirty = true
+	}
 	if fuzzy && fi.termOne[term] == 0 && fi.terms[term] == nil {
 		fi.fuzzyTerms[term[0]] = append(fi.fuzzyTerms[term[0]], term)
 	}
 	addPosting(fi.terms, fi.termOne, term, id, fi.capHint)
 }
 
-func add(m map[string]*Bitmap, term string, id DocID) {
-	// Compatibility helper for call sites that do not have singleton maps.
-	b := m[term]
-	if b == nil {
-		b = NewBitmap()
-		m[term] = b
-	}
-	b.Add(id)
-}
-
-func addPosting(m map[string]*Bitmap, one map[string]DocID, term string, id DocID, capHint DocID) {
+func addPosting(m map[string]*Bitmap, one map[string]DocID, term string, id DocID, _ DocID) {
 	if term == "" {
 		return
 	}
@@ -1155,52 +1296,85 @@ func (ix *Index) termBitmap(field, value string) *Bitmap {
 	return NewBitmap()
 }
 func (ix *Index) prefixBitmap(field, value string) *Bitmap {
+	return ix.prefixBitmapWithin(field, value, nil)
+}
+
+// prefixBitmapWithin intersects a prefix result with an optional selective
+// bitmap, using cached full-prefix postings for text fields when available.
+func (ix *Index) prefixBitmapWithin(field, value string, candidates *Bitmap) *Bitmap {
 	ix.mu.RLock()
-	defer ix.mu.RUnlock()
 	opt := ix.cfg.Schema.Fields[field]
 	fi := ix.fields[field]
 	if fi == nil {
+		ix.mu.RUnlock()
 		return NewBitmap()
 	}
 	val := normalize(value, opt.Lowercase)
 	if did := fi.prefixOne[val]; did != 0 && !ix.deleted.Has(did) {
 		r := NewBitmapCap(ix.nextDocID)
-		r.Add(did)
+		if candidates == nil || candidates.Has(did) {
+			r.Add(did)
+		}
+		ix.mu.RUnlock()
 		return r
 	}
 	if b := fi.prefix[val]; b != nil {
+		if candidates != nil {
+			b = candidates.Clone().AndInPlace(b)
+		}
+		ix.mu.RUnlock()
 		return b
 	}
+	if opt.Kind == FieldText && val != "" {
+		ix.mu.RUnlock()
+		matched := ix.textTermPatternBitmap(field, val, strings.HasPrefix, true)
+		if candidates != nil {
+			matched = candidates.Clone().AndInPlace(matched)
+		}
+		return matched
+	}
+	ix.mu.RUnlock()
 	return NewBitmap()
 }
 func (ix *Index) suffixBitmap(field, value string) *Bitmap {
 	ix.mu.RLock()
-	defer ix.mu.RUnlock()
 	opt := ix.cfg.Schema.Fields[field]
 	fi := ix.fields[field]
 	if fi == nil {
+		ix.mu.RUnlock()
 		return NewBitmap()
 	}
 	val := normalize(value, opt.Lowercase)
 	if did := fi.suffixOne[val]; did != 0 && !ix.deleted.Has(did) {
 		r := NewBitmapCap(ix.nextDocID)
 		r.Add(did)
+		ix.mu.RUnlock()
 		return r
 	}
 	if b := fi.suffix[val]; b != nil {
+		ix.mu.RUnlock()
 		return b
 	}
+	if opt.Kind == FieldText && val != "" {
+		ix.mu.RUnlock()
+		return ix.textTermPatternBitmap(field, val, strings.HasSuffix, false)
+	}
+	ix.mu.RUnlock()
 	return NewBitmap()
 }
 func (ix *Index) ngramBitmap(field, value string) *Bitmap {
 	ix.mu.RLock()
-	defer ix.mu.RUnlock()
 	opt := ix.cfg.Schema.Fields[field]
 	fi := ix.fields[field]
 	if fi == nil {
+		ix.mu.RUnlock()
 		return NewBitmap()
 	}
 	value = normalize(value, opt.Lowercase)
+	if opt.Kind == FieldText && !opt.Ngram && value != "" {
+		ix.mu.RUnlock()
+		return ix.textTermPatternBitmap(field, value, strings.Contains, false)
+	}
 	gs := grams(value, opt.MinGram, opt.MaxGram, nil)
 	var r *Bitmap
 	for _, g := range gs {
@@ -1211,6 +1385,7 @@ func (ix *Index) ngramBitmap(field, value string) *Bitmap {
 		} else if bb := fi.ngram[g]; bb != nil {
 			b = bb
 		} else {
+			ix.mu.RUnlock()
 			return NewBitmap()
 		}
 		if r == nil {
@@ -1220,9 +1395,139 @@ func (ix *Index) ngramBitmap(field, value string) *Bitmap {
 		}
 	}
 	if r == nil {
+		ix.mu.RUnlock()
 		return NewBitmap()
 	}
+	ix.mu.RUnlock()
 	return r
+}
+
+// textTermPatternBitmap implements prefix, infix, and suffix patterns for text
+// fields that do not materialize derived postings. The sorted token dictionary
+// is built lazily once per generation; prefix patterns use a binary range, and
+// infix/suffix patterns scan only the dictionary strings, never all documents.
+func (ix *Index) textTermPatternBitmap(field, value string, match func(string, string) bool, prefixRange bool) *Bitmap {
+	ix.mu.RLock()
+	fi := ix.fields[field]
+	if fi == nil {
+		ix.mu.RUnlock()
+		return NewBitmap()
+	}
+	cacheKey := ""
+	if prefixRange {
+		cacheKey = "prefix:" + value
+		if cached := fi.cachedPattern(cacheKey); cached != nil {
+			ix.mu.RUnlock()
+			return cached
+		}
+		ix.mu.RUnlock()
+		fi.patternBuildMu.Lock()
+		defer fi.patternBuildMu.Unlock()
+		ix.mu.RLock()
+		fi = ix.fields[field]
+		if fi == nil {
+			ix.mu.RUnlock()
+			return NewBitmap()
+		}
+		if cached := fi.cachedPattern(cacheKey); cached != nil {
+			ix.mu.RUnlock()
+			return cached
+		}
+	}
+	if fi.termKeys == nil || fi.termKeysDirty {
+		ix.mu.RUnlock()
+		ix.mu.Lock()
+		fi = ix.fields[field]
+		if fi != nil && (fi.termKeys == nil || fi.termKeysDirty) {
+			keys := make([]string, 0, len(fi.terms)+len(fi.termOne))
+			for term := range fi.termOne {
+				keys = append(keys, term)
+			}
+			for term := range fi.terms {
+				keys = append(keys, term)
+			}
+			sort.Strings(keys)
+			fi.termKeys = keys
+			fi.termKeysDirty = false
+		}
+		ix.mu.Unlock()
+		ix.mu.RLock()
+		fi = ix.fields[field]
+	}
+	matched := NewBitmap()
+	if fi != nil {
+		start := 0
+		if prefixRange {
+			start = sort.SearchStrings(fi.termKeys, value)
+		}
+		for i := start; i < len(fi.termKeys); i++ {
+			term := fi.termKeys[i]
+			if prefixRange && !strings.HasPrefix(term, value) {
+				break
+			}
+			if !match(term, value) {
+				continue
+			}
+			if id := fi.termOne[term]; id != 0 {
+				matched.Add(id)
+			} else if postings := fi.terms[term]; postings != nil {
+				matched = matched.OrInPlace(postings)
+			}
+		}
+	}
+	if cacheKey != "" {
+		fi.storePattern(cacheKey, matched)
+	}
+	ix.mu.RUnlock()
+	return matched
+}
+
+func (fi *fieldIndex) cachedPattern(key string) *Bitmap {
+	fi.patternCacheMu.Lock()
+	b := fi.patternCache[key]
+	if b != nil {
+		b = b.Clone()
+	}
+	fi.patternCacheMu.Unlock()
+	return b
+}
+
+func (fi *fieldIndex) storePattern(key string, bitmap *Bitmap) {
+	const maxCachedPatterns = 8
+	const maxPatternCacheBytes = 1 << 20
+	cacheSize := len(bitmap.words)*8 + len(bitmap.sparse)*4
+	fi.patternCacheMu.Lock()
+	if old := fi.patternCache[key]; old != nil {
+		fi.patternCacheBytes -= len(old.words)*8 + len(old.sparse)*4
+		delete(fi.patternCache, key)
+		for i, existing := range fi.patternCacheOrder {
+			if existing == key {
+				fi.patternCacheOrder = append(fi.patternCacheOrder[:i], fi.patternCacheOrder[i+1:]...)
+				break
+			}
+		}
+	}
+	if cacheSize > maxPatternCacheBytes {
+		fi.patternCacheMu.Unlock()
+		return
+	}
+	if fi.patternCache == nil {
+		fi.patternCache = make(map[string]*Bitmap, maxCachedPatterns)
+	}
+	for len(fi.patternCacheOrder) >= maxCachedPatterns || fi.patternCacheBytes+cacheSize > maxPatternCacheBytes {
+		oldest := fi.patternCacheOrder[0]
+		oldBitmap := fi.patternCache[oldest]
+		delete(fi.patternCache, oldest)
+		if oldBitmap != nil {
+			fi.patternCacheBytes -= len(oldBitmap.words)*8 + len(oldBitmap.sparse)*4
+		}
+		fi.patternCacheOrder = fi.patternCacheOrder[1:]
+	}
+	clone := bitmap.Clone()
+	fi.patternCache[key] = clone
+	fi.patternCacheOrder = append(fi.patternCacheOrder, key)
+	fi.patternCacheBytes += cacheSize
+	fi.patternCacheMu.Unlock()
 }
 func (ix *Index) existsBitmap(field string) *Bitmap {
 	ix.mu.RLock()
@@ -1329,7 +1634,7 @@ func (ix *Index) sortedNumericLocked(field string) []numPair {
 	ix.numDirty[field] = false
 	return pairs
 }
-func boundFloat(inclusive, exclusive any, lower bool) (float64, bool, bool) {
+func boundFloat(inclusive, exclusive any, _ bool) (float64, bool, bool) {
 	if exclusive != nil {
 		if f, ok := toFloatScalar(exclusive); ok {
 			return f, true, false
@@ -1405,76 +1710,6 @@ func normalizeStringByKind(kind specialNormalizer, raw string, lower bool) strin
 	}
 }
 
-func normalizeSpecialKind(kind specialNormalizer, v any, lower bool) string {
-	var raw string
-	switch x := v.(type) {
-	case string:
-		raw = x
-	case []byte:
-		raw = string(x)
-	case int:
-		raw = strconv.Itoa(x)
-	case int64:
-		raw = strconv.FormatInt(x, 10)
-	case float64:
-		raw = strconv.FormatFloat(x, 'f', -1, 64)
-	case bool:
-		raw = strconv.FormatBool(x)
-	case time.Time:
-		raw = x.Format(time.RFC3339)
-	default:
-		raw = fmt.Sprint(v)
-	}
-	s := normalize(raw, lower)
-	switch kind {
-	case specialEmail:
-		return normalizeEmail(s)
-	case specialPhone:
-		return normalizePhone(s)
-	case specialDomain:
-		return normalizeDomain(s)
-	case specialURL:
-		return normalizeURL(s)
-	default:
-		return s
-	}
-}
-
-func normalizeSpecial(field string, v any, lower bool) string {
-	var raw string
-	switch x := v.(type) {
-	case string:
-		raw = x
-	case []byte:
-		raw = string(x)
-	case int:
-		raw = strconv.Itoa(x)
-	case int64:
-		raw = strconv.FormatInt(x, 10)
-	case float64:
-		raw = strconv.FormatFloat(x, 'f', -1, 64)
-	case bool:
-		raw = strconv.FormatBool(x)
-	case time.Time:
-		raw = x.Format(time.RFC3339)
-	default:
-		raw = fmt.Sprint(v)
-	}
-	s := normalize(raw, lower)
-	lf := strings.ToLower(field)
-	switch {
-	case strings.Contains(lf, "email"):
-		return normalizeEmail(s)
-	case strings.Contains(lf, "phone") || strings.Contains(lf, "mobile"):
-		return normalizePhone(s)
-	case strings.Contains(lf, "domain") || strings.Contains(lf, "host"):
-		return normalizeDomain(s)
-	case strings.Contains(lf, "url") || strings.Contains(lf, "uri"):
-		return normalizeURL(s)
-	default:
-		return s
-	}
-}
 func normalizeSpecialString(field, s string, lower bool) string {
 	s = normalize(s, lower)
 	lf := strings.ToLower(field)
@@ -1550,32 +1785,6 @@ func valuesInto(v any, dst []string) []string {
 	}
 }
 
-func values(v any) []string {
-	switch x := v.(type) {
-	case string:
-		return []string{x}
-	case []string:
-		return x
-	case []any:
-		out := make([]string, 0, len(x))
-		for _, e := range x {
-			out = append(out, fmt.Sprint(e))
-		}
-		return out
-	case int:
-		return []string{strconv.Itoa(x)}
-	case int64:
-		return []string{strconv.FormatInt(x, 10)}
-	case float64:
-		return []string{strconv.FormatFloat(x, 'f', -1, 64)}
-	case bool:
-		return []string{strconv.FormatBool(x)}
-	case time.Time:
-		return []string{x.Format(time.RFC3339)}
-	default:
-		return []string{fmt.Sprint(v)}
-	}
-}
 func toUnix(v any) int64 {
 	switch x := v.(type) {
 	case int64:

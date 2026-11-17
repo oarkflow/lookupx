@@ -68,7 +68,7 @@ Commands:
   plan            Print a 1B-row partition/batch deployment plan
 
 Examples:
-  lookupx serve -addr :8089 -web ./web
+  lookupx serve -addr :8089
   lookupx demo -rows 100000
   lookupx search -index my_index -rows 100000 -q 'term=key-0013&group_id=4&date_key=2026-01-01'
   lookupx persist-demo -rows 100000 -data ./data/indexes
@@ -100,7 +100,7 @@ func serveCmd(args []string) {
 	addr := fs.String("addr", getenv("ADDR", ":8089"), "listen address")
 	configPath := fs.String("config", getenv("LOOKUPX_CONFIG", "config/lookupx.bcl"), "BCL configuration file; set empty to start without configured indexes")
 	apiKey := fs.String("api-key", getenv("LOOKUPX_API_KEY", ""), "optional API key")
-	webDir := fs.String("web", getenv("LOOKUPX_WEB_DIR", ""), "directory for static web frontend files")
+	webDir := fs.String("web", getenv("LOOKUPX_WEB_DIR", ""), "override the embedded browser console with static files from this directory")
 	dataDir := fs.String("data", getenv("LOOKUPX_DATA_DIR", "./data/indexes"), "persistent index directory")
 	storage := fs.String("storage", getenv("LOOKUPX_STORAGE", "memory"), "index storage: memory or disk")
 	_ = fs.Parse(args)
@@ -133,21 +133,69 @@ func serveCmd(args []string) {
 			}
 		}
 		for _, info := range mgr.List() {
-			if _, err := mgr.Reload(ctx, info.ID); err != nil {
+			indexStarted := time.Now()
+			lookup.LogKV("index_load_started", "index", info.ID, "storage", *storage)
+			mi, ok := mgr.Get(info.ID)
+			if !ok {
+				log.Fatalf("configured index %s disappeared", info.ID)
+			}
+			restored := false
+			if *storage == "disk" {
+				var indexConfig lookup.Config
+				for _, indexDef := range cfg.Indexes {
+					if indexDef.ID == info.ID {
+						indexConfig = indexDef.ToConfig()
+						break
+					}
+				}
+				err := mgr.RestorePersistentIndex(ctx, lookup.FileSegmentStore{Root: *dataDir}, info.ID, indexConfig)
+				if err == nil {
+					restored = true
+				} else if !os.IsNotExist(err) {
+					log.Fatalf("restore persistent index %s: %v", info.ID, err)
+				}
+			}
+			if restored {
+				ready, _ := mgr.Managed(info.ID)
+				stats := ready.Index.Stats()
+				lookup.LogKV("index_ready", "index", info.ID, "state", "restored", "storage", "disk", "generation", ready.Generation, "docs", stats.Docs, "live_docs", stats.LiveDocs, "fields", stats.Fields, "terms", stats.Terms, "elapsed", time.Since(indexStarted))
+				continue
+			}
+			loadStats, err := mgr.Reload(ctx, info.ID)
+			if err != nil {
 				log.Fatalf("initial index load %s: %v", info.ID, err)
 			}
+			persistDuration := time.Duration(0)
 			if *storage == "disk" {
-				mi, ok := mgr.Get(info.ID)
+				mi, ok = mgr.Get(info.ID)
 				if !ok {
 					log.Fatalf("loaded index %s disappeared", info.ID)
 				}
-				if err := mi.Freeze(); err != nil {
-					log.Fatalf("freeze index %s: %v", info.ID, err)
-				}
-				if _, err := mi.SavePersistent(ctx, lookup.FileSegmentStore{Root: *dataDir}, info.ID); err != nil {
+				persistStarted := time.Now()
+				manifest, err := mi.SavePersistent(ctx, lookup.FileSegmentStore{Root: *dataDir}, info.ID)
+				if err != nil {
 					log.Fatalf("persist index %s: %v", info.ID, err)
 				}
+				persistDuration = time.Since(persistStarted)
+				lookup.LogKV("index_persisted", "index", info.ID, "generation", manifest.Generation, "docs", manifest.Docs, "format", manifest.Format, "path", manifest.Path, "elapsed", persistDuration)
 			}
+			ready, _ := mgr.Managed(info.ID)
+			stats := ready.Index.Stats()
+			indexFields := []any{"index", info.ID, "state", "indexed", "storage", *storage}
+			if loadStats.Seen == loadStats.Indexed && uint64(stats.Docs) == loadStats.Indexed {
+				indexFields = append(indexFields, "rows_indexed", loadStats.Indexed)
+			} else {
+				indexFields = append(indexFields, "rows_seen", loadStats.Seen, "rows_indexed", loadStats.Indexed, "docs", stats.Docs)
+			}
+			if loadStats.Skipped > 0 {
+				indexFields = append(indexFields, "rows_skipped", loadStats.Skipped)
+			}
+			indexFields = append(indexFields, "live_docs", stats.LiveDocs, "fields", stats.Fields, "terms", stats.Terms, "rows_per_second", fmt.Sprintf("%.1f", loadStats.RowsPerSecond), "index_elapsed", loadStats.Took)
+			if *storage == "disk" {
+				indexFields = append(indexFields, "persist_elapsed", persistDuration)
+			}
+			indexFields = append(indexFields, "total_elapsed", time.Since(indexStarted))
+			lookup.LogKV("index_ready", indexFields...)
 		}
 	} else {
 		mgr = lookup.NewMultiIndexManager()
@@ -160,7 +208,7 @@ func serveCmd(args []string) {
 	if *apiKey != "" {
 		keys = append(keys, *apiKey)
 	}
-	log.Printf("lookupx server listening on %s (storage=%s, indexes=%d)", *addr, *storage, len(mgr.List()))
+	lookup.LogKV("server_listening", "address", *addr, "storage", *storage, "indexes", len(mgr.List()), "web_console", "/")
 	log.Fatal(http.ListenAndServe(*addr, &lookup.MultiServer{Manager: mgr, APIKeys: keys, WebDir: *webDir, DataDir: *dataDir, Storage: *storage}))
 }
 

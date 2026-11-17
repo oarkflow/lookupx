@@ -3,6 +3,7 @@ package pkg
 import (
 	"context"
 	"database/sql/driver"
+	"path/filepath"
 	"testing"
 	"time"
 )
@@ -28,6 +29,91 @@ func TestSQLSourceTimeWithoutLayoutAcceptsRFC3339(t *testing.T) {
 	doc, ok := ix.Get("1")
 	if !ok || doc["effective_date"] != "2018-01-01T00:00:00Z" {
 		t.Fatalf("unexpected document: ok=%v doc=%#v", ok, doc)
+	}
+}
+
+func TestTextAndStoredAliasesSurvivePersistentRoundTrip(t *testing.T) {
+	cfg := Config{DisableSource: true, Schema: Schema{Fields: map[string]FieldOptions{
+		"description":   {Kind: FieldText, Indexed: true, Stored: true, Lowercase: true, IndexAlias: "fulltext"},
+		"fulltext":      {Kind: FieldText, Indexed: true, Stored: true, Lowercase: true},
+		"work_item":     {Kind: FieldKeyword, Stored: true, StoredOnly: true, StoredAlias: "work_item_uid"},
+		"work_item_uid": {Kind: FieldKeyword, Indexed: true, Stored: true, Lookup: true},
+	}}}
+	ix, err := New(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec := SourceRecord{ID: "1", Seq: 1}
+	rec.AddText(ix.FieldID("description"), "Office Visit", true)
+	rec.AddText(ix.FieldID("fulltext"), "Office Visit", true)
+	rec.AddKeyword(ix.FieldID("work_item"), "42", false)
+	rec.AddKeyword(ix.FieldID("work_item_uid"), "42", true)
+	if _, err := ix.IndexFrom(context.Background(), SliceSource{Records: []SourceRecord{rec}}, BulkOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if got := ix.fields["fulltext"].totalTokens; got != 2 {
+		t.Fatalf("text alias duplicated token statistics: totalTokens=%d", got)
+	}
+	if got := ix.Count(Prefix{Field: "fulltext", Value: "offic"}); got != 1 {
+		t.Fatalf("text prefix query count=%d", got)
+	}
+	if got := ix.Count(Contains{Field: "fulltext", Value: "ffic"}); got != 1 {
+		t.Fatalf("text infix query count=%d", got)
+	}
+	if got := ix.Count(Suffix{Field: "fulltext", Value: "fice"}); got != 1 {
+		t.Fatalf("text suffix query count=%d", got)
+	}
+	store := FileSegmentStore{Root: filepath.Join(t.TempDir(), "index")}
+	if _, err := ix.SavePersistent(context.Background(), store, "aliases"); err != nil {
+		t.Fatal(err)
+	}
+	loaded, _, err := OpenPersistent(context.Background(), store, "aliases", cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := loaded.Count(Term{Field: "description", Value: "office"}); got != 1 {
+		t.Fatalf("alias text query count=%d", got)
+	}
+	if got := loaded.Count(Prefix{Field: "fulltext", Value: "offic"}); got != 1 {
+		t.Fatalf("restored text prefix query count=%d", got)
+	}
+	if got := loaded.Count(Contains{Field: "fulltext", Value: "ffic"}); got != 1 {
+		t.Fatalf("restored text infix query count=%d", got)
+	}
+	if got := loaded.Count(Suffix{Field: "fulltext", Value: "fice"}); got != 1 {
+		t.Fatalf("restored text suffix query count=%d", got)
+	}
+	doc, ok := loaded.Get("1")
+	if !ok || doc["description"] != "Office Visit" || doc["fulltext"] != "Office Visit" || doc["work_item"] != "42" || doc["work_item_uid"] != "42" {
+		t.Fatalf("stored aliases were not restored: ok=%v doc=%#v", ok, doc)
+	}
+}
+
+func TestTextPatternDictionaryRefreshesAfterWrites(t *testing.T) {
+	ix, err := New(Config{DisableSource: true, Schema: Schema{Fields: map[string]FieldOptions{
+		"body": {Kind: FieldText, Indexed: true, Stored: true, Lowercase: true},
+	}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	index := func(id, body string) {
+		rec := SourceRecord{ID: id}
+		rec.AddText(ix.FieldID("body"), body, true)
+		if _, err := ix.IndexFrom(context.Background(), SliceSource{Records: []SourceRecord{rec}}, BulkOptions{}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	index("1", "Office visit")
+	if got := ix.Count(Prefix{Field: "body", Value: "offic"}); got != 1 {
+		t.Fatalf("initial text prefix query count=%d", got)
+	}
+	index("2", "Official visit")
+	if got := ix.Count(Prefix{Field: "body", Value: "offic"}); got != 2 {
+		t.Fatalf("text prefix query after new term count=%d", got)
+	}
+	index("3", "Office visit")
+	if got := ix.Count(Prefix{Field: "body", Value: "offic"}); got != 3 {
+		t.Fatalf("cached text prefix query after repeated terms count=%d", got)
 	}
 }
 
@@ -103,6 +189,34 @@ func TestIndexFromSlicePopulatesDocs(t *testing.T) {
 	doc, ok := ix.Get("1")
 	if !ok || doc["term"] != "key-special" {
 		t.Fatalf("Get did not return the bulk-ingested document: ok=%v doc=%#v", ok, doc)
+	}
+}
+
+func TestStoredOnlyColumnsRemainInResultsWithoutSourceCopies(t *testing.T) {
+	ix, err := New(Config{DisableSource: true, Schema: Schema{Fields: map[string]FieldOptions{
+		"label": {Kind: FieldText, Stored: true, StoredOnly: true, Lowercase: true},
+		"body":  {Kind: FieldText, Stored: true, Lowercase: true},
+	}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	label, body := ix.FieldID("label"), ix.FieldID("body")
+	record := SourceRecord{ID: "doc-1", Seq: 1}
+	record.AddText(label, "Office Visit", true)
+	record.AddText(body, "Established patient", true)
+	if _, err := ix.IndexFrom(context.Background(), SliceSource{Records: []SourceRecord{record}}, BulkOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if got := ix.Count(Term{Field: "label", Value: "office"}); got != 0 {
+		t.Fatalf("stored-only field unexpectedly indexed terms: count=%d", got)
+	}
+	_, hits := ix.SearchInto(SearchRequest{Query: Term{Field: "body", Value: "established"}, Limit: 1, WithDocs: true}, nil)
+	if len(hits) != 1 || hits[0].Doc["label"] != "Office Visit" || hits[0].Doc["body"] != "Established patient" {
+		t.Fatalf("stored fields were not reconstructed in results: %#v", hits)
+	}
+	got, ok := ix.Get("doc-1")
+	if !ok || got["label"] != "Office Visit" || got["body"] != "Established patient" {
+		t.Fatalf("stored fields were not reconstructed by Get: ok=%v doc=%#v", ok, got)
 	}
 }
 

@@ -81,15 +81,19 @@ type IndexDef struct {
 
 // SchemaFieldDef configures one field in an index schema.
 type SchemaFieldDef struct {
-	ID        string `bcl:",id" json:"id"`
-	Kind      string `bcl:"kind" json:"kind,omitempty"`
-	Indexed   bool   `bcl:"indexed" json:"indexed,omitempty"`
-	Stored    bool   `bcl:"stored" json:"stored,omitempty"`
-	Lookup    bool   `bcl:"lookup" json:"lookup,omitempty"`
-	Lowercase bool   `bcl:"lowercase" json:"lowercase,omitempty"`
-	Prefix    bool   `bcl:"prefix" json:"prefix,omitempty"`
-	Sortable  bool   `bcl:"sortable" json:"sortable,omitempty"`
-	Facetable bool   `bcl:"facetable" json:"facetable,omitempty"`
+	ID          string `bcl:",id" json:"id"`
+	Kind        string `bcl:"kind" json:"kind,omitempty"`
+	Indexed     bool   `bcl:"indexed" json:"indexed,omitempty"`
+	Stored      bool   `bcl:"stored" json:"stored,omitempty"`
+	StoredOnly  bool   `bcl:"stored_only" json:"stored_only,omitempty"`
+	IndexAlias  string `bcl:"index_alias" json:"index_alias,omitempty"`
+	StoredAlias string `bcl:"stored_alias" json:"stored_alias,omitempty"`
+	Lookup      bool   `bcl:"lookup" json:"lookup,omitempty"`
+	TermSearch  bool   `bcl:"term_search" json:"term_search,omitempty"`
+	Lowercase   bool   `bcl:"lowercase" json:"lowercase,omitempty"`
+	Prefix      bool   `bcl:"prefix" json:"prefix,omitempty"`
+	Sortable    bool   `bcl:"sortable" json:"sortable,omitempty"`
+	Facetable   bool   `bcl:"facetable" json:"facetable,omitempty"`
 }
 
 // BulkDef holds bulk ingestion parameters for an index.
@@ -148,7 +152,7 @@ func (idx IndexDef) ToConfig() Config {
 			} else if strings.EqualFold(field.Kind, "time") {
 				kind = FieldTime
 			}
-			schema.Fields[field.ID] = FieldOptions{Kind: kind, Indexed: field.Indexed, Stored: field.Stored, Lookup: field.Lookup, Lowercase: field.Lowercase, Prefix: field.Prefix, Sortable: field.Sortable, Facetable: field.Facetable}
+			schema.Fields[field.ID] = FieldOptions{Kind: kind, Indexed: field.Indexed, Stored: field.Stored, StoredOnly: field.StoredOnly, IndexAlias: field.IndexAlias, StoredAlias: field.StoredAlias, Lookup: field.Lookup, TermSearch: field.TermSearch, Lowercase: field.Lowercase, Prefix: field.Prefix, Sortable: field.Sortable, Facetable: field.Facetable}
 		}
 	}
 	return Config{

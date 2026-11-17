@@ -17,21 +17,31 @@ const (
 )
 
 type FieldOptions struct {
-	Kind      FieldKind `json:"kind"`
-	Indexed   bool      `json:"indexed"`
-	Stored    bool      `json:"stored"`
-	Sortable  bool      `json:"sortable"`
-	Facetable bool      `json:"facetable"`
-	Lookup    bool      `json:"lookup"`
-	Prefix    bool      `json:"prefix"`
-	Suffix    bool      `json:"suffix"`
-	Ngram     bool      `json:"ngram"`
-	Fuzzy     bool      `json:"fuzzy"`
-	Phrase    bool      `json:"phrase"`
-	Lowercase bool      `json:"lowercase"`
-	Unique    bool      `json:"unique"`
-	MinGram   int       `json:"min_gram"`
-	MaxGram   int       `json:"max_gram"`
+	Kind    FieldKind `json:"kind"`
+	Indexed bool      `json:"indexed"`
+	Stored  bool      `json:"stored"`
+	// IndexAlias shares the term/postings index of another field. Use only when
+	// both fields have identical indexed values for every document.
+	IndexAlias string `json:"index_alias,omitempty"`
+	// StoredAlias shares the stored string column of another field. Use only
+	// when both fields have identical values for every document.
+	StoredAlias string `json:"stored_alias,omitempty"`
+	// StoredOnly retains the original value for result documents but does not
+	// build term, text, or derived indexes for the field.
+	StoredOnly bool `json:"stored_only,omitempty"`
+	Sortable   bool `json:"sortable"`
+	Facetable  bool `json:"facetable"`
+	Lookup     bool `json:"lookup"`
+	TermSearch bool `json:"term_search,omitempty"`
+	Prefix     bool `json:"prefix"`
+	Suffix     bool `json:"suffix"`
+	Ngram      bool `json:"ngram"`
+	Fuzzy      bool `json:"fuzzy"`
+	Phrase     bool `json:"phrase"`
+	Lowercase  bool `json:"lowercase"`
+	Unique     bool `json:"unique"`
+	MinGram    int  `json:"min_gram"`
+	MaxGram    int  `json:"max_gram"`
 	// MinPrefix/MaxPrefix bound prefix-index expansion. For large keyword
 	// fields, use MinPrefix=3 to avoid huge low-selectivity prefixes like
 	// "9" and "99". MaxPrefix<=0 means full length.

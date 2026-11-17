@@ -49,20 +49,58 @@ ADDR=:8089 go run ./cmd/lookupx serve
 
 `config/lookupx.bcl` defines the nine Clear fulltext indexes and their MySQL
 queries: `cpt`, `hcpcs`, `cpt-hm`, `dx-fac1`, `dx-fac3`, `dx-icd10`,
-`dx-icd10-pcs`, `special-fac`, and `special-pro`. Set `MYSQL_DSN` to a MySQL
-DSN with read access to the Clear lookup views and charge-master tables, then
-start the server. It loads the BCL file and streams each source into its index
-before accepting requests. The database needs the Clear views, including the
-`vw_cpt_master.is_cpt` column exposed by the latest lookup-view migration.
+`dx-icd10-pcs`, `special-fac`, and `special-pro`. The BCL fallback targets the
+local Clear database used by the Scala fulltext service. For another
+environment, set `MYSQL_DSN` to a MySQL DSN with read access to the Clear
+lookup views and charge-master tables. The server loads the BCL file and
+streams each source into its index before accepting requests. The database
+needs the Clear views, including the `vw_cpt_master.is_cpt` column exposed by
+the latest lookup-view migration.
 
 ```bash
 export MYSQL_DSN='user:password@tcp(db-host:3306)/clear?parseTime=true'
 go run ./cmd/lookupx serve -config config/lookupx.bcl
 ```
 
+The configured indexes are loaded before the server starts, and the browser
+console is embedded in the server at `/`; no `-web` flag is needed. Use
+`-web <directory>` only to serve a custom frontend build.
+Startup logs report each index's load or restore state, row counts, disk
+generation and persistence duration when applicable, and index duration.
+Search, lookup, and count requests log
+the index, query structure, hit count, and latency as key=value fields. Query
+values are omitted from routine logs. ANSI colors are automatic in a terminal;
+set `LOOKUPX_LOG_COLOR=always` or `never` to override detection.
+
+Term-search fields are configured on each index with `term_search true` inside
+its `schema_field` block. The default `term` query and the browser field chooser
+use only these fields when any are declared. The CPT indexes enable `code`,
+`code_no_period`, `description`, and `fulltext`; other indexed fields remain
+available as exact `field=value` filters. `term_field` can narrow a term query
+to one of the configured fields. Both candidate retrieval and BM25 scoring use
+this field list, avoiding work on unrelated searchable fields.
+
+```bcl
+schema_field "description" {
+  kind "text"
+  indexed true
+  term_search true
+}
+```
+
+In the earlier startup log, `generation=2` on a freshly indexed index was the
+in-memory manager revision: registration started at 1 and the initial reload
+advanced it to 2. It did not mean the second disk snapshot, so that field was
+removed from the indexed-ready event. `generation` on persisted or restored
+events identifies the actual disk snapshot and helps track or roll back index
+versions. Memory storage omits `persist_elapsed` because no disk write occurred.
+
 The same BCL file is the default for `serve`; `-config` selects another file.
 Use `-config ""` for an empty server, or `-storage disk` to persist the loaded
-indexes under `data_dir`. Set `LOOKUPX_API_KEY` to protect the HTTP endpoints.
+indexes under `data_dir` and restore saved generations on later starts. The
+persisted index is decoded into Go memory at startup; this is durable disk
+storage, not memory-mapped search. Set `LOOKUPX_API_KEY` to protect the HTTP
+endpoints.
 
 List configured indexes and check their indexed row counts:
 
@@ -77,7 +115,11 @@ Each index can be rebuilt from its configured SQL source:
 curl -X POST localhost:8089/v1/indexes/dx-icd10/reload
 ```
 
-Search a code prefix or description text. Search results include the original
+Search a code prefix or description text. Text prefix, suffix, and infix
+queries match analyzed tokens independently. They do not match byte sequences
+that span token boundaries. When optional derived postings are not configured,
+LookupX uses a lazily sorted token dictionary instead of storing every token
+pattern or scanning source documents. Search results include the original
 indexed fields by default, including the canonical code and description.
 
 ```bash
@@ -86,17 +128,27 @@ curl -X POST localhost:8089/v1/indexes/cpt/search \
   -d '{"type":"bool","should":[{"type":"prefix","field":"code","value":"992"},{"type":"prefix","field":"fulltext","value":"office"}],"min_should_match":1,"limit":10,"with_docs":true}'
 ```
 
-For a compact lookup, `term` searches across every keyword and text field in
-the index. Its words are ANDed; each other query parameter is an exact field
-filter ANDed with the term search. For example, this searches CPT codes and
-descriptions for `office` within work item 33:
+For a compact lookup, `term` searches across the index's configured term-search
+fields (or all searchable string fields when none are configured). Its words
+are ANDed; each other query parameter is an exact field filter ANDed with the
+term search. Set `term_field` to restrict term search to a specific configured
+field; it can be repeated or given a comma-separated list.
+For example, this searches only CPT descriptions, while `code=99213` performs a
+field-specific lookup using the `code` field:
 
 ```bash
-curl 'localhost:8089/v1/indexes/cpt/lookup?work_item_uid=33&term=office&limit=10'
+curl 'localhost:8089/v1/indexes/cpt/lookup?term=office&term_field=description&work_item_uid=33&limit=10'
+curl 'localhost:8089/v1/indexes/cpt/lookup?code=99213&limit=10'
 ```
 
 Multiple term words can match across different fields, and can be combined
 with additional exact filters such as `charge_type=ED_FACILITY`.
+
+For a large fulltext corpus, Go's runtime memory target can lower RSS at some
+additional indexing CPU cost. On the nine-index Clear corpus,
+`GOGC=50 GOMEMLIMIT=2GiB` reduced indexing peak RSS from about 3.3 GiB to
+2.0 GiB while keeping the measured index-load wall time near 12 seconds. These
+are runtime targets, not hard process limits.
 
 ## HTTP examples
 
@@ -982,7 +1034,11 @@ data/indexes/dataset_a/
     index.gob
 ```
 
-The `CURRENT` file is atomically advanced after a successful save. This supports blue/green index generations and rollback by changing `CURRENT` to a previous generation.
+The `CURRENT` file is atomically advanced after a successful save. Saves stream
+a consistent read-locked view and preserve sparse postings compactly. This
+supports blue/green index generations and rollback by changing `CURRENT` to a
+previous generation. Saving does not automatically call `Freeze`; build a
+composite accelerator explicitly only for indexes that use composite queries.
 
 ### Composite Dataset / DatasetB / DatasetC lookup
 

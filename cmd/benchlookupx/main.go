@@ -20,15 +20,16 @@ type row struct {
 	Fields map[string]string `json:"fields"`
 }
 type query struct {
-	Type   string            `json:"type"`
-	Name   string            `json:"name"`
-	Fields map[string]string `json:"fields"`
-	Field  string            `json:"field,omitempty"`
-	Value  string            `json:"value,omitempty"`
-	GTE    string            `json:"gte,omitempty"`
-	LTE    string            `json:"lte,omitempty"`
-	Offset int               `json:"offset,omitempty"`
-	Limit  int               `json:"limit"`
+	Type       string            `json:"type"`
+	Name       string            `json:"name"`
+	Fields     map[string]string `json:"fields"`
+	Field      string            `json:"field,omitempty"`
+	Value      string            `json:"value,omitempty"`
+	GTE        string            `json:"gte,omitempty"`
+	LTE        string            `json:"lte,omitempty"`
+	Offset     int               `json:"offset,omitempty"`
+	Limit      int               `json:"limit"`
+	WorkItemID string            `json:"work_item_id,omitempty"`
 }
 type result struct {
 	Engine          string    `json:"engine"`
@@ -41,10 +42,11 @@ type result struct {
 	Queries         []qresult `json:"queries"`
 }
 type qresult struct {
-	Name     string `json:"name"`
-	AvgNanos int64  `json:"avg_nanos"`
-	Hits     int    `json:"hits"`
-	Loops    int    `json:"loops"`
+	Name     string   `json:"name"`
+	AvgNanos int64    `json:"avg_nanos"`
+	Hits     int      `json:"hits"`
+	TopIDs   []string `json:"top_ids,omitempty"`
+	Loops    int      `json:"loops"`
 }
 
 func main() {
@@ -147,6 +149,9 @@ func main() {
 			}
 			query = lookup.Term{Field: "__composite", Value: strings.Join(vals, "\x1f")}
 		}
+		if q.WorkItemID != "" {
+			query = lookup.Bool{Must: []lookup.Query{query}, Filter: []lookup.Query{lookup.Term{Field: "work_item_id", Value: q.WorkItemID}}}
+		}
 		offset := 0
 		if q.Type == "page" {
 			offset = q.Offset
@@ -160,7 +165,11 @@ func main() {
 			_, dst = ix.SearchInto(lookup.SearchRequest{Query: query, Limit: q.Limit, Offset: offset}, dst[:0])
 			hits = len(dst)
 		}
-		qr = append(qr, qresult{Name: q.Name, AvgNanos: time.Since(start).Nanoseconds() / int64(*loops), Hits: hits, Loops: *loops})
+		ids := make([]string, len(dst))
+		for i := range dst {
+			ids[i] = dst[i].ID
+		}
+		qr = append(qr, qresult{Name: q.Name, AvgNanos: time.Since(start).Nanoseconds() / int64(*loops), Hits: hits, TopIDs: ids, Loops: *loops})
 	}
 	var heapDelta uint64
 	if mem.HeapAlloc > before.HeapAlloc {

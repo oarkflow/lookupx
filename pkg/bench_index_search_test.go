@@ -8,8 +8,8 @@ import (
 
 func perfConfig() Config {
 	return Config{DisableSource: true, InitialCapacity: 10000, Schema: Schema{Fields: map[string]FieldOptions{
-		"title":      {Kind: FieldText, Indexed: true, Lookup: true, Prefix: true, Suffix: true, Ngram: true, Fuzzy: true, Lowercase: true, MinGram: 3, MaxGram: 4},
-		"body":       {Kind: FieldText, Indexed: true, Lookup: true, Lowercase: true, Phrase: true},
+		"title":      {Kind: FieldText, Indexed: true, Lookup: true, Prefix: true, Suffix: true, Ngram: true, Fuzzy: true, Lowercase: true, TermSearch: true, MinGram: 3, MaxGram: 4},
+		"body":       {Kind: FieldText, Indexed: true, Lookup: true, Lowercase: true, Phrase: true, TermSearch: true},
 		"email":      {Kind: FieldKeyword, Lookup: true, Prefix: true, Suffix: true, Ngram: true, Lowercase: true, MinGram: 3, MaxGram: 4},
 		"tenant":     {Kind: FieldKeyword, Lookup: true, Lowercase: true},
 		"status":     {Kind: FieldKeyword, Lookup: true, Lowercase: true},
@@ -237,6 +237,14 @@ func BenchmarkSearch(b *testing.B) {
 	})
 	b.Run("GlobalTermBM25", func(b *testing.B) {
 		q := GlobalTerm{Words: []string{"engine"}}
+		b.ReportAllocs()
+		req := SearchRequest{Query: q, Limit: 20, WithDocs: true}
+		for i := 0; i < b.N; i++ {
+			_, hits = ix.SearchInto(req, hits)
+		}
+	})
+	b.Run("GlobalTermBM25AllFields", func(b *testing.B) {
+		q := GlobalTerm{Words: []string{"engine"}, Fields: []string{"title", "body", "email", "tenant", "status", "sku", "domain", "ip"}}
 		b.ReportAllocs()
 		req := SearchRequest{Query: q, Limit: 20, WithDocs: true}
 		for i := 0; i < b.N; i++ {

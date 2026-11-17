@@ -140,7 +140,7 @@ const App = (() => {
       <section class="search-panel" aria-label="Search controls">
         <form class="search-bar" onsubmit="event.preventDefault(); App.doLookup()">
           <div class="search-control search-index"><label class="control-label" for="lookup-index">INDEX</label>${indexSelect('lookup-index')}</div>
-          <div class="search-control term-control"><label class="control-label" for="lookup-term">SEARCH TERM</label><input id="lookup-term" type="search" placeholder="Search all text columns…" aria-label="Full-text search term" /></div>
+          <div class="search-control term-control"><label class="control-label" for="lookup-term">SEARCH TERM</label><div class="term-input-row"><input id="lookup-term" type="search" placeholder="Search all fields or enter code=99213" aria-label="Full-text search term" /><select id="lookup-term-field" aria-label="Search term field"><option value="">All searchable fields</option></select></div></div>
           <label class="search-fuzzy"><input id="lookup-fuzzy" type="checkbox" /> Fuzzy</label>
           <label class="search-fuzzy"><input id="lookup-profile" type="checkbox" /> Profile</label>
           <div class="search-control limit-control"><label class="control-label" for="lookup-limit">LIMIT</label><input id="lookup-limit" type="number" min="1" max="500" value="25" aria-label="Result limit" /></div>
@@ -162,6 +162,18 @@ const App = (() => {
     try {
       const data = await api('GET', `/v1/indexes/${encodeURIComponent(id)}/schema`);
       searchSchema = data.fields || {};
+      const termField = $('#lookup-term-field');
+      if (termField) {
+        const hasConfiguredTermFields = Object.values(searchSchema).some(info => info.term_search);
+        const searchable = Object.entries(searchSchema)
+          .filter(([, info]) => hasConfiguredTermFields
+            ? info.term_search
+            : [0, 1, 4].includes(Number(info.kind)))
+          .map(([name]) => name)
+          .sort((a, b) => a.localeCompare(b));
+        termField.innerHTML = '<option value="">All searchable fields</option>' + searchable
+          .map(name => `<option value="${escHtml(name)}">${escHtml(name)}</option>`).join('');
+      }
       columnFilterValues = {};
       const rows = $('#filter-rows');
       rows.innerHTML = '';
@@ -274,27 +286,27 @@ const App = (() => {
   function renderHits(hits) {
     if (!hits || !hits.length) return empty('No results.');
 
-    // One column per field actually present across the returned docs, in
-    // first-seen order, so the table shows real data instead of a raw blob.
-    const fieldOrder = Object.keys(searchSchema).filter(name => name !== 'id');
+    // One column per document field actually present, including a database
+    // field named "id". The hit's internal index ID is not a document field
+    // and is intentionally never rendered.
+    const fieldOrder = Object.keys(searchSchema);
     const seen = new Set(fieldOrder);
     let anyDoc = false;
     for (const h of hits) {
       if (!h.doc) continue;
       anyDoc = true;
       for (const k of Object.keys(h.doc)) {
-        if (k === 'id') continue;
         if (!seen.has(k)) { seen.add(k); fieldOrder.push(k); }
       }
     }
 
     let html = `<div class="card results-card"><div class="card-header">Matching documents <span class="results-count">${hits.length}</span></div>`;
     if (!anyDoc) {
-      html += `<p class="text-xs text-gray-500 mb-2">This index doesn't store full documents (created with DisableSource), so only ID and score are available.</p>`;
+      html += `<p class="text-xs text-gray-500 mb-2">This index doesn't store full documents, so the table can only show relevance scores.</p>`;
     }
     html += `<div class="table-wrap"><table><thead>
-      <tr><th>ID</th><th>Score</th>${fieldOrder.map(f => `<th>${escHtml(f)}</th>`).join('')}</tr>
-      <tr class="column-filter-row"><th></th><th></th>${fieldOrder.map(f => {
+      <tr><th>Score</th>${fieldOrder.map(f => `<th>${escHtml(f)}</th>`).join('')}</tr>
+      <tr class="column-filter-row"><th></th>${fieldOrder.map(f => {
         const kind = fieldKind(f);
         const numeric = [2, 3].includes(kind);
         const type = numeric ? 'number' : kind === 5 ? 'date' : 'search';
@@ -305,7 +317,6 @@ const App = (() => {
     </thead><tbody>`;
     for (const h of hits) {
       html += `<tr>
-        <td class="font-mono text-sm">${escHtml(h.id)}</td>
         <td>${h.score !== undefined ? h.score.toFixed(4) : '—'}</td>
         ${fieldOrder.map(f => `<td class="text-sm max-w-xs truncate" title="${h.doc && h.doc[f] !== undefined ? escHtml(String(h.doc[f])) : ''}">${fmtCell(h.doc && h.doc[f])}</td>`).join('')}
       </tr>`;
@@ -320,8 +331,18 @@ const App = (() => {
     const limit = parseInt($('#lookup-limit').value) || 25;
     const params = new URLSearchParams();
 	const term = $('#lookup-term').value.trim();
-	if (term) params.set('term', term);
-	if (term && $('#lookup-fuzzy').checked) params.set('fuzzy', 'true');
+	const fieldValueAt = term.indexOf('=');
+	const fieldValueName = fieldValueAt > 0 ? term.slice(0, fieldValueAt).trim() : '';
+	const isFieldValue = !!fieldValueName && Object.prototype.hasOwnProperty.call(searchSchema, fieldValueName);
+	if (isFieldValue) {
+	  const fieldValue = term.slice(fieldValueAt + 1).trim();
+	  if (fieldValue) params.set(fieldValueName, fieldValue);
+	} else if (term) {
+	  params.set('term', term);
+	  const termField = $('#lookup-term-field').value;
+	  if (termField) params.set('term_field', termField);
+	  if ($('#lookup-fuzzy').checked) params.set('fuzzy', 'true');
+	}
 	if ($('#lookup-profile').checked) params.set('profile', 'true');
     for (const row of $$('.filter-row')) {
       const fieldName = row.querySelector('.filter-field').value;

@@ -1,11 +1,14 @@
 package pkg
 
 import (
+	"bufio"
+	"compress/gzip"
 	"context"
 	"encoding/gob"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -405,7 +408,6 @@ func (s FileSegmentStore) SaveIndex(ctx context.Context, indexID string, ix *Ind
 	if ix == nil {
 		return PersistentManifest{}, errors.New("nil index")
 	}
-	_ = ix.Freeze()
 	base := s.dir(indexID)
 	if err := os.MkdirAll(base, 0755); err != nil {
 		return PersistentManifest{}, err
@@ -415,16 +417,12 @@ func (s FileSegmentStore) SaveIndex(ctx context.Context, indexID string, ix *Ind
 	if err := os.MkdirAll(genDir, 0755); err != nil {
 		return PersistentManifest{}, err
 	}
-	dump, err := ix.persistentDump()
-	if err != nil {
-		return PersistentManifest{}, err
-	}
 	dataPath := filepath.Join(genDir, "index.gob")
 	f, err := os.Create(dataPath + ".tmp")
 	if err != nil {
 		return PersistentManifest{}, err
 	}
-	if err = gob.NewEncoder(f).Encode(dump); err == nil {
+	if err = ix.encodePersistent(f); err == nil {
 		err = f.Sync()
 		if err == nil {
 			err = f.Close()
@@ -440,7 +438,7 @@ func (s FileSegmentStore) SaveIndex(ctx context.Context, indexID string, ix *Ind
 	if err = os.Rename(dataPath+".tmp", dataPath); err != nil {
 		return PersistentManifest{}, err
 	}
-	man := PersistentManifest{IndexID: cleanIndexID(indexID), Generation: gen, CreatedAt: time.Now().UTC(), Docs: uint64(ix.Stats().LiveDocs), Path: genDir, Frozen: ix.IsFrozen(), Format: "lookupx-gob-segment-v1"}
+	man := PersistentManifest{IndexID: cleanIndexID(indexID), Generation: gen, CreatedAt: time.Now().UTC(), Docs: uint64(ix.Stats().LiveDocs), Path: genDir, Frozen: ix.IsFrozen(), Format: "lookupx-gob-segment-v3-gzip-no-ext-map"}
 	mb, _ := json.MarshalIndent(man, "", "  ")
 	if err = os.WriteFile(filepath.Join(genDir, "manifest.json"), mb, 0644); err != nil {
 		return PersistentManifest{}, err
@@ -475,7 +473,7 @@ func (s FileSegmentStore) LoadIndex(ctx context.Context, indexID string, cfg Con
 	}
 	defer f.Close()
 	var dump persistentDump
-	if err = gob.NewDecoder(f).Decode(&dump); err != nil {
+	if err = decodePersistent(f, &dump); err != nil {
 		return nil, man, err
 	}
 	if cfg.Schema.Fields != nil {
@@ -535,26 +533,31 @@ type persistentDump struct {
 	NumericDense  map[string][]float64
 	NumericExists map[string][]uint64
 	Strings       map[string]map[DocID]string
+	StringColumns map[string][]string
 	IP4           map[string]map[DocID]uint32
 	Vectors       map[string]map[DocID][]float64
 	Composite     *compositeDump
 	Frozen        bool
 }
 type fieldDump struct {
-	Terms       map[string][]uint64
-	TermOne     map[string]DocID
-	Prefix      map[string][]uint64
-	PrefixOne   map[string]DocID
-	Suffix      map[string][]uint64
-	SuffixOne   map[string]DocID
-	Ngram       map[string][]uint64
-	NgramOne    map[string]DocID
-	Unique      map[string]DocID
-	Exists      []uint64
-	DocLengths  []uint32
-	TotalTokens uint64
-	Positions   map[string]map[DocID][]uint32
-	ExtraTF     map[string]map[DocID]uint16
+	Terms        map[string][]uint64
+	TermsSparse  map[string][]DocID
+	TermOne      map[string]DocID
+	Prefix       map[string][]uint64
+	PrefixSparse map[string][]DocID
+	PrefixOne    map[string]DocID
+	Suffix       map[string][]uint64
+	SuffixSparse map[string][]DocID
+	SuffixOne    map[string]DocID
+	Ngram        map[string][]uint64
+	NgramSparse  map[string][]DocID
+	NgramOne     map[string]DocID
+	Unique       map[string]DocID
+	Exists       []uint64
+	DocLengths   []uint32
+	TotalTokens  uint64
+	Positions    map[string]map[DocID][]uint32
+	ExtraTF      map[string]map[DocID]uint16
 }
 type compositeDump struct {
 	Terms     map[string]uint32
@@ -562,6 +565,7 @@ type compositeDump struct {
 	Sources   map[string]uint16
 	RevSource []string
 	Postings  map[TupleKey][]uint64
+	Sparse    map[TupleKey][]DocID
 	Singles   map[TupleKey]DocID
 }
 
@@ -589,9 +593,15 @@ func (ix *Index) persistentDump() (*persistentDump, error) {
 		d.NumericExists[k] = v.Words(ix.nextDocID)
 	}
 	for k, v := range ix.strings {
+		opt := ix.cfg.Schema.Fields[k]
+		if opt.StoredAlias != "" || opt.IndexAlias != "" {
+			continue
+		}
 		m := map[DocID]string{}
-		for a, b := range v {
-			m[a] = b
+		for i, b := range v {
+			if i > 0 && b != "" {
+				m[DocID(i)] = b
+			}
 		}
 		d.Strings[k] = m
 	}
@@ -618,73 +628,186 @@ func (ix *Index) persistentDump() (*persistentDump, error) {
 	ex.mu.RUnlock()
 	return d, nil
 }
+
+// encodePersistent streams a point-in-time view of the index to disk while
+// holding a read lock. The view reuses immutable index maps/slices, avoiding
+// the multi-gigabyte duplicate snapshot that a deep copy would create. Writers
+// pause until encoding finishes so the on-disk generation remains consistent.
+func (ix *Index) encodePersistent(w io.Writer) error {
+	ix.mu.RLock()
+	defer ix.mu.RUnlock()
+	cfg := ix.cfg
+	cfg.Clock, cfg.EnableWAL, cfg.WALPath = nil, false, ""
+	d := &persistentDump{
+		// DocToExt already contains every external ID in DocID order. Omitting
+		// ExtToDoc avoids writing a second copy of the same keys to disk; restore
+		// rebuilds the live-ID lookup map for mutable indexes.
+		Config: cfg, NextDocID: ix.nextDocID,
+		DocToExt: ix.docToExt, Deleted: ix.deleted.words, Live: ix.live.words,
+		Expires: ix.expires, HasTTL: ix.hasTTL, HasDeletes: ix.hasDeletes,
+		Fields:       make(map[string]fieldDump, len(ix.fields)),
+		NumericDense: ix.numericDense, NumericExists: make(map[string][]uint64, len(ix.numericExists)),
+		Strings: map[string]map[DocID]string{}, StringColumns: make(map[string][]string, len(ix.strings)),
+		IP4: ix.ip4, Vectors: ix.vectors,
+	}
+	if !ix.cfg.DisableSource {
+		d.Docs = ix.docs
+	}
+	for name, fi := range ix.fields {
+		if ix.cfg.Schema.Fields[name].IndexAlias != "" {
+			continue
+		}
+		terms, termsSparse := bitmapMapView(fi.terms)
+		prefix, prefixSparse := bitmapMapView(fi.prefix)
+		suffix, suffixSparse := bitmapMapView(fi.suffix)
+		ngram, ngramSparse := bitmapMapView(fi.ngram)
+		d.Fields[name] = fieldDump{Terms: terms, TermsSparse: termsSparse, TermOne: fi.termOne, Prefix: prefix, PrefixSparse: prefixSparse, PrefixOne: fi.prefixOne, Suffix: suffix, SuffixSparse: suffixSparse, SuffixOne: fi.suffixOne, Ngram: ngram, NgramSparse: ngramSparse, NgramOne: fi.ngramOne, Unique: fi.unique, Exists: fi.exists.words, DocLengths: fi.docLengths, TotalTokens: fi.totalTokens, Positions: fi.positions, ExtraTF: fi.extraTF}
+	}
+	for name, bm := range ix.numericExists {
+		d.NumericExists[name] = bm.words
+	}
+	for name, col := range ix.strings {
+		opt := ix.cfg.Schema.Fields[name]
+		if opt.StoredAlias == "" && opt.IndexAlias == "" {
+			d.StringColumns[name] = col
+		}
+	}
+	ex := extras(ix)
+	ex.mu.RLock()
+	d.Frozen = ex.frozen
+	if ex.composite != nil {
+		d.Composite = dumpComposite(ex.composite)
+	}
+	ex.mu.RUnlock()
+	compressed, err := gzip.NewWriterLevel(w, gzip.BestSpeed)
+	if err != nil {
+		return err
+	}
+	if err = gob.NewEncoder(compressed).Encode(d); err != nil {
+		_ = compressed.Close()
+		return err
+	}
+	return compressed.Close()
+}
+
+// decodePersistent accepts both the original raw gob generation and the
+// compressed streaming format so existing indexes remain readable.
+func decodePersistent(r io.Reader, dst *persistentDump) error {
+	br := bufio.NewReader(r)
+	magic, err := br.Peek(2)
+	if err != nil && err != io.EOF {
+		return err
+	}
+	if len(magic) == 2 && magic[0] == 0x1f && magic[1] == 0x8b {
+		zr, err := gzip.NewReader(br)
+		if err != nil {
+			return err
+		}
+		defer zr.Close()
+		return gob.NewDecoder(zr).Decode(dst)
+	}
+	return gob.NewDecoder(br).Decode(dst)
+}
+
+func bitmapMapView(src map[string]*Bitmap) (map[string][]uint64, map[string][]DocID) {
+	dst := make(map[string][]uint64, len(src))
+	sparse := make(map[string][]DocID)
+	for key, bm := range src {
+		if bm == nil {
+			continue
+		}
+		if bm.isDense() {
+			dst[key] = bm.words
+		} else if len(bm.sparse) != 0 {
+			sparse[key] = bm.sparse
+		}
+	}
+	return dst, sparse
+}
+
 func (ix *Index) restorePersistentDump(d *persistentDump) error {
 	ix.mu.Lock()
 	defer ix.mu.Unlock()
 	ix.nextDocID = d.NextDocID
-	ix.extToDoc = copyMapStringDoc(d.ExtToDoc)
-	ix.docToExt = append([]string(nil), d.DocToExt...)
+	ix.extToDoc = d.ExtToDoc
+	ix.docToExt = d.DocToExt
 	if d.Config.DisableSource {
 		ix.docs = nil
 	} else {
-		ix.docs = make([]Document, len(ix.docToExt))
-		for i := range d.Docs {
-			if i < len(ix.docs) {
-				ix.docs[i] = cloneDoc(d.Docs[i])
-			}
-		}
+		ix.docs = d.Docs
 	}
-	ix.deleted = &Bitmap{words: append([]uint64(nil), d.Deleted...)}
-	ix.live = &Bitmap{words: append([]uint64(nil), d.Live...)}
-	ix.expires = copyMapDocInt64(d.Expires)
+	ix.deleted = &Bitmap{words: d.Deleted}
+	ix.live = &Bitmap{words: d.Live}
+	ix.expires = d.Expires
 	ix.hasTTL = d.HasTTL
 	ix.hasDeletes = d.HasDeletes
-	for name, fd := range d.Fields {
-		if fi := ix.fields[name]; fi != nil {
-			fi.terms = loadBitmapMap(fd.Terms)
-			fi.termOne = copyMapStringDoc(fd.TermOne)
-			fi.prefix = loadBitmapMap(fd.Prefix)
-			fi.prefixOne = copyMapStringDoc(fd.PrefixOne)
-			fi.suffix = loadBitmapMap(fd.Suffix)
-			fi.suffixOne = copyMapStringDoc(fd.SuffixOne)
-			fi.ngram = loadBitmapMap(fd.Ngram)
-			fi.ngramOne = copyMapStringDoc(fd.NgramOne)
-			fi.unique = copyMapStringDoc(fd.Unique)
-			fi.exists = &Bitmap{words: append([]uint64(nil), fd.Exists...)}
-			fi.docLengths = append([]uint32(nil), fd.DocLengths...)
-			fi.totalTokens = fd.TotalTokens
-			fi.positions = copyPositions(fd.Positions)
-			fi.extraTF = copyExtraTF(fd.ExtraTF)
+	if ix.extToDoc == nil && !ix.cfg.AppendOnly {
+		ix.extToDoc = make(map[string]DocID, len(ix.docToExt))
+		for i, externalID := range ix.docToExt {
+			if externalID == "" || ix.isDeletedOrExpiredLocked(DocID(i)) {
+				continue
+			}
+			ix.extToDoc[externalID] = DocID(i)
 		}
 	}
-	ix.numericDense = map[string][]float64{}
-	for k, v := range d.NumericDense {
-		ix.numericDense[k] = append([]float64(nil), v...)
+	for name, fd := range d.Fields {
+		if fi := ix.fields[name]; fi != nil {
+			fi.terms = adoptBitmapMapSparse(fd.Terms, fd.TermsSparse)
+			fi.termOne = fd.TermOne
+			fi.prefix = adoptBitmapMapSparse(fd.Prefix, fd.PrefixSparse)
+			fi.prefixOne = fd.PrefixOne
+			fi.suffix = adoptBitmapMapSparse(fd.Suffix, fd.SuffixSparse)
+			fi.suffixOne = fd.SuffixOne
+			fi.ngram = adoptBitmapMapSparse(fd.Ngram, fd.NgramSparse)
+			fi.ngramOne = fd.NgramOne
+			fi.unique = fd.Unique
+			fi.exists = &Bitmap{words: fd.Exists}
+			fi.docLengths = fd.DocLengths
+			fi.totalTokens = fd.TotalTokens
+			fi.positions = fd.Positions
+			fi.extraTF = fd.ExtraTF
+		}
 	}
+	ix.numericDense = d.NumericDense
 	ix.numericExists = map[string]*Bitmap{}
 	for k, v := range d.NumericExists {
-		ix.numericExists[k] = &Bitmap{words: append([]uint64(nil), v...)}
+		ix.numericExists[k] = &Bitmap{words: v}
 	}
-	ix.strings = map[string]map[DocID]string{}
+	for i := range ix.fieldList {
+		ix.fieldList[i].numericDense = ix.numericDense[ix.fieldList[i].name]
+		ix.fieldList[i].numericEx = ix.numericExists[ix.fieldList[i].name]
+	}
+	ix.strings = map[string][]string{}
 	for k, v := range d.Strings {
-		m := map[DocID]string{}
+		m := make([]string, int(ix.nextDocID))
 		for a, b := range v {
-			m[a] = b
+			if int(a) < len(m) {
+				m[a] = b
+			}
 		}
 		ix.strings[k] = m
 	}
-	ix.ip4 = map[string]map[DocID]uint32{}
-	for k, v := range d.IP4 {
-		m := map[DocID]uint32{}
-		for a, b := range v {
-			m[a] = b
-		}
-		ix.ip4[k] = m
+	for k, v := range d.StringColumns {
+		ix.strings[k] = v
 	}
-	ix.vectors = map[string]map[DocID][]float64{}
+	for i := range ix.fieldList {
+		sf := &ix.fieldList[i]
+		if sf.opt.IndexAlias != "" {
+			if col := ix.strings[sf.opt.IndexAlias]; col != nil && (sf.opt.Stored || sf.opt.Facetable || sf.special == specialDomain || sf.special == specialURL) {
+				ix.strings[sf.name] = col
+			}
+		}
+		if sf.opt.StoredAlias != "" {
+			if col := ix.strings[sf.opt.StoredAlias]; col != nil && (sf.opt.Stored || sf.opt.Facetable || sf.special == specialDomain || sf.special == specialURL) {
+				ix.strings[sf.name] = col
+			}
+		}
+		sf.stringsCol = ix.strings[sf.name]
+	}
+	ix.ip4 = d.IP4
+	ix.vectors = d.Vectors
 	ix.anns = map[string]*VectorANN{}
 	for k, v := range d.Vectors {
-		m := map[DocID][]float64{}
 		opt := ix.cfg.Schema.Fields[k]
 		if opt.Dim == 0 {
 			for _, b := range v {
@@ -694,12 +817,10 @@ func (ix *Index) restorePersistentDump(d *persistentDump) error {
 		}
 		ann := newVectorANNWithOptions(opt, len(v))
 		for a, b := range v {
-			m[a] = append([]float64(nil), b...)
 			if !ix.isDeletedOrExpiredLocked(a) {
 				ann.Add(a, b)
 			}
 		}
-		ix.vectors[k] = m
 		ix.anns[k] = ann
 	}
 	ex := extras(ix)
@@ -751,6 +872,23 @@ func loadBitmapMap(in map[string][]uint64) map[string]*Bitmap {
 	}
 	return out
 }
+func loadBitmapMapSparse(dense map[string][]uint64, sparse map[string][]DocID) map[string]*Bitmap {
+	out := loadBitmapMap(dense)
+	for key, ids := range sparse {
+		out[key] = &Bitmap{sparse: append([]DocID(nil), ids...)}
+	}
+	return out
+}
+func adoptBitmapMapSparse(dense map[string][]uint64, sparse map[string][]DocID) map[string]*Bitmap {
+	out := make(map[string]*Bitmap, len(dense)+len(sparse))
+	for key, words := range dense {
+		out[key] = &Bitmap{words: words}
+	}
+	for key, ids := range sparse {
+		out[key] = &Bitmap{sparse: ids}
+	}
+	return out
+}
 func copyMapStringDoc(in map[string]DocID) map[string]DocID {
 	out := map[string]DocID{}
 	for k, v := range in {
@@ -769,22 +907,30 @@ func dumpComposite(c *TupleCompositeIndex) *compositeDump {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	p := map[TupleKey][]uint64{}
+	sparse := map[TupleKey][]DocID{}
 	for k, b := range c.postings {
-		p[k] = b.Words(0)
+		if b.isDense() {
+			p[k] = append([]uint64(nil), b.words...)
+		} else {
+			sparse[k] = append([]DocID(nil), b.sparse...)
+		}
 	}
-	return &compositeDump{Terms: copyMapStringU32(c.terms), RevTerms: append([]string(nil), c.revTerms...), Sources: copyMapStringU16(c.sources), RevSource: append([]string(nil), c.revSource...), Postings: p, Singles: copyMapKeyDoc(c.singles)}
+	return &compositeDump{Terms: copyMapStringU32(c.terms), RevTerms: append([]string(nil), c.revTerms...), Sources: copyMapStringU16(c.sources), RevSource: append([]string(nil), c.revSource...), Postings: p, Sparse: sparse, Singles: copyMapKeyDoc(c.singles)}
 }
 func loadComposite(d *compositeDump) *TupleCompositeIndex {
 	c := NewTupleCompositeIndex()
-	c.terms = copyMapStringU32(d.Terms)
-	c.revTerms = append([]string(nil), d.RevTerms...)
-	c.sources = copyMapStringU16(d.Sources)
-	c.revSource = append([]string(nil), d.RevSource...)
+	c.terms = d.Terms
+	c.revTerms = d.RevTerms
+	c.sources = d.Sources
+	c.revSource = d.RevSource
 	c.postings = map[TupleKey]*Bitmap{}
 	for k, w := range d.Postings {
-		c.postings[k] = &Bitmap{words: append([]uint64(nil), w...)}
+		c.postings[k] = &Bitmap{words: w}
 	}
-	c.singles = copyMapKeyDoc(d.Singles)
+	for k, ids := range d.Sparse {
+		c.postings[k] = &Bitmap{sparse: ids}
+	}
+	c.singles = d.Singles
 	return c
 }
 func copyMapStringU32(in map[string]uint32) map[string]uint32 {

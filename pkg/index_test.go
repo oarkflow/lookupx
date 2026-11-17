@@ -1,6 +1,7 @@
 package pkg
 
 import (
+	"fmt"
 	"path/filepath"
 	"testing"
 	"time"
@@ -64,6 +65,37 @@ func TestBoolAndFilters(t *testing.T) {
 	}
 }
 
+func TestFilteredBroadTextPrefixMatchesOnlyCandidates(t *testing.T) {
+	ix, err := New(Config{Schema: Schema{Fields: map[string]FieldOptions{
+		"body":  {Kind: FieldText, Indexed: true, Lowercase: true},
+		"group": {Kind: FieldKeyword, Indexed: true, Lowercase: true},
+	}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 200; i++ {
+		group := "other"
+		if i == 137 {
+			group = "target"
+		}
+		if err := ix.Upsert(fmt.Sprintf("row-%d", i), Document{"body": "office outpatient observation", "group": group}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	query := Bool{
+		Should: []Query{Prefix{Field: "body", Value: "o"}},
+		Filter: []Query{Term{Field: "group", Value: "target"}},
+	}
+	res := ix.Search(SearchRequest{Query: query, Limit: 10, WithDocs: true})
+	if len(res.Hits) != 1 || res.Hits[0].ID != "row-137" {
+		t.Fatalf("filtered broad prefix hits = %+v, want only row-137", res.Hits)
+	}
+	unfiltered := ix.Search(SearchRequest{Query: Prefix{Field: "body", Value: "o"}, Limit: 10})
+	if unfiltered.Total != 200 || len(unfiltered.Hits) != 10 {
+		t.Fatalf("broad prefix total/hits = %d/%d, want 200/10", unfiltered.Total, len(unfiltered.Hits))
+	}
+}
+
 func TestRangeTermsMissingSortFacetsUniqueBatchAnalyze(t *testing.T) {
 	ix := testIndex(t)
 	seed(t, ix)
@@ -119,29 +151,5 @@ func TestDeleteTTLAndSnapshotWAL(t *testing.T) {
 	}
 	if res := ix2.Search(SearchRequest{Query: MatchAll{}, Limit: 10}); res.Total != 2 {
 		t.Fatalf("snapshot got %d", res.Total)
-	}
-}
-func disabledBenchmarkExactLookup(b *testing.B) {
-	ix := testIndex(&testing.T{})
-	for i := 0; i < 10000; i++ {
-		_ = ix.Upsert(string(rune(i+1)), Document{"email": "user" + string(rune(i+1)) + "@example.com", "tenant": "t", "status": "active"})
-	}
-	b.ReportAllocs()
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		_ = ix.Search(SearchRequest{Query: Term{"tenant", "t"}, Limit: 10})
-	}
-}
-
-func disabledBenchmarkCollectTermHotPath(b *testing.B) {
-	ix := testIndex(&testing.T{})
-	for i := 0; i < 10000; i++ {
-		_ = ix.Upsert(string(rune(i+1)), Document{"tenant": "t", "status": "active"})
-	}
-	dst := make([]string, 0, 10000)
-	b.ReportAllocs()
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		dst = ix.CollectTerm("tenant", "t", dst)
 	}
 }

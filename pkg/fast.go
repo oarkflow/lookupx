@@ -97,6 +97,9 @@ func (w *RowWriter) keyword(fid FieldID, value string, normalized bool) {
 	if sf == nil {
 		return
 	}
+	if sf.opt.IndexAlias != "" {
+		return
+	}
 	v := value
 	if !normalized {
 		v = normalizeStringByKind(sf.special, value, sf.opt.Lowercase)
@@ -105,8 +108,11 @@ func (w *RowWriter) keyword(fid FieldID, value string, normalized bool) {
 		return
 	}
 	sf.fi.exists.AddUnsafe(w.did)
-	if col := sf.stringsCol; col != nil {
-		col[w.did] = v
+	if sf.stringsCol != nil {
+		w.ix.setStringColumnLocked(sf.name, w.did, v)
+	}
+	if sf.opt.StoredOnly {
+		return
 	}
 	if sf.special == specialIP {
 		if ip, ok := parseIPv4(v); ok {
@@ -139,6 +145,9 @@ func (w *RowWriter) text(fid FieldID, value string, normalized bool) {
 	if sf == nil {
 		return
 	}
+	if sf.opt.IndexAlias != "" {
+		return
+	}
 	v := value
 	if !normalized {
 		v = normalizeStringByKind(sf.special, value, sf.opt.Lowercase)
@@ -147,8 +156,11 @@ func (w *RowWriter) text(fid FieldID, value string, normalized bool) {
 		return
 	}
 	sf.fi.exists.AddUnsafe(w.did)
-	if col := sf.stringsCol; col != nil {
-		col[w.did] = v
+	if sf.stringsCol != nil {
+		w.ix.setStringColumnLocked(sf.name, w.did, v)
+	}
+	if sf.opt.StoredOnly {
+		return
 	}
 	if sf.analyzeFn != nil && hasNoSynonyms() {
 		w.ix.tokens = sf.analyzeFn(v, w.ix.tokens)
@@ -313,7 +325,7 @@ func (bw *BatchWriter) Commit() error {
 
 type KeywordField struct {
 	sf  *schemaField
-	col map[DocID]string
+	col []string
 }
 type NumericField struct {
 	name   string
@@ -360,7 +372,7 @@ func (w *RowWriter) keywordH(h KeywordField, value string, normalized bool) {
 	}
 	h.sf.fi.exists.AddUnsafe(w.did)
 	if h.col != nil {
-		h.col[w.did] = v
+		w.ix.setStringColumnLocked(h.sf.name, w.did, v)
 	}
 	if h.sf.special == specialIP {
 		if ip, ok := parseIPv4(v); ok {
@@ -397,7 +409,7 @@ func (w *RowWriter) textH(h KeywordField, value string, normalized bool) {
 	}
 	h.sf.fi.exists.AddUnsafe(w.did)
 	if h.col != nil {
-		h.col[w.did] = v
+		w.ix.setStringColumnLocked(h.sf.name, w.did, v)
 	}
 	if h.sf.analyzeFn != nil && hasNoSynonyms() {
 		w.ix.tokens = h.sf.analyzeFn(v, w.ix.tokens)

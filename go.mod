@@ -4,7 +4,7 @@ go 1.26.2
 
 require (
 	github.com/oarkflow/bcl v0.0.37
-	github.com/oarkflow/squealx v0.0.82
+	github.com/oarkflow/squealx v0.0.83
 	github.com/oarkflow/squealx/drivers/mysql v0.0.82
 	github.com/oarkflow/squealx/drivers/postgres v0.0.82
 	github.com/oarkflow/squealx/drivers/sqlite v0.0.82

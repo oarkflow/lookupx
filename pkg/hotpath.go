@@ -164,23 +164,26 @@ func (ix *Index) searchIntoFast(req SearchRequest, dst []Hit) (Result, []Hit) {
 
 func (ix *Index) searchBitmapIntoFast(bm *Bitmap, req SearchRequest, dst []Hit, start int64) (Result, []Hit) {
 	dst = dst[:0]
-	total, skipped := 0, 0
+	skipped := 0
 	ix.mu.RLock()
 	defer ix.mu.RUnlock()
+	total := -1
+	if !req.SkipTotal || req.AfterDocID == 0 {
+		total = ix.countLiveLocked(bm)
+	}
 	bm.Each(func(id DocID) bool {
 		if ix.isDeletedOrExpiredLocked(id) {
 			return true
 		}
-		total++
 		if skipped < req.Offset {
 			skipped++
 			return true
 		}
 		if len(dst) >= req.Limit {
-			return true
+			return false
 		}
 		dst = append(dst, Hit{ID: ix.docToExt[id], DocID: id, Score: 1})
-		return true
+		return len(dst) < req.Limit
 	})
 	return Result{Total: total, Hits: dst, Took: ix.elapsed(start)}, dst
 }

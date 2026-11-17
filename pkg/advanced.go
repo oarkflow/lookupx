@@ -498,7 +498,11 @@ func (ix *Index) domainWildcardBitmap(field, pattern string) *Bitmap {
 	r := NewBitmap()
 	ix.mu.RLock()
 	defer ix.mu.RUnlock()
-	for id, s := range ix.strings[field] {
+	for i, s := range ix.strings[field] {
+		id := DocID(i)
+		if id == 0 || s == "" {
+			continue
+		}
 		d := normalizeDomain(s)
 		if d == suffix || strings.HasSuffix(d, "."+suffix) {
 			r.Add(id)

@@ -178,7 +178,7 @@ func schemaFieldsWire(fields map[string]FieldOptions) map[string]any {
 	for name, o := range fields {
 		out[name] = map[string]any{
 			"kind": int(o.Kind), "kind_name": fieldKindName(o.Kind),
-			"indexed": o.Indexed, "lookup": o.Lookup, "prefix": o.Prefix,
+			"indexed": o.Indexed, "lookup": o.Lookup, "term_search": o.TermSearch, "prefix": o.Prefix,
 			"sortable": o.Sortable, "facetable": o.Facetable, "lowercase": o.Lowercase,
 			"min_prefix": o.MinPrefix, "max_prefix": o.MaxPrefix,
 		}

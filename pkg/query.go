@@ -37,6 +37,9 @@ func (q Terms) eval(ix *Index) *Bitmap {
 type Prefix struct{ Field, Value string }
 
 func (q Prefix) eval(ix *Index) *Bitmap { return ix.prefixBitmap(q.Field, q.Value) }
+func (q Prefix) evalWithin(ix *Index, candidates *Bitmap) *Bitmap {
+	return ix.prefixBitmapWithin(q.Field, q.Value, candidates)
+}
 
 type Suffix struct{ Field, Value string }
 
@@ -46,19 +49,36 @@ type Contains struct{ Field, Value string }
 
 func (q Contains) eval(ix *Index) *Bitmap { return ix.ngramBitmap(q.Field, q.Value) }
 
-// GlobalTerm performs indexed full-text retrieval across all searchable string
-// fields. Each word must match at least one field; optional fuzzy expansion is
-// bounded by each field's fuzzy term index.
+// GlobalTerm performs indexed full-text retrieval across configured term-search
+// fields (or all searchable string fields when none are configured). Each word
+// must match at least one field; optional fuzzy expansion is bounded by each
+// field's fuzzy term index.
 type GlobalTerm struct {
-	Words []string
-	Fuzzy bool
+	Words  []string
+	Fields []string
+	Fuzzy  bool
+}
+
+func (ix *Index) globalTermFields(q GlobalTerm) []string {
+	if len(q.Fields) > 0 {
+		return q.Fields
+	}
+	if len(ix.termSearchFields) > 0 {
+		return ix.termSearchFields
+	}
+	return ix.globalSearchFields
 }
 
 func (q GlobalTerm) eval(ix *Index) *Bitmap {
+	fields := ix.globalTermFields(q)
 	var result *Bitmap
 	for _, word := range q.Words {
 		perWord := NewBitmap()
-		for field, opt := range ix.cfg.Schema.Fields {
+		for _, field := range fields {
+			opt, ok := ix.cfg.Schema.Fields[field]
+			if !ok {
+				continue
+			}
 			if opt.Kind != FieldText && opt.Kind != FieldKeyword && opt.Kind != FieldBool {
 				continue
 			}
@@ -111,8 +131,9 @@ func (q sourceStringFilter) eval(ix *Index) *Bitmap {
 	// Stored string columns remain available when source documents are disabled
 	// and preserve the complete value (unlike analyzed text postings).
 	if col := ix.strings[q.Field]; col != nil {
-		for id, raw := range col {
-			if !ix.isDeletedOrExpiredLocked(id) && match(normalize(raw, opt.Lowercase)) {
+		for i, raw := range col {
+			id := DocID(i)
+			if id > 0 && raw != "" && !ix.isDeletedOrExpiredLocked(id) && match(normalize(raw, opt.Lowercase)) {
 				out.Add(id)
 			}
 		}
@@ -266,7 +287,26 @@ func (q Bool) eval(ix *Index) *Bitmap {
 	}
 	if len(q.Should) > 0 {
 		if q.MinShouldMatch <= 1 {
-			s := Or(q.Should).eval(ix)
+			var s *Bitmap
+			for _, clause := range q.Should {
+				var hits *Bitmap
+				if prefix, ok := clause.(Prefix); ok && r != nil {
+					hits = prefix.evalWithin(ix, r)
+				} else {
+					hits = clause.eval(ix)
+					if r != nil {
+						hits = r.Clone().AndInPlace(hits)
+					}
+				}
+				if s == nil {
+					s = hits
+				} else {
+					s = s.OrInPlace(hits)
+				}
+			}
+			if s == nil {
+				s = NewBitmap()
+			}
 			if r == nil {
 				r = s
 			} else {

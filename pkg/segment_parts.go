@@ -2,7 +2,6 @@ package pkg
 
 import (
 	"context"
-	"encoding/gob"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -29,7 +28,6 @@ func (s FileMMapSegmentStore) SaveIndex(ctx context.Context, indexID string, ix 
 	if ix == nil {
 		return PersistentManifest{}, errors.New("nil index")
 	}
-	_ = ix.Freeze()
 	base := s.dir(indexID)
 	if err := os.MkdirAll(base, 0755); err != nil {
 		return PersistentManifest{}, err
@@ -40,16 +38,12 @@ func (s FileMMapSegmentStore) SaveIndex(ctx context.Context, indexID string, ix 
 	if err := os.MkdirAll(genDir, 0755); err != nil {
 		return PersistentManifest{}, err
 	}
-	dump, err := ix.persistentDump()
-	if err != nil {
-		return PersistentManifest{}, err
-	}
 	payload := filepath.Join(genDir, "segment.dat")
 	f, err := os.Create(payload + ".tmp")
 	if err != nil {
 		return PersistentManifest{}, err
 	}
-	if err = gob.NewEncoder(f).Encode(dump); err == nil {
+	if err = ix.encodePersistent(f); err == nil {
 		err = f.Sync()
 		if err == nil {
 			err = f.Close()
@@ -99,7 +93,7 @@ func (s FileMMapSegmentStore) LoadIndex(ctx context.Context, indexID string, cfg
 	}
 	defer f.Close()
 	var dump persistentDump
-	if err = gob.NewDecoder(f).Decode(&dump); err != nil {
+	if err = decodePersistent(f, &dump); err != nil {
 		return nil, man, err
 	}
 	if cfg.Schema.Fields != nil {

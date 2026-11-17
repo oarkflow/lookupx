@@ -152,6 +152,7 @@ button { color: inherit; }
 .search-control { display: grid; gap: 6px; min-width: 0; }
 .control-label { color: #617084; font-size: 10px; font-weight: 700; letter-spacing: .04em; }
 .search-bar input, .search-bar select { height: 38px; }
+.term-input-row { display: grid; grid-template-columns: minmax(0, 1fr) 170px; gap: 8px; min-width: 0; }
 #lookup-term { padding-left: 12px; }
 .search-fuzzy { display: flex; align-items: center; gap: 7px; height: 38px; color: #4c5b6e; font-size: 12px; white-space: nowrap; cursor: pointer; }
 .search-fuzzy input { width: 15px; height: 15px; margin: 0; accent-color: var(--accent); }
@@ -274,6 +275,7 @@ td:first-child { color: #263548; font-family: ui-monospace, SFMono-Regular, Menl
   .search-panel { padding: 14px; }
   .search-bar { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); }
   .search-index, .term-control { grid-column: 1 / -1; }
+  .term-input-row { grid-template-columns: minmax(0, 1fr) 150px; }
   .search-fuzzy { grid-row: auto; }
   .limit-control { grid-column: 1; grid-row: auto; }
   .search-bar .btn { grid-column: 1 / -1; grid-row: auto; }

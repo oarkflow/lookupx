@@ -333,9 +333,9 @@ func TestCSVFileDatasourceValidation(t *testing.T) {
 	}
 
 	ds, err := factory(map[string]any{
-		"id":       "test_csv",
-		"kind":     "csv",
-		"file":     "./data.csv",
+		"id":        "test_csv",
+		"kind":      "csv",
+		"file":      "./data.csv",
 		"id_column": "id",
 	}, nil)
 	if err != nil {
@@ -352,9 +352,9 @@ func TestJSONLFileDatasourceValidation(t *testing.T) {
 	}
 
 	ds, err := factory(map[string]any{
-		"id":      "test_jsonl",
-		"kind":    "jsonl",
-		"file":    "./data.jsonl",
+		"id":       "test_jsonl",
+		"kind":     "jsonl",
+		"file":     "./data.jsonl",
 		"id_field": "event_id",
 	}, nil)
 	if err != nil {
@@ -378,9 +378,9 @@ func TestHTTPDatasourceValidation(t *testing.T) {
 	}
 
 	ds, err := factory(map[string]any{
-		"id":      "test_http",
-		"kind":    "http",
-		"url":     "https://api.example.com/data",
+		"id":       "test_http",
+		"kind":     "http",
+		"url":      "https://api.example.com/data",
 		"id_field": "id",
 	}, nil)
 	if err != nil {
@@ -538,13 +538,13 @@ index "env_idx" {
 
 func TestDatasourceDefToMap(t *testing.T) {
 	ds := DatasourceDef{
-		ID:         "products",
-		Kind:       "sql_table",
-		Driver:     "postgres",
-		DSN:        "localhost",
-		Table:      "products",
-		IDColumn:   "sku",
-		PageSize:   50000,
+		ID:       "products",
+		Kind:     "sql_table",
+		Driver:   "postgres",
+		DSN:      "localhost",
+		Table:    "products",
+		IDColumn: "sku",
+		PageSize: 50000,
 		Columns: []ColumnDef{
 			{Column: "sku", Field: "sku", Kind: "keyword"},
 			{Column: "price", Field: "price", Kind: "number"},
@@ -654,6 +654,11 @@ datasource "file_ds" {
 index "file_idx" {
   schema "record"
   datasource "file_ds"
+  schema_field "description" {
+    kind "text"
+    indexed true
+    term_search true
+  }
 }
 `
 	if err := os.WriteFile(bclPath, []byte(content), 0644); err != nil {
@@ -669,6 +674,30 @@ index "file_idx" {
 	}
 	if cfg.Datasources[0].ID != "file_ds" {
 		t.Fatalf("expected ID=file_ds, got %s", cfg.Datasources[0].ID)
+	}
+	if len(cfg.Indexes) != 1 || !cfg.Indexes[0].ToConfig().Schema.Fields["description"].TermSearch {
+		t.Fatal("expected BCL term_search field setting to reach index schema")
+	}
+}
+
+func TestClearBCLConfigDeclaresTermSearchFields(t *testing.T) {
+	cfg, err := LoadBCLConfig(filepath.Join("..", "config", "lookupx.bcl"), nil)
+	if err != nil {
+		t.Fatalf("LoadBCLConfig: %v", err)
+	}
+	if len(cfg.Indexes) == 0 {
+		t.Fatal("expected configured indexes")
+	}
+	for _, idx := range cfg.Indexes {
+		fields := idx.ToConfig().Schema.Fields
+		for _, name := range []string{"code", "code_no_period", "description", "fulltext"} {
+			if opt, ok := fields[name]; !ok || !opt.TermSearch {
+				t.Errorf("index %q field %q is not configured for term search", idx.ID, name)
+			}
+		}
+		if opt := fields["work_item_uid"]; opt.TermSearch {
+			t.Errorf("index %q work_item_uid should remain a field-value filter, not a term-search field", idx.ID)
+		}
 	}
 }
 

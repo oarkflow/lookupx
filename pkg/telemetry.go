@@ -2,7 +2,6 @@ package pkg
 
 import (
 	"runtime"
-	"runtime/metrics"
 )
 
 type ResourceUsage struct {
@@ -18,13 +17,7 @@ type ResourceUsage struct {
 func readResourceUsage() ResourceUsage {
 	var m runtime.MemStats
 	runtime.ReadMemStats(&m)
-	s := []metrics.Sample{{Name: "/cpu/classes/total:cpu-seconds"}}
-	metrics.Read(s)
-	cpu := float64(0)
-	if s[0].Value.Kind() == metrics.KindFloat64 {
-		cpu = s[0].Value.Float64()
-	}
-	return ResourceUsage{HeapBytes: m.HeapAlloc, HeapInUseBytes: m.HeapInuse, SystemBytes: m.Sys, TotalAllocBytes: m.TotalAlloc, Mallocs: m.Mallocs, Goroutines: runtime.NumGoroutine(), CPUSeconds: cpu}
+	return ResourceUsage{HeapBytes: m.HeapAlloc, HeapInUseBytes: m.HeapInuse, SystemBytes: m.Sys, TotalAllocBytes: m.TotalAlloc, Mallocs: m.Mallocs, Goroutines: runtime.NumGoroutine(), CPUSeconds: processCPUSeconds()}
 }
 
 func usageDelta(before, after ResourceUsage) ResourceUsage {

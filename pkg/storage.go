@@ -956,19 +956,46 @@ func (ix *Index) CompileDatasourceLookup(raw string) (Query, error) {
 	if err != nil {
 		return nil, fmt.Errorf("invalid lookup query: %w", err)
 	}
+	termFields := make([]string, 0, len(vals["term_field"]))
+	termFieldSeen := make(map[string]struct{}, len(vals["term_field"]))
+	for _, rawField := range vals["term_field"] {
+		for _, field := range strings.Split(rawField, ",") {
+			field = strings.TrimSpace(field)
+			if field == "" {
+				continue
+			}
+			opt, ok := ix.cfg.Schema.Fields[field]
+			if !ok {
+				return nil, fmt.Errorf("unknown term search field %q", field)
+			}
+			if opt.Kind != FieldText && opt.Kind != FieldKeyword && opt.Kind != FieldBool {
+				return nil, fmt.Errorf("term search field %q must be text, keyword, or bool", field)
+			}
+			if len(ix.termSearchFields) > 0 && !opt.TermSearch {
+				return nil, fmt.Errorf("term search field %q is not enabled for term search", field)
+			}
+			if _, exists := termFieldSeen[field]; !exists {
+				termFieldSeen[field] = struct{}{}
+				termFields = append(termFields, field)
+			}
+		}
+	}
+	if len(termFields) > 0 && len(vals["term"]) == 0 {
+		return nil, fmt.Errorf("term_field requires term")
+	}
 	filters := make([]Query, 0, len(vals))
 	for field, values := range vals {
-		if field == "limit" || field == "offset" || field == "fuzzy" || field == "profile" || field == "with_docs" {
+		if field == "limit" || field == "offset" || field == "fuzzy" || field == "profile" || field == "with_docs" || field == "term_field" {
 			continue
 		}
 		if field == "term" {
-			if _, schemaField := ix.cfg.Schema.Fields[field]; schemaField {
+			if _, schemaField := ix.cfg.Schema.Fields[field]; schemaField && len(termFields) == 0 {
 				// Preserve exact filtering for schemas that define a real field named
 				// "term" (for example TupleLookupSchema).
 			} else {
 				for _, value := range values {
 					fuzzy, _ := strconv.ParseBool(vals.Get("fuzzy"))
-					if q := ix.compileGlobalTerm(strings.TrimSpace(value), fuzzy); q != nil {
+					if q := ix.compileGlobalTerm(strings.TrimSpace(value), fuzzy, termFields); q != nil {
 						filters = append(filters, q)
 					}
 				}
@@ -1001,12 +1028,12 @@ func (ix *Index) CompileDatasourceLookup(raw string) (Query, error) {
 // compileGlobalTerm searches each word across every text, keyword, and boolean
 // field. Words are ANDed, while fields are ORed, so "nail repair" may match
 // either one column or values distributed across multiple searchable columns.
-func (ix *Index) compileGlobalTerm(value string, fuzzy bool) Query {
+func (ix *Index) compileGlobalTerm(value string, fuzzy bool, fields []string) Query {
 	words := strings.Fields(value)
 	if len(words) == 0 {
 		return nil
 	}
-	return GlobalTerm{Words: words, Fuzzy: fuzzy}
+	return GlobalTerm{Words: words, Fields: fields, Fuzzy: fuzzy}
 }
 
 func lookupFieldOperator(key string) (string, string) {
