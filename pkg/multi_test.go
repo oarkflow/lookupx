@@ -54,8 +54,8 @@ func TestPersistentManagerRestoreKeepsRecordsAndFilters(t *testing.T) {
 	}
 }
 
-func TestMultiServerServesEmbeddedWebConsoleByDefault(t *testing.T) {
-	server := &MultiServer{Manager: NewMultiIndexManager()}
+func TestMultiServerServesFilesystemWebConsoleByDefault(t *testing.T) {
+	server := &MultiServer{Manager: NewMultiIndexManager(), WebDir: "../web"}
 	for _, path := range []string{"/", "/app.js", "/styles.css"} {
 		rec := httptest.NewRecorder()
 		serveFHTest(t, rec, server, httptest.NewRequest(http.MethodGet, path, nil))

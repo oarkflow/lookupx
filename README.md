@@ -62,9 +62,11 @@ export MYSQL_DSN='user:password@tcp(db-host:3306)/clear?parseTime=true'
 go run ./cmd/lookupx serve -config config/lookupx.bcl
 ```
 
-The configured indexes are loaded before the server starts, and the browser
-console is embedded in the server at `/`; no `-web` flag is needed. Use
-`-web <directory>` only to serve a custom frontend build.
+The configured indexes are loaded before the server starts. The browser
+console is served from the filesystem at `./web` by default. Use
+`-web <directory>` or `LOOKUPX_WEB_DIR` to serve frontend files from another
+directory. Keep the `web` directory alongside the server's working directory
+when using the default path.
 Startup logs report each index's load or restore state, row counts, disk
 generation and persistence duration when applicable, and index duration.
 Search, lookup, and count requests log

@@ -11,8 +11,7 @@ import (
 	"github.com/oarkflow/fh/mw/recover"
 	"github.com/oarkflow/fh/mw/requestid"
 	"github.com/oarkflow/fh/mw/security"
-
-	lookupxweb "github.com/oarkflow/lookupx/web"
+	fhstatic "github.com/oarkflow/fh/mw/static"
 )
 
 // NewFHApp builds LookupX's native fh application. HTTP requests stay in fh
@@ -50,16 +49,27 @@ func NewFHApp(handler any) *fh.App {
 		registerServerRoutes(app, h)
 	case *MultiServer:
 		registerMultiServerRoutes(app, h)
-		multi := h
-		if multi.WebDir != "" {
-			app.StaticFS("/", os.DirFS(multi.WebDir), fh.StaticConfig{CacheControl: "no-cache", IndexFiles: []string{"index.html"}})
-		} else {
-			app.StaticFS("/", lookupxweb.Assets, fh.StaticConfig{CacheControl: "no-cache", IndexFiles: []string{"index.html"}})
+		root := h.WebDir
+		if root == "" {
+			root = defaultWebDir()
 		}
+		app.Get("/*", fhstatic.New(root, fhstatic.Config{
+			Root: root, Index: "index.html", CacheControl: "no-cache",
+			ETag: true, LastModified: true,
+		}))
 	default:
 		app.Get("/*path", func(c fh.Ctx) error { return c.Status(404).SendString("404 page not found\n") })
 	}
 	return app
+}
+
+func defaultWebDir() string {
+	for _, root := range []string{"web", "../web"} {
+		if info, err := os.Stat(root); err == nil && info.IsDir() {
+			return root
+		}
+	}
+	return "web"
 }
 
 func fhMaxBodyBytes(handler any) int {

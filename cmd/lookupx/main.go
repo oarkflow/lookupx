@@ -99,7 +99,7 @@ func serveCmd(args []string) {
 	addr := fs.String("addr", getenv("ADDR", ":8089"), "listen address")
 	configPath := fs.String("config", getenv("LOOKUPX_CONFIG", "config/lookupx.bcl"), "BCL configuration file; set empty to start without configured indexes")
 	apiKey := fs.String("api-key", getenv("LOOKUPX_API_KEY", ""), "optional API key")
-	webDir := fs.String("web", getenv("LOOKUPX_WEB_DIR", ""), "override the embedded browser console with static files from this directory")
+	webDir := fs.String("web", getenv("LOOKUPX_WEB_DIR", ""), "serve frontend files from this directory (default: ./web)")
 	dataDir := fs.String("data", getenv("LOOKUPX_DATA_DIR", "./data/indexes"), "persistent index directory")
 	storage := fs.String("storage", getenv("LOOKUPX_STORAGE", "memory"), "index storage: memory or disk")
 	_ = fs.Parse(args)
