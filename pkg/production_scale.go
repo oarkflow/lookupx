@@ -9,7 +9,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"net/http"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -1133,82 +1132,6 @@ func (r PartitionRouter) SearchTuple(indexID, term string, groupID uint32, date_
 
 // Small HTTP extension handler. Call from MultiServer by registering under /v1 if
 // the app wants async tasks/persistence endpoints.
-func (s *MultiServer) ServeProductionHTTP(w http.ResponseWriter, r *http.Request, store PersistentStore) bool {
-	path := strings.Trim(r.URL.Path, "/")
-	parts := strings.Split(path, "/")
-	if path == "v1/tasks" && r.Method == http.MethodGet {
-		writeJSON(w, map[string]any{"tasks": s.Manager.Tasks().List()})
-		return true
-	}
-	if len(parts) == 3 && parts[0] == "v1" && parts[1] == "tasks" && r.Method == http.MethodGet {
-		if t, ok := s.Manager.Tasks().Get(parts[2]); ok {
-			writeJSON(w, t)
-		} else {
-			http.NotFound(w, r)
-		}
-		return true
-	}
-	if len(parts) == 4 && parts[0] == "v1" && parts[1] == "tasks" && parts[3] == "cancel" && r.Method == http.MethodPost {
-		writeJSON(w, map[string]any{"ok": s.Manager.Tasks().Cancel(parts[2])})
-		return true
-	}
-	if len(parts) >= 4 && parts[0] == "v1" && parts[1] == "indexes" {
-		id := parts[2]
-		action := parts[3]
-		if (action == "reload-file" || action == "reload-sql" || action == "reload-table") && r.Method == http.MethodPost {
-			return false
-		}
-		if action == "reload-async" && r.Method == http.MethodPost {
-			tid := s.Manager.Tasks().StartReload(r.Context(), s.Manager, id)
-			writeJSON(w, map[string]any{"task_id": tid})
-			return true
-		}
-		ix, ok := s.Manager.Get(id)
-		if !ok {
-			http.Error(w, "index not found", 404)
-			return true
-		}
-		switch action {
-		case "freeze":
-			if r.Method == http.MethodPost {
-				err := ix.Freeze()
-				if err != nil {
-					http.Error(w, err.Error(), 500)
-				} else {
-					writeJSON(w, map[string]any{"ok": true, "frozen": ix.IsFrozen()})
-				}
-				return true
-			}
-		case "persist":
-			if r.Method == http.MethodPost {
-				if store == nil {
-					http.Error(w, "store required", 500)
-					return true
-				}
-				man, err := store.SaveIndex(r.Context(), id, ix)
-				if err != nil {
-					http.Error(w, err.Error(), 500)
-				} else {
-					writeJSON(w, man)
-				}
-				return true
-			}
-		case "lookup-composite":
-			if r.Method == http.MethodGet {
-				q := r.URL.Query()
-				wi, _ := strconv.ParseUint(q.Get("group_id"), 10, 32)
-				_, hits := ix.SearchInto(SearchRequest{Query: TupleCompositeQuery{Term: q.Get("term"), GroupID: uint32(wi), DateKey: q.Get("date_key")}, Limit: IntParam(r, "limit", 20)}, nil)
-				writeJSON(w, map[string]any{"hits": hits, "total": len(hits)})
-				return true
-			}
-		}
-	}
-	if s.serveBillionHTTP(w, r, store) {
-		return true
-	}
-	return false
-}
-
 func (ix *Index) updateTupleCompositeFromSource(rec *SourceRecord, did DocID) {
 	ex := extras(ix)
 	ex.mu.RLock()

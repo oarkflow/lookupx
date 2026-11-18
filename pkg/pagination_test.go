@@ -123,7 +123,7 @@ func TestHTTPKeysetPaginationCanSkipTotal(t *testing.T) {
 	}
 	req := httptest.NewRequest(http.MethodPost, "/search", strings.NewReader(`{"type":"all","limit":2,"after_doc_id":2,"skip_total":true}`))
 	rec := httptest.NewRecorder()
-	(&Server{Index: ix}).ServeHTTP(rec, req)
+	serveFHTest(t, rec, &Server{Index: ix}, req)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
 	}

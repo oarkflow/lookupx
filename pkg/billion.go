@@ -9,11 +9,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"net/http"
 	"os"
 	"path/filepath"
 	"sort"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -474,85 +472,6 @@ func (ix *Index) ApplyMutations(ctx context.Context, src MutationSource, opt Bul
 // -----------------------------------------------------------------------------
 // HTTP extension endpoints for production-scale operations.
 // -----------------------------------------------------------------------------
-
-func (s *MultiServer) serveBillionHTTP(w http.ResponseWriter, r *http.Request, store PersistentStore) bool {
-	path := strings.Trim(r.URL.Path, "/")
-	parts := strings.Split(path, "/")
-	if path == "v1/plan" && r.Method == http.MethodGet {
-		rows, _ := strconv.ParseInt(r.URL.Query().Get("rows"), 10, 64)
-		if rows <= 0 {
-			rows = 1_000_000_000
-		}
-		idx := r.URL.Query().Get("index")
-		if idx == "" {
-			idx = "dataset_a"
-		}
-		writeJSON(w, PlanBillionRowDeployment(idx, rows, DefaultBillionRowBudget()))
-		return true
-	}
-	if len(parts) >= 4 && parts[0] == "v1" && parts[1] == "indexes" {
-		id, action := parts[2], parts[3]
-		switch action {
-		case "generations":
-			if r.Method == http.MethodGet {
-				gens, err := store.ListGenerations(r.Context(), id)
-				if err != nil {
-					http.Error(w, err.Error(), 500)
-				} else {
-					writeJSON(w, map[string]any{"generations": gens})
-				}
-				return true
-			}
-		case "validate":
-			if r.Method == http.MethodPost || r.Method == http.MethodGet {
-				rep, err := ValidatePersistentIndex(r.Context(), store, id, Config{})
-				if err != nil && len(rep.Issues) == 0 {
-					http.Error(w, err.Error(), 500)
-				} else {
-					writeJSON(w, rep)
-				}
-				return true
-			}
-		case "repair":
-			if r.Method == http.MethodPost {
-				man, rep, err := RepairPersistentIndex(r.Context(), store, id, Config{})
-				if err != nil {
-					http.Error(w, err.Error(), 500)
-				} else {
-					writeJSON(w, map[string]any{"manifest": man, "validation": rep})
-				}
-				return true
-			}
-		case "compact":
-			if r.Method == http.MethodPost {
-				fs, ok := store.(FileSegmentStore)
-				if !ok {
-					http.Error(w, "file segment store required", 500)
-					return true
-				}
-				var req GenerationPolicy
-				_ = json.NewDecoder(r.Body).Decode(&req)
-				removed, err := CompactPersistentGenerations(r.Context(), fs, id, req)
-				if err != nil {
-					http.Error(w, err.Error(), 500)
-				} else {
-					writeJSON(w, map[string]any{"removed": removed})
-				}
-				return true
-			}
-		case "plan":
-			if r.Method == http.MethodGet {
-				rows, _ := strconv.ParseInt(r.URL.Query().Get("rows"), 10, 64)
-				if rows <= 0 {
-					rows = 1_000_000_000
-				}
-				writeJSON(w, PlanBillionRowDeployment(id, rows, DefaultBillionRowBudget()))
-				return true
-			}
-		}
-	}
-	return false
-}
 
 // -----------------------------------------------------------------------------
 // Source helpers for parallel/partition-oriented database ingestion.

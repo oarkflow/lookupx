@@ -5,7 +5,6 @@ import (
 	"flag"
 	"fmt"
 	"log"
-	"net/http"
 	"os"
 	"strconv"
 	"strings"
@@ -209,7 +208,8 @@ func serveCmd(args []string) {
 		keys = append(keys, *apiKey)
 	}
 	lookup.LogKV("server_listening", "address", *addr, "storage", *storage, "indexes", len(mgr.List()), "web_console", "/")
-	log.Fatal(http.ListenAndServe(*addr, &lookup.MultiServer{Manager: mgr, APIKeys: keys, WebDir: *webDir, DataDir: *dataDir, Storage: *storage}))
+	app := lookup.NewFHApp(&lookup.MultiServer{Manager: mgr, APIKeys: keys, WebDir: *webDir, DataDir: *dataDir, Storage: *storage})
+	log.Fatal(app.ListenWithGracefulShutdown(*addr))
 }
 
 func demoCmd(args []string) {

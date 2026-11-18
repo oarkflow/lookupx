@@ -1,12 +1,10 @@
 package pkg
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"net/http"
 	"os"
 	"path/filepath"
 	"sort"
@@ -15,7 +13,6 @@ import (
 	"sync"
 	"time"
 
-	lookupxweb "github.com/oarkflow/lookupx/web"
 	"github.com/oarkflow/squealx"
 )
 
@@ -404,20 +401,6 @@ func (s *MultiServer) diskStorageEnabled() bool {
 	return strings.EqualFold(strings.TrimSpace(s.Storage), "disk")
 }
 
-func (s *MultiServer) writeReloadResult(w http.ResponseWriter, ctx context.Context, id string, stats BulkStats) {
-	result := map[string]any{"ok": true, "stats": stats, "storage": "memory"}
-	if s.diskStorageEnabled() {
-		man, err := s.persistManagedIndex(ctx, id)
-		if err != nil {
-			http.Error(w, "indexed but persistence failed: "+err.Error(), http.StatusInternalServerError)
-			return
-		}
-		result["storage"] = "disk"
-		result["manifest"] = man
-	}
-	writeJSON(w, result)
-}
-
 func (s *MultiServer) persistentStore() FileSegmentStore {
 	root := s.DataDir
 	if root == "" {
@@ -441,289 +424,6 @@ func (s *MultiServer) persistManagedIndex(ctx context.Context, id string) (Persi
 	}
 	_, _ = CompactPersistentGenerations(ctx, store, id, GenerationPolicy{KeepLast: 2})
 	return man, nil
-}
-
-func (s *MultiServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	if s.Manager == nil {
-		http.Error(w, "manager required", http.StatusInternalServerError)
-		return
-	}
-	if !s.authorized(r) {
-		http.Error(w, "unauthorized", http.StatusUnauthorized)
-		return
-	}
-	if s.ServeProductionHTTP(w, r, s.persistentStore()) {
-		return
-	}
-	path := strings.Trim(r.URL.Path, "/")
-	// Non-API paths serve the embedded console unless a custom WebDir is set.
-	if !strings.HasPrefix(path, "v1/") && path != "health" && path != "metrics" {
-		s.serveWebOrNotFound(w, r)
-		return
-	}
-	w.Header().Set("Content-Type", "application/json")
-	if path == "health" || path == "v1/health" {
-		writeJSON(w, map[string]any{"ok": true, "indexes": len(s.Manager.List())})
-		return
-	}
-	if path == "metrics" || path == "v1/metrics" {
-		w.Header().Set("Content-Type", "text/plain; version=0.0.4")
-		for _, info := range s.Manager.List() {
-			fmt.Fprintf(w, "lookupx_index_live_docs{index=%q} %d\n", info.ID, info.Stats.LiveDocs)
-			fmt.Fprintf(w, "lookupx_index_terms{index=%q} %d\n", info.ID, info.Stats.Terms)
-			fmt.Fprintf(w, "lookupx_index_last_reload_ns{index=%q} %d\n", info.ID, info.Latency.LastReloadNS)
-			fmt.Fprintf(w, "lookupx_index_last_indexed{index=%q} %d\n", info.ID, info.Latency.LastIndexed)
-		}
-		return
-	}
-	if path == "v1/indexes" && r.Method == http.MethodGet {
-		writeJSON(w, s.Manager.List())
-		return
-	}
-	if path == "v1/indexes" && r.Method == http.MethodPost {
-		var req CreateIndexRequest
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			http.Error(w, err.Error(), 400)
-			return
-		}
-		cfg := req.Config
-		if cfg.Schema.Fields == nil {
-			switch strings.ToLower(req.Schema) {
-			case "record", "tuple", "lookup", "":
-				cfg.Schema = TupleLookupSchema()
-			default:
-				http.Error(w, "schema required (use schema: record or provide config.schema.fields)", 400)
-				return
-			}
-		}
-		if _, err := s.Manager.Register(IndexDefinition{ID: req.ID, Config: cfg, BulkOptions: req.BulkOptions}); err != nil {
-			http.Error(w, err.Error(), 400)
-			return
-		}
-		writeJSON(w, map[string]any{"ok": true, "id": cleanIndexID(req.ID)})
-		return
-	}
-	if path == "v1/indexes" && r.Method == http.MethodDelete {
-		var req struct {
-			ID string `json:"id"`
-		}
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			http.Error(w, err.Error(), 400)
-			return
-		}
-		s.Manager.Remove(cleanIndexID(req.ID))
-		writeJSON(w, map[string]any{"ok": true})
-		return
-	}
-	if path == "v1/auto-index" && r.Method == http.MethodPost {
-		resp, err := s.autoCreateIndex(r.Context(), r)
-		if err != nil {
-			http.Error(w, err.Error(), 400)
-			return
-		}
-		writeJSON(w, resp)
-		return
-	}
-	if path == "v1/infer-columns" && r.Method == http.MethodPost {
-		resp, err := s.inferColumns(r.Context(), r)
-		if err != nil {
-			http.Error(w, err.Error(), 400)
-			return
-		}
-		writeJSON(w, resp)
-		return
-	}
-	parts := strings.Split(path, "/")
-	if len(parts) < 3 || parts[0] != "v1" || parts[1] != "indexes" {
-		http.NotFound(w, r)
-		return
-	}
-	id := parts[2]
-	action := ""
-	if len(parts) > 3 {
-		action = parts[3]
-	}
-	if r.Method == http.MethodPost && (action == "reload-file" || action == "reload-sql" || action == "reload-table") {
-		var stats BulkStats
-		var err error
-		switch action {
-		case "reload-file":
-			stats, err = s.reloadFile(r.Context(), id, w, r)
-		case "reload-sql":
-			stats, err = s.reloadSQL(r.Context(), id, r)
-		case "reload-table":
-			stats, err = s.reloadTable(r.Context(), id, r)
-		}
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
-			return
-		}
-		s.writeReloadResult(w, r.Context(), id, stats)
-		return
-	}
-	ix, ok := s.Manager.Get(id)
-	if !ok {
-		http.Error(w, "index not found", 404)
-		return
-	}
-	switch {
-	case r.Method == http.MethodGet && action == "stats":
-		mi, _ := s.Manager.Managed(id)
-		writeJSON(w, map[string]any{"id": id, "stats": ix.Stats(), "latency": mi.Latency, "resources": readResourceUsage(), "generation": mi.Generation, "reloading": mi.Reloading})
-	case r.Method == http.MethodGet && action == "schema":
-		writeJSON(w, map[string]any{"id": id, "fields": schemaFieldsWire(ix.SchemaFields()), "lookup_rules": ix.cfg.LookupRules})
-	case r.Method == http.MethodPost && action == "search":
-		var q WireQuery
-		dec := json.NewDecoder(r.Body)
-		dec.UseNumber()
-		if err := dec.Decode(&q); err != nil {
-			http.Error(w, err.Error(), 400)
-			return
-		}
-		limit := q.Limit
-		if limit <= 0 {
-			limit = 20
-		}
-		if q.AfterDocID > 0 && len(q.Sort) > 0 {
-			http.Error(w, "after_doc_id pagination cannot be combined with sort", http.StatusBadRequest)
-			return
-		}
-		if q.AfterDocID > 0 && q.Offset > 0 {
-			http.Error(w, "after_doc_id pagination cannot be combined with offset", http.StatusBadRequest)
-			return
-		}
-		started := time.Now()
-		// Search APIs are record-oriented by default. Clients can opt out with
-		// ?with_docs=false for the lowest-allocation ID-only hot path.
-		withDocs := true
-		if raw := r.URL.Query().Get("with_docs"); raw != "" {
-			withDocs, _ = strconv.ParseBool(raw)
-		}
-		res, hits := ix.SearchInto(SearchRequest{Query: q.ToQuery(), Limit: limit, Offset: q.Offset, AfterDocID: q.AfterDocID, SkipTotal: q.SkipTotal, WithDocs: withDocs, Sort: q.Sort, Facets: q.Facets}, nil)
-		res.Hits = hits
-		LogKV("query_search", "index", id, "query", wireQueryShape(q), "limit", limit, "offset", q.Offset, "hits", len(hits), "total", res.Total, "latency", time.Since(started))
-		writeJSON(w, map[string]any{"result": res, "latency_ns": time.Since(started).Nanoseconds()})
-	case r.Method == http.MethodGet && action == "lookup":
-		profile, _ := strconv.ParseBool(r.URL.Query().Get("profile"))
-		var usageBefore ResourceUsage
-		if profile {
-			usageBefore = readResourceUsage()
-		}
-		raw := r.URL.RawQuery
-		limit := IntParam(r, "limit", 20)
-		query, err := ix.CompileDatasourceLookup(raw)
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
-			return
-		}
-		started := time.Now()
-		result, hits := ix.SearchInto(SearchRequest{Query: query, Limit: limit, WithDocs: true}, nil)
-		fields := make([]string, 0, len(r.URL.Query()))
-		for key := range r.URL.Query() {
-			fields = append(fields, key)
-		}
-		sort.Strings(fields)
-		LogKV("query_lookup", "index", id, "filters", strings.Join(fields, ","), "limit", limit, "hits", len(hits), "total", result.Total, "latency", time.Since(started))
-		response := map[string]any{"hits": hits, "total": result.Total, "latency_ns": time.Since(started).Nanoseconds()}
-		if profile {
-			response["resources"] = usageDelta(usageBefore, readResourceUsage())
-		}
-		writeJSON(w, response)
-	case r.Method == http.MethodPost && action == "count":
-		var q WireQuery
-		dec := json.NewDecoder(r.Body)
-		dec.UseNumber()
-		if err := dec.Decode(&q); err != nil {
-			http.Error(w, err.Error(), 400)
-			return
-		}
-		started := time.Now()
-		c := ix.Count(q.ToQuery())
-		LogKV("query_count", "index", id, "query", wireQueryShape(q), "count", c, "latency", time.Since(started))
-		writeJSON(w, map[string]any{"count": c, "latency_ns": time.Since(started).Nanoseconds()})
-	case r.Method == http.MethodPost && action == "reload":
-		stats, err := s.Manager.Reload(r.Context(), id)
-		if err != nil {
-			http.Error(w, err.Error(), 500)
-			return
-		}
-		s.writeReloadResult(w, r.Context(), id, stats)
-	case r.Method == http.MethodPost && action == "snapshot":
-		var body struct {
-			Path string `json:"path"`
-		}
-		_ = json.NewDecoder(r.Body).Decode(&body)
-		if body.Path == "" {
-			body.Path = filepath.Join("data", id+".snapshot.json")
-		}
-		if err := ix.SaveSnapshot(body.Path); err != nil {
-			http.Error(w, err.Error(), 500)
-			return
-		}
-		writeJSON(w, map[string]any{"ok": true, "path": body.Path})
-	case len(parts) > 4 && action == "docs" && r.Method == http.MethodPut:
-		docID := strings.Join(parts[4:], "/")
-		var d Document
-		dec := json.NewDecoder(r.Body)
-		dec.UseNumber()
-		if err := dec.Decode(&d); err != nil {
-			http.Error(w, err.Error(), 400)
-			return
-		}
-		if err := ix.Upsert(docID, d); err != nil {
-			http.Error(w, err.Error(), 400)
-			return
-		}
-		writeJSON(w, map[string]any{"ok": true, "id": docID})
-	case action == "docs" && len(parts) == 5 && r.Method == http.MethodDelete:
-		_ = ix.Delete(parts[4])
-		writeJSON(w, map[string]any{"ok": true})
-	default:
-		s.serveWebOrNotFound(w, r)
-	}
-}
-
-func (s *MultiServer) serveWebOrNotFound(w http.ResponseWriter, r *http.Request) {
-	// Force revalidation on every request. Without this, browsers may serve a
-	// stale index.html/app.js/styles.css straight from disk cache (no request
-	// to the server at all) even on a normal reload, since Go's static file
-	// server sends no cache-control hints of its own — only Last-Modified/ETag,
-	// which no-cache still lets the browser use for a cheap 304.
-	w.Header().Set("Cache-Control", "no-cache")
-	path := strings.TrimPrefix(r.URL.Path, "/")
-	if path == "" || path == "index.html" {
-		if s.WebDir != "" {
-			http.ServeFile(w, r, filepath.Join(s.WebDir, "index.html"))
-			return
-		}
-		path = "index.html"
-	}
-	if s.WebDir != "" {
-		http.FileServer(http.Dir(s.WebDir)).ServeHTTP(w, r)
-		return
-	}
-	asset, err := lookupxweb.Assets.ReadFile(path)
-	if err != nil {
-		http.NotFound(w, r)
-		return
-	}
-	http.ServeContent(w, r, path, time.Time{}, bytes.NewReader(asset))
-}
-
-func (s *MultiServer) authorized(r *http.Request) bool {
-	if len(s.APIKeys) == 0 {
-		return true
-	}
-	key := r.Header.Get("X-API-Key")
-	if strings.HasPrefix(r.Header.Get("Authorization"), "Bearer ") {
-		key = strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
-	}
-	for _, k := range s.APIKeys {
-		if k == key {
-			return true
-		}
-	}
-	return false
 }
 
 type CreateIndexRequest struct {
@@ -770,11 +470,7 @@ type SQLColumnSpec struct {
 	Layout     string `json:"layout,omitempty"`
 }
 
-func (s *MultiServer) reloadSQL(ctx context.Context, id string, r *http.Request) (BulkStats, error) {
-	var req SQLReloadRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		return BulkStats{}, err
-	}
+func (s *MultiServer) reloadSQLRequest(ctx context.Context, id string, req SQLReloadRequest) (BulkStats, error) {
 	mi, ok := s.Manager.Managed(id)
 	db, err := squealx.Connect(squealxDriver(req.Driver), req.DSN, "")
 	if err != nil {
@@ -801,11 +497,7 @@ func (s *MultiServer) reloadSQL(ctx context.Context, id string, r *http.Request)
 	}, opt)
 }
 
-func (s *MultiServer) reloadTable(ctx context.Context, id string, r *http.Request) (BulkStats, error) {
-	var req SQLTableReloadRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		return BulkStats{}, err
-	}
+func (s *MultiServer) reloadTableRequest(ctx context.Context, id string, req SQLTableReloadRequest) (BulkStats, error) {
 	if req.OrderColumn == "" && req.IDColumn != "" {
 		req.OrderColumn = req.IDColumn
 	}
@@ -910,8 +602,6 @@ func parseValueKind(kind string) ValueKind {
 		return ValueKeyword
 	}
 }
-
-func writeJSON(w http.ResponseWriter, v any) { _ = json.NewEncoder(w).Encode(v) }
 
 // RegisterDemoIndexes creates empty Dataset, DatasetB, and DatasetC indexes using the
 // same record lookup schema. Sources can be attached later and each index can

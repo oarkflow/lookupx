@@ -58,7 +58,7 @@ func TestMultiServerServesEmbeddedWebConsoleByDefault(t *testing.T) {
 	server := &MultiServer{Manager: NewMultiIndexManager()}
 	for _, path := range []string{"/", "/app.js", "/styles.css"} {
 		rec := httptest.NewRecorder()
-		server.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, path, nil))
+		serveFHTest(t, rec, server, httptest.NewRequest(http.MethodGet, path, nil))
 		if rec.Code != http.StatusOK {
 			t.Fatalf("GET %s: status=%d body=%q", path, rec.Code, rec.Body.String())
 		}
@@ -84,7 +84,7 @@ func TestHTTPReloadPersistsForServerRestart(t *testing.T) {
 	server := &MultiServer{Manager: mgr, DataDir: root, Storage: "disk"}
 	req := httptest.NewRequest(http.MethodPost, "/v1/indexes/products/reload", nil)
 	res := httptest.NewRecorder()
-	server.ServeHTTP(res, req)
+	serveFHTest(t, res, server, req)
 	if res.Code != http.StatusOK {
 		t.Fatalf("reload status=%d body=%s", res.Code, res.Body.String())
 	}
@@ -123,7 +123,7 @@ func TestHTTPReloadDefaultsToMemoryWithoutPersistence(t *testing.T) {
 		t.Fatal(err)
 	}
 	res := httptest.NewRecorder()
-	(&MultiServer{Manager: mgr, DataDir: root}).ServeHTTP(res, httptest.NewRequest(http.MethodPost, "/v1/indexes/products/reload", nil))
+	serveFHTest(t, res, &MultiServer{Manager: mgr, DataDir: root}, httptest.NewRequest(http.MethodPost, "/v1/indexes/products/reload", nil))
 	if res.Code != http.StatusOK {
 		t.Fatalf("reload status=%d body=%s", res.Code, res.Body.String())
 	}
@@ -151,7 +151,7 @@ func TestMultiServerSearchReturnsBulkDatasourceRecordsByDefault(t *testing.T) {
 
 	req := httptest.NewRequest(http.MethodPost, "/v1/indexes/records/search", strings.NewReader(`{"type":"term","field":"term","value":"alpha"}`))
 	res := httptest.NewRecorder()
-	(&MultiServer{Manager: mgr}).ServeHTTP(res, req)
+	serveFHTest(t, res, &MultiServer{Manager: mgr}, req)
 	if res.Code != http.StatusOK {
 		t.Fatalf("status=%d body=%s", res.Code, res.Body.String())
 	}
@@ -184,7 +184,7 @@ func TestMultiServerSearchSupportsCursorPagination(t *testing.T) {
 	search := func(body string) (int, Result) {
 		req := httptest.NewRequest(http.MethodPost, "/v1/indexes/records/search?with_docs=false", strings.NewReader(body))
 		res := httptest.NewRecorder()
-		server.ServeHTTP(res, req)
+		serveFHTest(t, res, server, req)
 		var response struct {
 			Result Result `json:"result"`
 		}
@@ -279,7 +279,7 @@ func TestLookupFiltersDatasourceTextAndNumericFields(t *testing.T) {
 	for _, filter := range []string{"ld=943846", "work_item=37", "ld=943846&work_item=37"} {
 		req := httptest.NewRequest(http.MethodGet, "/v1/indexes/cpt/lookup?"+filter, nil)
 		res := httptest.NewRecorder()
-		server.ServeHTTP(res, req)
+		serveFHTest(t, res, server, req)
 		if res.Code != http.StatusOK {
 			t.Fatalf("filter %q: status=%d body=%s", filter, res.Code, res.Body.String())
 		}

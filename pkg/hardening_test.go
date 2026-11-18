@@ -91,14 +91,14 @@ func TestHTTPVectorValidationAndCompactionEndpoint(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPut, "/docs/a", bytes.NewReader(body))
 	req.Header.Set("X-API-Key", "secret")
 	rr := httptest.NewRecorder()
-	srv.ServeHTTP(rr, req)
+	serveFHTest(t, rr, srv, req)
 	if rr.Code != http.StatusBadRequest {
 		t.Fatalf("expected 400 for bad vector dimension, got %d body=%s", rr.Code, rr.Body.String())
 	}
 	req = httptest.NewRequest(http.MethodPost, "/compact", nil)
 	req.Header.Set("X-API-Key", "secret")
 	rr = httptest.NewRecorder()
-	srv.ServeHTTP(rr, req)
+	serveFHTest(t, rr, srv, req)
 	if rr.Code != http.StatusOK {
 		t.Fatalf("compact failed: %d %s", rr.Code, rr.Body.String())
 	}

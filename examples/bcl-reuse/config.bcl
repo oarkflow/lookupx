@@ -1,0 +1,151 @@
+bcl {
+  version "1.0"
+}
+
+# One environment-backed value can be referenced by multiple datasource blocks.
+const MYSQL_DSN = env("MYSQL_DSN", "example:example@tcp(127.0.0.1:3306)/lookupx?parseTime=true&loc=UTC")
+
+# Named blocks can be spread into other blocks to reuse nested configuration.
+column_set "code_lookup" {
+  column "code" {
+    kind "keyword"
+    normalized true
+  }
+  column "description" {
+    kind "text"
+    normalized true
+  }
+}
+
+datasource "first" {
+  kind "sql_query"
+  driver "mysql"
+  dsn MYSQL_DSN
+  query "SELECT code, description FROM first_table"
+  &column_set.code_lookup
+}
+
+datasource "second" {
+  kind "sql_query"
+  driver "mysql"
+  dsn MYSQL_DSN
+  query "SELECT code, description FROM second_table"
+  &column_set.code_lookup
+  column "active" {
+    kind "bool"
+    normalized true
+  }
+}
+
+index_defaults "record" {
+  schema "record"
+}
+
+schema_field_set "lookup_fields" {
+  schema_field "code" {
+    kind "keyword"
+    indexed true
+    stored true
+    lookup true
+    lowercase true
+    prefix true
+    term_search true
+  }
+  schema_field "code_no_period" {
+    kind "keyword"
+    indexed true
+    stored true
+    lowercase true
+    prefix true
+    term_search true
+  }
+  schema_field "description" {
+    kind "text"
+    indexed true
+    stored true
+    lowercase true
+    term_search true
+  }
+  schema_field "fulltext" {
+    kind "text"
+    indexed true
+    stored true
+    lowercase true
+    term_search true
+  }
+}
+
+schema_field_set "lookup_fields_with_alias" {
+  schema_field "code" {
+    kind "keyword"
+    indexed true
+    stored true
+    lookup true
+    lowercase true
+    prefix true
+    term_search true
+  }
+  schema_field "code_no_period" {
+    kind "keyword"
+    indexed true
+    stored true
+    lowercase true
+    prefix true
+    term_search true
+  }
+  schema_field "description" {
+    kind "text"
+    indexed true
+    stored true
+    index_alias "fulltext"
+    lowercase true
+    term_search true
+  }
+  schema_field "fulltext" {
+    kind "text"
+    indexed true
+    stored true
+    lowercase true
+    term_search true
+  }
+}
+
+lookup_rule_set "dos_from_date" {
+  lookup_rule "DOS" {
+    target_field "effective_date"
+    operator "gte"
+  }
+}
+
+bulk_settings "standard" {
+  batch_size 32768
+}
+
+bulk_settings "special" {
+  batch_size 16384
+}
+
+index "first_index" {
+  &index_defaults.record
+  &schema_field_set.lookup_fields_with_alias
+  &lookup_rule_set.dos_from_date
+  datasource "first"
+  bulk {
+    &bulk_settings.standard
+    checkpoint_path "./data/first.json"
+  }
+}
+
+index "second_index" {
+  &index_defaults.record
+  &schema_field_set.lookup_fields
+  datasource "second"
+  schema_field "active" {
+    kind "bool"
+    indexed true
+    stored true
+  }
+  bulk {
+    &bulk_settings.special
+  }
+}

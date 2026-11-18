@@ -2,9 +2,7 @@ package pkg
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
-	"net/http"
 	"strconv"
 	"strings"
 
@@ -115,19 +113,6 @@ type InferColumnsResponse struct {
 	Columns []AutoIndexColumn `json:"columns"`
 }
 
-func (s *MultiServer) inferColumns(ctx context.Context, r *http.Request) (InferColumnsResponse, error) {
-	var req sqlSampleRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		return InferColumnsResponse{}, err
-	}
-	db, cols, err := connectAndSample(ctx, req)
-	if err != nil {
-		return InferColumnsResponse{}, err
-	}
-	db.Close()
-	return InferColumnsResponse{Columns: autoColumnsWire(cols)}, nil
-}
-
 // AutoIndexRequest drives the combined "detect schema from a live SQL source,
 // then create the index" flow used by the web UI's index-creation wizard. It
 // samples SampleSize rows to infer field kinds via InferSQLColumns, so the
@@ -141,33 +126,6 @@ type AutoIndexResponse struct {
 	ID      string            `json:"id"`
 	Columns []AutoIndexColumn `json:"columns"`
 	Fields  map[string]any    `json:"fields"`
-}
-
-func (s *MultiServer) autoCreateIndex(ctx context.Context, r *http.Request) (AutoIndexResponse, error) {
-	var req AutoIndexRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		return AutoIndexResponse{}, err
-	}
-	id := cleanIndexID(req.ID)
-	if id == "" {
-		return AutoIndexResponse{}, errors.New("id required")
-	}
-	db, cols, err := connectAndSample(ctx, req.sqlSampleRequest)
-	if err != nil {
-		return AutoIndexResponse{}, err
-	}
-	defer db.Close()
-
-	ix, err := New(Config{Schema: AutoSchema(cols), InitialCapacity: 1024})
-	if err != nil {
-		return AutoIndexResponse{}, err
-	}
-	if err := s.Manager.AddIndex(id, ix); err != nil {
-		_ = ix.Close()
-		return AutoIndexResponse{}, err
-	}
-
-	return AutoIndexResponse{ID: id, Fields: schemaFieldsWire(ix.SchemaFields()), Columns: autoColumnsWire(cols)}, nil
 }
 
 // schemaFieldsWire renders a compiled schema for the web UI: each field's

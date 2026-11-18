@@ -3,6 +3,7 @@ package pkg
 import (
 	"bytes"
 	"encoding/json"
+	"io"
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
@@ -69,15 +70,22 @@ func TestHTTPReloadFileSupportedFormats(t *testing.T) {
 
 			req := httptest.NewRequest(http.MethodPost, "/v1/indexes/records/reload-file", body)
 			req.Header.Set("Content-Type", writer.FormDataContentType())
-			res := httptest.NewRecorder()
-			(&MultiServer{Manager: mgr}).ServeHTTP(res, req)
-			if res.Code != http.StatusOK {
-				t.Fatalf("upload returned %d: %s", res.Code, res.Body.String())
+			res, err := NewFHApp(&MultiServer{Manager: mgr}).Test(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer res.Body.Close()
+			responseBody, err := io.ReadAll(res.Body)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if res.StatusCode != http.StatusOK {
+				t.Fatalf("upload returned %d: %s", res.StatusCode, responseBody)
 			}
 			var response struct {
 				Stats BulkStats `json:"stats"`
 			}
-			if err := json.Unmarshal(res.Body.Bytes(), &response); err != nil {
+			if err := json.Unmarshal(responseBody, &response); err != nil {
 				t.Fatal(err)
 			}
 			want := uint64(2)

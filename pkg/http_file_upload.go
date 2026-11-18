@@ -8,11 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"net/http"
 	"os"
-	"path/filepath"
-	"strconv"
-	"strings"
 
 	"github.com/xuri/excelize/v2"
 )
@@ -29,48 +25,9 @@ func (source filePathSource) Open(ctx context.Context) (Cursor, error) {
 // JSON Lines, and XLSX rows into a replacement index generation. Tabular
 // formats use their first row as column headers; XLSX uses the selected sheet
 // or the workbook's first sheet.
-func (s *MultiServer) reloadFile(ctx context.Context, id string, w http.ResponseWriter, r *http.Request) (BulkStats, error) {
-	r.Body = http.MaxBytesReader(w, r.Body, maxIndexUploadBytes+(64<<20))
-	if err := r.ParseMultipartForm(32 << 20); err != nil {
-		return BulkStats{}, fmt.Errorf("read upload form: %w", err)
-	}
-	if r.MultipartForm != nil {
-		defer r.MultipartForm.RemoveAll()
-	}
-
-	file, header, err := r.FormFile("file")
-	if err != nil {
-		return BulkStats{}, fmt.Errorf("file is required: %w", err)
-	}
-	defer file.Close()
-	if header.Size > maxIndexUploadBytes {
-		return BulkStats{}, fmt.Errorf("file exceeds the %d MiB upload limit", maxIndexUploadBytes>>20)
-	}
-
-	format := strings.ToLower(strings.TrimSpace(r.FormValue("format")))
-	if format == "" || format == "auto" {
-		format = strings.TrimPrefix(strings.ToLower(filepath.Ext(header.Filename)), ".")
-	}
-	idField := strings.TrimSpace(r.FormValue("id_field"))
-
-	upload, err := os.CreateTemp("", "lookupx-upload-*")
-	if err != nil {
-		return BulkStats{}, fmt.Errorf("create upload file: %w", err)
-	}
-	uploadPath := upload.Name()
-	defer os.Remove(uploadPath)
-	written, copyErr := io.Copy(upload, io.LimitReader(file, maxIndexUploadBytes+1))
-	closeErr := upload.Close()
-	if copyErr != nil {
-		return BulkStats{}, fmt.Errorf("save uploaded file: %w", copyErr)
-	}
-	if closeErr != nil {
-		return BulkStats{}, fmt.Errorf("close uploaded file: %w", closeErr)
-	}
-	if written > maxIndexUploadBytes {
-		return BulkStats{}, fmt.Errorf("file exceeds the %d MiB upload limit", maxIndexUploadBytes>>20)
-	}
-
+func (s *MultiServer) reloadFilePath(ctx context.Context, id, uploadPath, format, idField, sheet string, batchSize int) (BulkStats, error) {
+	var err error
+	var closeErr error
 	dataPath := uploadPath
 	effectiveFormat := format
 	var convertedPath string
@@ -86,7 +43,7 @@ func (s *MultiServer) reloadFile(ctx context.Context, id string, w http.Response
 		convertedPath, err = convertJSONToJSONL(uploadPath)
 		effectiveFormat = "jsonl"
 	case "xlsx":
-		convertedPath, err = convertXLSXToCSV(uploadPath, strings.TrimSpace(r.FormValue("sheet")))
+		convertedPath, err = convertXLSXToCSV(uploadPath, sheet)
 		effectiveFormat = "csv"
 	default:
 		return BulkStats{}, fmt.Errorf("unsupported file format %q; use CSV, TSV, XLSX, JSON, or JSON Lines", format)
@@ -126,10 +83,6 @@ func (s *MultiServer) reloadFile(ctx context.Context, id string, w http.Response
 	cfg.DisableSource = false
 	if _, _, err := s.Manager.EnsureIndex(id, cfg); err != nil {
 		return BulkStats{}, err
-	}
-	batchSize := 0
-	if raw := strings.TrimSpace(r.FormValue("batch_size")); raw != "" {
-		batchSize, _ = strconv.Atoi(raw)
 	}
 	options := bulkFromSQLReq(id, batchSize, "", false)
 

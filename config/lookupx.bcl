@@ -9,12 +9,11 @@ addr env("ADDR", ":8089")
 data_dir env("LOOKUPX_DATA_DIR", "./data/indexes")
 api_keys [env("LOOKUPX_API_KEY", "")]
 
-datasource "cpt" {
-  kind "sql_query"
-  driver "mysql"
-  dsn env("MYSQL_DSN", "service:service@tcp(127.0.0.1:3306)/cleardb?parseTime=true&loc=UTC")
-  id_column "record_id"
-  query "SELECT CONCAT_WS(':', work_item, charge_type, effective_date, cpt_code, SHA2(JSON_ARRAY(work_item, charge_type, effective_date, cpt_code, end_effective_date, patient_status, ld), 256)) AS record_id, cpt_code AS code, REPLACE(LOWER(cpt_code), '.', '') AS code_no_period, ld AS description, ld AS `fulltext`, work_item AS work_item_uid, work_item, effective_date, end_effective_date, patient_status, charge_type FROM vw_cpt_master WHERE is_cpt = 1"
+# Shared MySQL connection string used by all SQL datasources below.
+const MYSQL_DSN = env("MYSQL_DSN", "service:service@tcp(127.0.0.1:3306)/cleardb?parseTime=true&loc=UTC")
+
+# Reusable base mapping shared by all code lookup datasources.
+column_set "lookup_code_columns" {
   column "code" {
     kind "keyword"
     normalized true
@@ -31,6 +30,103 @@ datasource "cpt" {
     kind "text"
     normalized true
   }
+}
+
+index_defaults "record" {
+  schema "record"
+}
+
+schema_field_set "lookup_fields" {
+  schema_field "code" {
+    kind "keyword"
+    indexed true
+    stored true
+    lookup true
+    lowercase true
+    prefix true
+    term_search true
+  }
+  schema_field "code_no_period" {
+    kind "keyword"
+    indexed true
+    stored true
+    lowercase true
+    prefix true
+    term_search true
+  }
+  schema_field "description" {
+    kind "text"
+    indexed true
+    stored true
+    lowercase true
+    term_search true
+  }
+  schema_field "fulltext" {
+    kind "text"
+    indexed true
+    stored true
+    lowercase true
+    term_search true
+  }
+}
+
+schema_field_set "lookup_fields_with_alias" {
+  schema_field "code" {
+    kind "keyword"
+    indexed true
+    stored true
+    lookup true
+    lowercase true
+    prefix true
+    term_search true
+  }
+  schema_field "code_no_period" {
+    kind "keyword"
+    indexed true
+    stored true
+    lowercase true
+    prefix true
+    term_search true
+  }
+  schema_field "description" {
+    kind "text"
+    indexed true
+    stored true
+    index_alias "fulltext"
+    lowercase true
+    term_search true
+  }
+  schema_field "fulltext" {
+    kind "text"
+    indexed true
+    stored true
+    lowercase true
+    term_search true
+  }
+}
+
+lookup_rule_set "dos_from_date" {
+  lookup_rule "DOS" {
+    target_field "effective_date"
+    operator "gte"
+  }
+}
+
+bulk_settings "standard" {
+  batch_size 32768
+}
+
+bulk_settings "special" {
+  batch_size 16384
+}
+
+datasource "cpt" {
+  kind "sql_query"
+  &column_set.lookup_code_columns
+  driver "mysql"
+  dsn MYSQL_DSN
+  id_column "record_id"
+  query "SELECT CONCAT_WS(':', work_item, charge_type, effective_date, cpt_code, SHA2(JSON_ARRAY(work_item, charge_type, effective_date, cpt_code, end_effective_date, patient_status, ld), 256)) AS record_id, cpt_code AS code, REPLACE(LOWER(cpt_code), '.', '') AS code_no_period, ld AS description, ld AS `fulltext`, work_item AS work_item_uid, work_item, effective_date, end_effective_date, patient_status, charge_type FROM vw_cpt_master WHERE is_cpt = 1"
   column "work_item" {
     kind "keyword"
     normalized true
@@ -59,26 +155,11 @@ datasource "cpt" {
 
 datasource "hcpcs" {
   kind "sql_query"
+  &column_set.lookup_code_columns
   driver "mysql"
-  dsn env("MYSQL_DSN", "service:service@tcp(127.0.0.1:3306)/cleardb?parseTime=true&loc=UTC")
+  dsn MYSQL_DSN
   id_column "record_id"
   query "SELECT CONCAT_WS(':', work_item, charge_type, effective_date, cpt_code, SHA2(JSON_ARRAY(work_item, charge_type, effective_date, cpt_code, end_effective_date, patient_status, ld), 256)) AS record_id, cpt_code AS code, REPLACE(LOWER(cpt_code), '.', '') AS code_no_period, ld AS description, ld AS `fulltext`, work_item AS work_item_uid, work_item, effective_date, end_effective_date, patient_status, charge_type FROM vw_cpt_master WHERE is_cpt = 0"
-  column "code" {
-    kind "keyword"
-    normalized true
-  }
-  column "code_no_period" {
-    kind "keyword"
-    normalized true
-  }
-  column "description" {
-    kind "text"
-    normalized true
-  }
-  column "fulltext" {
-    kind "text"
-    normalized true
-  }
   column "work_item" {
     kind "keyword"
     normalized true
@@ -107,98 +188,38 @@ datasource "hcpcs" {
 
 datasource "cpt_reference" {
   kind "sql_query"
+  &column_set.lookup_code_columns
   driver "mysql"
-  dsn env("MYSQL_DSN", "service:service@tcp(127.0.0.1:3306)/cleardb?parseTime=true&loc=UTC")
+  dsn MYSQL_DSN
   id_column "record_id"
   query "SELECT cpt_code AS record_id, cpt_code AS code, REPLACE(LOWER(cpt_code), '.', '') AS code_no_period, ld AS description, COALESCE(fd, ld) AS `fulltext` FROM vw_cpt WHERE cpt_code NOT REGEXP '^[A-Za-z][0-9]{4}$'"
-  column "code" {
-    kind "keyword"
-    normalized true
-  }
-  column "code_no_period" {
-    kind "keyword"
-    normalized true
-  }
-  column "description" {
-    kind "text"
-    normalized true
-  }
-  column "fulltext" {
-    kind "text"
-    normalized true
-  }
 }
 
 datasource "dx_fac1" {
   kind "sql_query"
+  &column_set.lookup_code_columns
   driver "mysql"
-  dsn env("MYSQL_DSN", "service:service@tcp(127.0.0.1:3306)/cleardb?parseTime=true&loc=UTC")
+  dsn MYSQL_DSN
   id_column "record_id"
   query "SELECT ICD9_CODE AS record_id, ICD9_CODE AS code, REPLACE(LOWER(ICD9_CODE), '.', '') AS code_no_period, LONG_DESCRIPTION AS description, COALESCE(FULL_DESCRIPTION, LONG_DESCRIPTION) AS `fulltext` FROM vw_icd9_fac_1"
-  column "code" {
-    kind "keyword"
-    normalized true
-  }
-  column "code_no_period" {
-    kind "keyword"
-    normalized true
-  }
-  column "description" {
-    kind "text"
-    normalized true
-  }
-  column "fulltext" {
-    kind "text"
-    normalized true
-  }
 }
 
 datasource "dx_fac3" {
   kind "sql_query"
+  &column_set.lookup_code_columns
   driver "mysql"
-  dsn env("MYSQL_DSN", "service:service@tcp(127.0.0.1:3306)/cleardb?parseTime=true&loc=UTC")
+  dsn MYSQL_DSN
   id_column "record_id"
   query "SELECT ICD9_CODE AS record_id, ICD9_CODE AS code, REPLACE(LOWER(ICD9_CODE), '.', '') AS code_no_period, LONG_DESCRIPTION AS description, COALESCE(FULL_DESCRIPTION, LONG_DESCRIPTION) AS `fulltext` FROM vw_icd9_fac_3"
-  column "code" {
-    kind "keyword"
-    normalized true
-  }
-  column "code_no_period" {
-    kind "keyword"
-    normalized true
-  }
-  column "description" {
-    kind "text"
-    normalized true
-  }
-  column "fulltext" {
-    kind "text"
-    normalized true
-  }
 }
 
 datasource "dx_icd10" {
   kind "sql_query"
+  &column_set.lookup_code_columns
   driver "mysql"
-  dsn env("MYSQL_DSN", "service:service@tcp(127.0.0.1:3306)/cleardb?parseTime=true&loc=UTC")
+  dsn MYSQL_DSN
   id_column "record_id"
   query "SELECT id AS record_id, code_with_period AS code, REPLACE(LOWER(code_with_period), '.', '') AS code_no_period, med_desc AS description, COALESCE(long_desc, med_desc) AS `fulltext`, header, effective_date FROM vw_icd10_cm"
-  column "code" {
-    kind "keyword"
-    normalized true
-  }
-  column "code_no_period" {
-    kind "keyword"
-    normalized true
-  }
-  column "description" {
-    kind "text"
-    normalized true
-  }
-  column "fulltext" {
-    kind "text"
-    normalized true
-  }
   column "header" {
     kind "keyword"
     normalized true
@@ -211,26 +232,11 @@ datasource "dx_icd10" {
 
 datasource "dx_icd10_pcs" {
   kind "sql_query"
+  &column_set.lookup_code_columns
   driver "mysql"
-  dsn env("MYSQL_DSN", "service:service@tcp(127.0.0.1:3306)/cleardb?parseTime=true&loc=UTC")
+  dsn MYSQL_DSN
   id_column "record_id"
   query "SELECT id AS record_id, code_with_period AS code, REPLACE(LOWER(code_with_period), '.', '') AS code_no_period, med_desc AS description, COALESCE(long_desc, med_desc) AS `fulltext`, effective_date FROM vw_icd10_pcs"
-  column "code" {
-    kind "keyword"
-    normalized true
-  }
-  column "code_no_period" {
-    kind "keyword"
-    normalized true
-  }
-  column "description" {
-    kind "text"
-    normalized true
-  }
-  column "fulltext" {
-    kind "text"
-    normalized true
-  }
   column "effective_date" {
     kind "time"
     normalized true
@@ -239,26 +245,11 @@ datasource "dx_icd10_pcs" {
 
 datasource "special_fac" {
   kind "sql_query"
+  &column_set.lookup_code_columns
   driver "mysql"
-  dsn env("MYSQL_DSN", "service:service@tcp(127.0.0.1:3306)/cleardb?parseTime=true&loc=UTC")
+  dsn MYSQL_DSN
   id_column "record_id"
   query "SELECT CONCAT_WS(':', cm.work_item_uid, cm.charge_type, cm.effective_date, cm.cpt_hcpcs_code) AS record_id, cm.cpt_hcpcs_code AS code, REPLACE(LOWER(cm.cpt_hcpcs_code), '.', '') AS code_no_period, cm.client_proc_desc AS description, cm.client_proc_desc AS `fulltext`, cm.work_item_uid AS work_item_uid, cm.work_item_uid AS work_item, cm.effective_date, cm.charge_type FROM tbl_charge_master cm JOIN (SELECT work_item_uid, charge_type, effective_date FROM tbl_charge_master WHERE charge_type = 'ED_FACILITY' GROUP BY work_item_uid, charge_type) latest USING (work_item_uid, charge_type, effective_date) LEFT JOIN lu_cpt ON lu_cpt.cpt_code = LEFT(cm.cpt_hcpcs_code, 5) LEFT JOIN tbl_work_item_em_level em ON em.work_item_uid = cm.work_item_uid AND em.charge_type = cm.charge_type AND em.code = cm.cpt_hcpcs_code WHERE lu_cpt.cpt_code IS NULL AND em.code IS NULL AND cm.client_internal_code <> ''"
-  column "code" {
-    kind "keyword"
-    normalized true
-  }
-  column "code_no_period" {
-    kind "keyword"
-    normalized true
-  }
-  column "description" {
-    kind "text"
-    normalized true
-  }
-  column "fulltext" {
-    kind "text"
-    normalized true
-  }
   column "work_item" {
     kind "keyword"
     normalized true
@@ -279,26 +270,11 @@ datasource "special_fac" {
 
 datasource "special_pro" {
   kind "sql_query"
+  &column_set.lookup_code_columns
   driver "mysql"
-  dsn env("MYSQL_DSN", "service:service@tcp(127.0.0.1:3306)/cleardb?parseTime=true&loc=UTC")
+  dsn MYSQL_DSN
   id_column "record_id"
   query "SELECT CONCAT_WS(':', cm.work_item_uid, cm.charge_type, cm.effective_date, cm.cpt_hcpcs_code) AS record_id, cm.cpt_hcpcs_code AS code, REPLACE(LOWER(cm.cpt_hcpcs_code), '.', '') AS code_no_period, cm.client_proc_desc AS description, cm.client_proc_desc AS `fulltext`, cm.work_item_uid AS work_item_uid, cm.work_item_uid AS work_item, cm.effective_date, cm.charge_type FROM tbl_charge_master cm JOIN (SELECT work_item_uid, charge_type, effective_date FROM tbl_charge_master WHERE charge_type = 'ED_PROFEE' GROUP BY work_item_uid, charge_type) latest USING (work_item_uid, charge_type, effective_date) LEFT JOIN lu_cpt ON lu_cpt.cpt_code = LEFT(cm.cpt_hcpcs_code, 5) LEFT JOIN tbl_work_item_em_level em ON em.work_item_uid = cm.work_item_uid AND em.charge_type = cm.charge_type AND em.code = cm.cpt_hcpcs_code WHERE lu_cpt.cpt_code IS NULL AND em.code IS NULL AND cm.client_internal_code <> ''"
-  column "code" {
-    kind "keyword"
-    normalized true
-  }
-  column "code_no_period" {
-    kind "keyword"
-    normalized true
-  }
-  column "description" {
-    kind "text"
-    normalized true
-  }
-  column "fulltext" {
-    kind "text"
-    normalized true
-  }
   column "work_item" {
     kind "keyword"
     normalized true
@@ -318,45 +294,11 @@ datasource "special_pro" {
 }
 
 index "cpt" {
-  schema "record"
   datasource "cpt"
-  lookup_rule "DOS" {
-    target_field "effective_date"
-    operator "gte"
-  }
+  &index_defaults.record
+  &schema_field_set.lookup_fields_with_alias
+  &lookup_rule_set.dos_from_date
   initial_capacity 1000000
-  schema_field "code" {
-    kind "keyword"
-    indexed true
-    stored true
-    lookup true
-    lowercase true
-    prefix true
-    term_search true
-  }
-  schema_field "code_no_period" {
-    kind "keyword"
-    indexed true
-    stored true
-    lowercase true
-    prefix true
-    term_search true
-  }
-  schema_field "description" {
-    kind "text"
-    indexed true
-    stored true
-    index_alias "fulltext"
-    lowercase true
-    term_search true
-  }
-  schema_field "fulltext" {
-    kind "text"
-    indexed true
-    stored true
-    lowercase true
-    term_search true
-  }
   schema_field "work_item" {
     kind "keyword"
     indexed false
@@ -395,7 +337,7 @@ index "cpt" {
     lookup true
   }
   bulk {
-    batch_size 32768
+    &bulk_settings.standard
     checkpoint_every 10000
     checkpoint_path "./data/checkpoints/cpt.json"
     resume false
@@ -403,45 +345,11 @@ index "cpt" {
 }
 
 index "hcpcs" {
-  schema "record"
   datasource "hcpcs"
-  lookup_rule "DOS" {
-    target_field "effective_date"
-    operator "gte"
-  }
+  &index_defaults.record
+  &schema_field_set.lookup_fields_with_alias
+  &lookup_rule_set.dos_from_date
   initial_capacity 1000000
-  schema_field "code" {
-    kind "keyword"
-    indexed true
-    stored true
-    lookup true
-    lowercase true
-    prefix true
-    term_search true
-  }
-  schema_field "code_no_period" {
-    kind "keyword"
-    indexed true
-    stored true
-    lowercase true
-    prefix true
-    term_search true
-  }
-  schema_field "description" {
-    kind "text"
-    indexed true
-    stored true
-    index_alias "fulltext"
-    lowercase true
-    term_search true
-  }
-  schema_field "fulltext" {
-    kind "text"
-    indexed true
-    stored true
-    lowercase true
-    term_search true
-  }
   schema_field "work_item" {
     kind "keyword"
     indexed false
@@ -480,7 +388,7 @@ index "hcpcs" {
     lookup true
   }
   bulk {
-    batch_size 32768
+    &bulk_settings.standard
     checkpoint_every 10000
     checkpoint_path "./data/checkpoints/hcpcs.json"
     resume false
@@ -488,161 +396,38 @@ index "hcpcs" {
 }
 
 index "cpt-hm" {
-  schema "record"
   datasource "cpt_reference"
+  &index_defaults.record
+  &schema_field_set.lookup_fields
   initial_capacity 50000
-    schema_field "code" {
-    kind "keyword"
-    indexed true
-    stored true
-    lookup true
-    lowercase true
-    prefix true
-    term_search true
-  }
-  schema_field "code_no_period" {
-    kind "keyword"
-    indexed true
-    lowercase true
-    prefix true
-    stored true
-    term_search true
-  }
-  schema_field "description" {
-    kind "text"
-    indexed true
-    stored true
-    lowercase true
-    term_search true
-  }
-  schema_field "fulltext" {
-    kind "text"
-    indexed true
-    lowercase true
-    stored true
-    term_search true
-  }
   bulk {
-    batch_size 32768
+    &bulk_settings.standard
   }
 }
 
 index "dx-fac1" {
-  schema "record"
   datasource "dx_fac1"
-    schema_field "code" {
-    kind "keyword"
-    indexed true
-    stored true
-    lookup true
-    lowercase true
-    prefix true
-    term_search true
-  }
-  schema_field "code_no_period" {
-    kind "keyword"
-    indexed true
-    lowercase true
-    prefix true
-    stored true
-    term_search true
-  }
-  schema_field "description" {
-    kind "text"
-    indexed true
-    stored true
-    lowercase true
-    term_search true
-  }
-  schema_field "fulltext" {
-    kind "text"
-    indexed true
-    lowercase true
-    stored true
-    term_search true
-  }
+  &index_defaults.record
+  &schema_field_set.lookup_fields
   bulk {
-    batch_size 32768
+    &bulk_settings.standard
   }
 }
 
 index "dx-fac3" {
-  schema "record"
   datasource "dx_fac3"
-    schema_field "code" {
-    kind "keyword"
-    indexed true
-    stored true
-    lookup true
-    lowercase true
-    prefix true
-    term_search true
-  }
-  schema_field "code_no_period" {
-    kind "keyword"
-    indexed true
-    lowercase true
-    prefix true
-    stored true
-    term_search true
-  }
-  schema_field "description" {
-    kind "text"
-    indexed true
-    stored true
-    lowercase true
-    term_search true
-  }
-  schema_field "fulltext" {
-    kind "text"
-    indexed true
-    lowercase true
-    stored true
-    term_search true
-  }
+  &index_defaults.record
+  &schema_field_set.lookup_fields
   bulk {
-    batch_size 32768
+    &bulk_settings.standard
   }
 }
 
 index "dx-icd10" {
-  schema "record"
   datasource "dx_icd10"
-  lookup_rule "DOS" {
-    target_field "effective_date"
-    operator "gte"
-  }
-    schema_field "code" {
-    kind "keyword"
-    indexed true
-    stored true
-    lookup true
-    lowercase true
-    prefix true
-    term_search true
-  }
-  schema_field "code_no_period" {
-    kind "keyword"
-    indexed true
-    lowercase true
-    prefix true
-    stored true
-    term_search true
-  }
-  schema_field "description" {
-    kind "text"
-    indexed true
-    stored true
-    lowercase true
-    term_search true
-  }
-  schema_field "fulltext" {
-    kind "text"
-    indexed true
-    lowercase true
-    stored true
-    term_search true
-  }
+  &index_defaults.record
+  &schema_field_set.lookup_fields
+  &lookup_rule_set.dos_from_date
   schema_field "header" {
     kind "keyword"
     indexed true
@@ -657,48 +442,15 @@ index "dx-icd10" {
     lookup true
   }
   bulk {
-    batch_size 32768
+    &bulk_settings.standard
   }
 }
 
 index "dx-icd10-pcs" {
-  schema "record"
   datasource "dx_icd10_pcs"
-  lookup_rule "DOS" {
-    target_field "effective_date"
-    operator "gte"
-  }
-    schema_field "code" {
-    kind "keyword"
-    indexed true
-    stored true
-    lookup true
-    lowercase true
-    prefix true
-    term_search true
-  }
-  schema_field "code_no_period" {
-    kind "keyword"
-    indexed true
-    lowercase true
-    prefix true
-    stored true
-    term_search true
-  }
-  schema_field "description" {
-    kind "text"
-    indexed true
-    stored true
-    lowercase true
-    term_search true
-  }
-  schema_field "fulltext" {
-    kind "text"
-    indexed true
-    lowercase true
-    stored true
-    term_search true
-  }
+  &index_defaults.record
+  &schema_field_set.lookup_fields
+  &lookup_rule_set.dos_from_date
   schema_field "effective_date" {
     kind "time"
     indexed true
@@ -706,49 +458,15 @@ index "dx-icd10-pcs" {
     lookup true
   }
   bulk {
-    batch_size 32768
+    &bulk_settings.standard
   }
 }
 
 index "special-fac" {
-  schema "record"
   datasource "special_fac"
-  lookup_rule "DOS" {
-    target_field "effective_date"
-    operator "gte"
-  }
-    schema_field "code" {
-    kind "keyword"
-    indexed true
-    stored true
-    lookup true
-    lowercase true
-    prefix true
-    term_search true
-  }
-  schema_field "code_no_period" {
-    kind "keyword"
-    indexed true
-    lowercase true
-    prefix true
-    stored true
-    term_search true
-  }
-  schema_field "description" {
-    kind "text"
-    indexed true
-    stored true
-    index_alias "fulltext"
-    lowercase true
-    term_search true
-  }
-  schema_field "fulltext" {
-    kind "text"
-    indexed true
-    lowercase true
-    stored true
-    term_search true
-  }
+  &index_defaults.record
+  &schema_field_set.lookup_fields_with_alias
+  &lookup_rule_set.dos_from_date
   schema_field "work_item" {
     kind "keyword"
     indexed true
@@ -775,49 +493,15 @@ index "special-fac" {
     lookup true
   }
   bulk {
-    batch_size 16384
+    &bulk_settings.special
   }
 }
 
 index "special-pro" {
-  schema "record"
   datasource "special_pro"
-  lookup_rule "DOS" {
-    target_field "effective_date"
-    operator "gte"
-  }
-    schema_field "code" {
-    kind "keyword"
-    indexed true
-    stored true
-    lookup true
-    lowercase true
-    prefix true
-    term_search true
-  }
-  schema_field "code_no_period" {
-    kind "keyword"
-    indexed true
-    lowercase true
-    prefix true
-    stored true
-    term_search true
-  }
-  schema_field "description" {
-    kind "text"
-    indexed true
-    stored true
-    index_alias "fulltext"
-    lowercase true
-    term_search true
-  }
-  schema_field "fulltext" {
-    kind "text"
-    indexed true
-    lowercase true
-    stored true
-    term_search true
-  }
+  &index_defaults.record
+  &schema_field_set.lookup_fields_with_alias
+  &lookup_rule_set.dos_from_date
   schema_field "work_item" {
     kind "keyword"
     indexed true
@@ -844,6 +528,6 @@ index "special-pro" {
     lookup true
   }
   bulk {
-    batch_size 16384
+    &bulk_settings.special
   }
 }

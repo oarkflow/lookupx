@@ -2,11 +2,6 @@ package pkg
 
 import (
 	"crypto/subtle"
-	"encoding/json"
-	"fmt"
-	"io"
-	"net/http"
-	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -20,180 +15,6 @@ type Server struct {
 	LatencyBuckets [6]uint64
 	lastSecond     int64
 	secondCount    int64
-}
-
-func (s *Server) authorized(w http.ResponseWriter, r *http.Request) bool {
-	atomic.AddUint64(&s.Requests, 1)
-	if s.Index != nil && s.Index.cfg.RateLimitQPS > 0 {
-		now := time.Now().Unix()
-		if atomic.LoadInt64(&s.lastSecond) != now {
-			atomic.StoreInt64(&s.lastSecond, now)
-			atomic.StoreInt64(&s.secondCount, 0)
-		}
-		if atomic.AddInt64(&s.secondCount, 1) > int64(s.Index.cfg.RateLimitQPS) {
-			http.Error(w, "rate limit exceeded", http.StatusTooManyRequests)
-			return false
-		}
-	}
-	if s.Index == nil || len(s.Index.cfg.APIKeys) == 0 {
-		return true
-	}
-	key := r.Header.Get("X-API-Key")
-	if strings.HasPrefix(r.Header.Get("Authorization"), "Bearer ") {
-		key = strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
-	}
-	for _, k := range s.Index.cfg.APIKeys {
-		if constantTimeStringEqual(k, key) {
-			return true
-		}
-	}
-	writeError(w, http.StatusUnauthorized, "unauthorized")
-	return false
-}
-
-func (s *Server) audit(r *http.Request, status string) {
-	if s.Index == nil || s.Index.cfg.AuditPath == "" {
-		return
-	}
-	_ = appendAudit(s.Index.cfg.AuditPath, map[string]any{"ts": time.Now().Format(time.RFC3339Nano), "method": r.Method, "path": r.URL.Path, "status": status, "trace_id": r.Header.Get("X-Trace-ID")})
-}
-
-func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
-	if s.Index == nil {
-		writeError(w, http.StatusServiceUnavailable, "index not configured")
-		return
-	}
-	if !s.authorized(w, r) {
-		return
-	}
-	started := time.Now()
-	r.Body = http.MaxBytesReader(w, r.Body, s.maxRequestBytes())
-	defer func() {
-		dur := time.Since(started)
-		s.observeLatency(dur)
-		if s.Index != nil && s.Index.cfg.SlowQueryNanos > 0 && dur.Nanoseconds() > s.Index.cfg.SlowQueryNanos {
-			atomic.AddUint64(&s.SlowQueries, 1)
-		}
-		s.audit(r, "ok")
-	}()
-	switch {
-	case r.Method == "GET" && r.URL.Path == "/health":
-		json.NewEncoder(w).Encode(map[string]any{"ok": true})
-	case r.Method == "GET" && r.URL.Path == "/stats":
-		json.NewEncoder(w).Encode(s.Index.Stats())
-	case r.Method == "GET" && r.URL.Path == "/metrics":
-		w.Header().Set("Content-Type", "text/plain; version=0.0.4")
-		stats := s.Index.Stats()
-		fmt.Fprintf(w, "lookupx_requests_total %d\nlookupx_errors_total %d\nlookupx_slow_queries_total %d\nlookupx_live_docs %d\nlookupx_vector_nodes %d\nlookupx_vector_tombstones %d\n", atomic.LoadUint64(&s.Requests), atomic.LoadUint64(&s.Errors), atomic.LoadUint64(&s.SlowQueries), stats.LiveDocs, stats.VectorNodes, stats.VectorTombstones)
-		for i, le := range []string{"1000000", "5000000", "10000000", "50000000", "100000000", "+Inf"} {
-			fmt.Fprintf(w, "lookupx_request_duration_ns_bucket{le=\"%s\"} %d\n", le, atomic.LoadUint64(&s.LatencyBuckets[i]))
-		}
-	case r.Method == "GET" && r.URL.Path == "/health/index":
-		json.NewEncoder(w).Encode(map[string]any{"ok": true, "stats": s.Index.Stats()})
-	case r.Method == "POST" && r.URL.Path == "/analyze":
-		var body struct{ Field, Text string }
-		if err := decodeJSON(r.Body, &body); err != nil {
-			atomic.AddUint64(&s.Errors, 1)
-			writeError(w, http.StatusBadRequest, err.Error())
-			return
-		}
-		json.NewEncoder(w).Encode(map[string]any{"tokens": s.Index.Analyze(body.Field, body.Text)})
-	case r.Method == "PUT" && strings.HasPrefix(r.URL.Path, "/docs/"):
-		id := strings.TrimPrefix(r.URL.Path, "/docs/")
-		var d Document
-		if err := decodeJSON(r.Body, &d); err != nil {
-			atomic.AddUint64(&s.Errors, 1)
-			writeError(w, http.StatusBadRequest, err.Error())
-			return
-		}
-		if err := s.Index.Upsert(id, d); err != nil {
-			atomic.AddUint64(&s.Errors, 1)
-			writeError(w, http.StatusBadRequest, err.Error())
-			return
-		}
-		json.NewEncoder(w).Encode(map[string]any{"ok": true, "id": id})
-	case r.Method == "POST" && r.URL.Path == "/docs/batch":
-		var body map[string]Document
-		if err := decodeJSON(r.Body, &body); err != nil {
-			atomic.AddUint64(&s.Errors, 1)
-			writeError(w, http.StatusBadRequest, err.Error())
-			return
-		}
-		if err := s.Index.BatchUpsert(body); err != nil {
-			atomic.AddUint64(&s.Errors, 1)
-			writeError(w, http.StatusBadRequest, err.Error())
-			return
-		}
-		json.NewEncoder(w).Encode(map[string]any{"ok": true, "count": len(body)})
-	case r.Method == "GET" && strings.HasPrefix(r.URL.Path, "/docs/"):
-		id := strings.TrimPrefix(r.URL.Path, "/docs/")
-		if d, ok := s.Index.Get(id); ok {
-			json.NewEncoder(w).Encode(d)
-		} else {
-			http.NotFound(w, r)
-		}
-	case r.Method == "DELETE" && strings.HasPrefix(r.URL.Path, "/docs/"):
-		id := strings.TrimPrefix(r.URL.Path, "/docs/")
-		_ = s.Index.Delete(id)
-		json.NewEncoder(w).Encode(map[string]any{"ok": true})
-	case r.Method == "POST" && r.URL.Path == "/search":
-		var q WireQuery
-		if err := decodeJSON(r.Body, &q); err != nil {
-			atomic.AddUint64(&s.Errors, 1)
-			writeError(w, http.StatusBadRequest, err.Error())
-			return
-		}
-		limit := s.sanitizeLimit(q.Limit)
-		if q.AfterDocID > 0 && len(q.Sort) > 0 {
-			writeError(w, http.StatusBadRequest, "after_doc_id pagination cannot be combined with sort")
-			return
-		}
-		if q.AfterDocID > 0 && q.Offset > 0 {
-			writeError(w, http.StatusBadRequest, "after_doc_id pagination cannot be combined with offset")
-			return
-		}
-		res := s.Index.Search(SearchRequest{Query: q.ToQuery(), Limit: limit, Offset: q.Offset, AfterDocID: q.AfterDocID, SkipTotal: q.SkipTotal, WithDocs: q.WithDocs, Sort: q.Sort, Facets: q.Facets})
-		json.NewEncoder(w).Encode(res)
-	case r.Method == "POST" && r.URL.Path == "/count":
-		var q WireQuery
-		if err := decodeJSON(r.Body, &q); err != nil {
-			atomic.AddUint64(&s.Errors, 1)
-			writeError(w, http.StatusBadRequest, err.Error())
-			return
-		}
-		json.NewEncoder(w).Encode(map[string]any{"count": s.Index.Count(q.ToQuery())})
-	case r.Method == "POST" && r.URL.Path == "/truncate-wal":
-		if err := s.Index.TruncateWAL(); err != nil {
-			atomic.AddUint64(&s.Errors, 1)
-			writeError(w, http.StatusInternalServerError, err.Error())
-			return
-		}
-		json.NewEncoder(w).Encode(map[string]any{"ok": true})
-	case r.Method == "POST" && r.URL.Path == "/snapshot":
-		var body struct {
-			Path string `json:"path"`
-		}
-		_ = decodeJSON(r.Body, &body)
-		if body.Path == "" {
-			body.Path = s.Index.cfg.SnapshotPath
-		}
-		if err := s.Index.SaveSnapshot(body.Path); err != nil {
-			atomic.AddUint64(&s.Errors, 1)
-			writeError(w, http.StatusInternalServerError, err.Error())
-			return
-		}
-		json.NewEncoder(w).Encode(map[string]any{"ok": true, "path": body.Path})
-	case r.Method == "POST" && r.URL.Path == "/compact":
-		if err := s.Index.Compact(); err != nil {
-			atomic.AddUint64(&s.Errors, 1)
-			writeError(w, http.StatusInternalServerError, err.Error())
-			return
-		}
-		json.NewEncoder(w).Encode(map[string]any{"ok": true, "stats": s.Index.Stats()})
-	default:
-		http.NotFound(w, r)
-	}
 }
 
 type WireQuery struct {
@@ -288,45 +109,11 @@ func toQueries(ws []WireQuery) []Query {
 	}
 	return qs
 }
-func IntParam(r *http.Request, name string, def int) int {
-	if v := r.URL.Query().Get(name); v != "" {
-		if i, err := strconv.Atoi(v); err == nil {
-			return i
-		}
-	}
-	return def
-}
-
 func constantTimeStringEqual(a, b string) bool {
 	if len(a) != len(b) {
 		return false
 	}
 	return subtle.ConstantTimeCompare([]byte(a), []byte(b)) == 1
-}
-
-func decodeJSON(r io.Reader, dst any) error {
-	dec := json.NewDecoder(r)
-	dec.UseNumber()
-	if err := dec.Decode(dst); err != nil {
-		return err
-	}
-	if err := dec.Decode(&struct{}{}); err != io.EOF {
-		return fmt.Errorf("request body must contain a single JSON value")
-	}
-	return nil
-}
-
-func writeError(w http.ResponseWriter, status int, message string) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(map[string]any{"ok": false, "error": message, "status": status})
-}
-
-func (s *Server) maxRequestBytes() int64 {
-	if s != nil && s.Index != nil && s.Index.cfg.MaxRequestBytes > 0 {
-		return s.Index.cfg.MaxRequestBytes
-	}
-	return 32 << 20
 }
 
 func (s *Server) sanitizeLimit(limit int) int {

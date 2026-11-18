@@ -65,7 +65,7 @@ func TestSQLIntegrationsCreateIndexesWithoutPrimaryKey(t *testing.T) {
 			request.Header.Set("Content-Type", "application/json")
 			response := httptest.NewRecorder()
 			manager := NewMultiIndexManager()
-			(&MultiServer{Manager: manager}).ServeHTTP(response, request)
+			serveFHTest(t, response, &MultiServer{Manager: manager}, request)
 			if response.Code != http.StatusOK {
 				t.Fatalf("reload returned %d: %s", response.Code, response.Body.String())
 			}
