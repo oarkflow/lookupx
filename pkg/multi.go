@@ -48,6 +48,7 @@ type ManagedIndex struct {
 	Source     SourceFactory `json:"-"`
 	Bulk       BulkOptions   `json:"-"`
 	Latency    IndexLatency  `json:"latency"`
+	Progress   BulkProgress  `json:"progress,omitempty"`
 	Reloading  bool          `json:"reloading"`
 	Generation uint64        `json:"generation"`
 }
@@ -90,15 +91,33 @@ func (m *MultiIndexManager) RestorePersistent(ctx context.Context, store FileSeg
 // RestorePersistentIndex replaces one configured index with its saved
 // generation while retaining the BCL datasource factory and reload settings.
 func (m *MultiIndexManager) RestorePersistentIndex(ctx context.Context, store FileSegmentStore, id string, cfg Config) error {
+	id = cleanIndexID(id)
+	m.mu.Lock()
+	old := m.indexes[id]
+	if old != nil && old.Reloading {
+		m.mu.Unlock()
+		return fmt.Errorf("index %q is already reloading", id)
+	}
+	if old != nil {
+		old.Reloading = true
+	}
+	m.mu.Unlock()
 	ix, man, err := OpenPersistent(ctx, store, id, cfg)
 	if errors.Is(err, os.ErrNotExist) {
+		m.setReloading(id, false, "")
 		return err
 	}
 	if err != nil {
+		m.setReloading(id, false, err.Error())
 		return err
 	}
 	m.mu.Lock()
-	old := m.indexes[cleanIndexID(id)]
+	if current := m.indexes[id]; current != old {
+		m.mu.Unlock()
+		_ = ix.Close()
+		m.setReloading(id, false, "")
+		return fmt.Errorf("index %q changed while restore was being prepared", id)
+	}
 	mi := &ManagedIndex{ID: cleanIndexID(id), Index: ix, Config: ix.cfg, Generation: man.Generation}
 	if old != nil {
 		mi.Source, mi.Bulk, mi.Latency = old.Source, old.Bulk, old.Latency
@@ -218,7 +237,7 @@ func (m *MultiIndexManager) List() []ManagedIndexInfo {
 	m.mu.RLock()
 	out := make([]ManagedIndexInfo, 0, len(m.indexes))
 	for id, mi := range m.indexes {
-		info := ManagedIndexInfo{ID: id, Generation: mi.Generation, Reloading: mi.Reloading, Latency: mi.Latency}
+		info := ManagedIndexInfo{ID: id, Generation: mi.Generation, Reloading: mi.Reloading, Latency: mi.Latency, Progress: mi.Progress}
 		if mi.Index != nil {
 			info.Stats = mi.Index.Stats()
 		}
@@ -234,6 +253,7 @@ type ManagedIndexInfo struct {
 	Reloading  bool         `json:"reloading"`
 	Stats      Stats        `json:"stats"`
 	Latency    IndexLatency `json:"latency"`
+	Progress   BulkProgress `json:"progress,omitempty"`
 }
 
 func (m *MultiIndexManager) Reload(ctx context.Context, id string) (BulkStats, error) {
@@ -259,9 +279,12 @@ func (m *MultiIndexManager) ReloadFromFactory(ctx context.Context, id string, fa
 	return m.ReloadWithConfig(ctx, id, old.Config, factory, opt)
 }
 
-// ReloadWithConfig atomically replaces an index using a new schema. The source
-// factory receives the new index so column names are resolved against the
-// replacement schema, not the index being retired.
+// ReloadWithConfig builds a replacement using a new schema. A populated index
+// remains active until the replacement is complete. If this is an initial
+// build with no documents to serve, the new index is published immediately and
+// each successfully flushed batch becomes queryable while ingestion continues.
+// The source factory receives the replacement index so column names resolve
+// against its compiled schema.
 func (m *MultiIndexManager) ReloadWithConfig(ctx context.Context, id string, cfg Config, factory SourceFactory, opt BulkOptions) (BulkStats, error) {
 	id = cleanIndexID(id)
 	m.mu.RLock()
@@ -276,7 +299,34 @@ func (m *MultiIndexManager) ReloadWithConfig(ctx context.Context, id string, cfg
 	if factory == nil {
 		return BulkStats{}, fmt.Errorf("index %q has no source", id)
 	}
-	m.setReloading(id, true, "")
+	m.mu.Lock()
+	if m.indexes[id] != old {
+		m.mu.Unlock()
+		return BulkStats{}, fmt.Errorf("index %q changed while reload was being prepared", id)
+	}
+	if old.Reloading {
+		m.mu.Unlock()
+		return BulkStats{}, fmt.Errorf("index %q is already reloading", id)
+	}
+	old.Reloading = true
+	old.Progress = BulkProgress{SourceName: opt.Name, StartedAt: time.Now()}
+	m.mu.Unlock()
+	if opt.Resume && opt.Checkpoint != nil {
+		checkpointName := opt.Name
+		if checkpointName == "" {
+			checkpointName = id
+		}
+		seq, err := opt.Checkpoint.Load(ctx, checkpointName)
+		if err != nil {
+			m.setReloading(id, false, err.Error())
+			return BulkStats{}, fmt.Errorf("load reload checkpoint: %w", err)
+		}
+		if seq > 0 {
+			message := fmt.Sprintf("cannot resume replacement index %q from source checkpoint %d: the replacement index is empty; use a durable partition build that restores its matching index generation, or restart with resume=false", id, seq)
+			m.setReloading(id, false, message)
+			return BulkStats{}, errors.New(message)
+		}
+	}
 	usageBefore := readResourceUsage()
 	started := time.Now()
 	ix, err := New(cfg)
@@ -284,10 +334,39 @@ func (m *MultiIndexManager) ReloadWithConfig(ctx context.Context, id string, cfg
 		m.setReloading(id, false, err.Error())
 		return BulkStats{}, err
 	}
+	previousIndex := old.Index
+	exposePartial := previousIndex == nil || previousIndex.Stats().Docs == 0
+	active := old
+	if exposePartial {
+		// A first build has no complete generation to serve. Publish its empty
+		// index before ingest starts so each successfully flushed batch becomes
+		// queryable while the build remains pending.
+		active = &ManagedIndex{ID: id, Index: ix, Config: cfg, Source: factory, Bulk: old.Bulk, Latency: old.Latency, Progress: old.Progress, Reloading: true, Generation: old.Generation}
+		m.mu.Lock()
+		if m.indexes[id] != old {
+			m.mu.Unlock()
+			_ = ix.Close()
+			return BulkStats{}, fmt.Errorf("index %q changed while reload was being prepared", id)
+		}
+		m.indexes[id] = active
+		m.mu.Unlock()
+	}
 	src, err := factory(ix)
 	if err != nil {
-		_ = ix.Close()
-		m.setReloading(id, false, err.Error())
+		if !exposePartial {
+			_ = ix.Close()
+		}
+		m.mu.Lock()
+		if m.indexes[id] == active {
+			if exposePartial {
+				active.Reloading = false
+				active.Latency.LastError = err.Error()
+			} else {
+				old.Reloading = false
+				old.Latency.LastError = err.Error()
+			}
+		}
+		m.mu.Unlock()
 		return BulkStats{}, err
 	}
 	if opt.Name == "" {
@@ -296,26 +375,48 @@ func (m *MultiIndexManager) ReloadWithConfig(ctx context.Context, id string, cfg
 	if opt.BatchSize <= 0 {
 		opt.BatchSize = 65536
 	}
+	progressCallback := opt.Progress
+	opt.Progress = func(progress BulkProgress) {
+		m.mu.Lock()
+		if current := m.indexes[id]; current == active {
+			current.Progress = progress
+		}
+		m.mu.Unlock()
+		if progressCallback != nil {
+			progressCallback(progress)
+		}
+	}
 	stats, err := ix.IndexFrom(ctx, src, opt)
 	took := time.Since(started)
 	lat := latencyFromStats(stats, took, err)
 	lat.LastResources = usageDelta(usageBefore, readResourceUsage())
 	m.mu.Lock()
 	cur := m.indexes[id]
+	if cur != active {
+		m.mu.Unlock()
+		_ = ix.Close()
+		return stats, fmt.Errorf("index %q changed while reload was running", id)
+	}
 	if err == nil {
 		ix.cfg = cfg
-		m.indexes[id] = &ManagedIndex{ID: id, Index: ix, Config: cfg, Source: factory, Bulk: opt, Latency: lat, Generation: old.Generation + 1}
-	} else if cur != nil {
+		m.indexes[id] = &ManagedIndex{ID: id, Index: ix, Config: cfg, Source: factory, Bulk: opt, Latency: lat, Progress: BulkProgress{SourceName: opt.Name, Seen: stats.Seen, Indexed: stats.Indexed, Skipped: stats.Skipped, LastSeq: stats.LastSeq, StartedAt: old.Progress.StartedAt, Took: took}, Generation: old.Generation + 1}
+	} else if exposePartial {
+		active.Reloading = false
+		active.Latency = lat
+		active.Progress = BulkProgress{SourceName: opt.Name, Seen: stats.Seen, Indexed: stats.Indexed, Skipped: stats.Skipped, LastSeq: stats.LastSeq, StartedAt: old.Progress.StartedAt, Took: took}
+	} else {
 		cur.Reloading = false
-		cur.Latency.LastError = err.Error()
+		cur.Latency = lat
 	}
 	m.mu.Unlock()
 	if err != nil {
-		_ = ix.Close()
+		if !exposePartial {
+			_ = ix.Close()
+		}
 		return stats, err
 	}
-	if old.Index != nil {
-		_ = old.Index.Close()
+	if previousIndex != nil && previousIndex != ix {
+		_ = previousIndex.Close()
 	}
 	return stats, nil
 }
@@ -448,6 +549,7 @@ type SQLReloadRequest struct {
 	Args           []any           `json:"args"`
 	IDColumn       string          `json:"id_column"`
 	SeqColumn      string          `json:"seq_column"`
+	PageSize       int             `json:"page_size,omitempty"`
 	Columns        []SQLColumnSpec `json:"columns"`
 	BatchSize      int             `json:"batch_size"`
 	CheckpointPath string          `json:"checkpoint_path"`
@@ -479,6 +581,18 @@ type SQLColumnSpec struct {
 }
 
 func (s *MultiServer) reloadSQLRequest(ctx context.Context, id string, req SQLReloadRequest) (BulkStats, error) {
+	if req.PageSize < 0 {
+		return BulkStats{}, errors.New("page_size cannot be negative")
+	}
+	if req.PageSize > 0 && req.SeqColumn == "" {
+		return BulkStats{}, errors.New("page_size requires a stable numeric seq_column")
+	}
+	if req.PageSize > 0 && req.IDColumn == "" {
+		return BulkStats{}, errors.New("keyset paging requires an id_column for stable document IDs")
+	}
+	if req.PageSize > 0 && !validSQLIdentifier(req.SeqColumn) {
+		return BulkStats{}, errors.New("seq_column must be a simple SELECT output identifier for keyset paging")
+	}
 	mi, ok := s.Manager.Managed(id)
 	dsn, err := secureSQLiteDSN(req.Driver, req.DSN, s.DataDir)
 	if err != nil {
@@ -489,6 +603,7 @@ func (s *MultiServer) reloadSQLRequest(ctx context.Context, id string, req SQLRe
 		return BulkStats{}, err
 	}
 	defer db.Close()
+	configureBulkSQLPool(db.DB())
 	inferred, err := InferSQLColumns(ctx, db.DB(), req.Query, req.Args, req.IDColumn, req.SeqColumn, 200)
 	if err != nil {
 		return BulkStats{}, err
@@ -505,7 +620,15 @@ func (s *MultiServer) reloadSQLRequest(ctx context.Context, id string, req SQLRe
 	}
 	opt := bulkFromSQLReq(id, req.BatchSize, req.CheckpointPath, req.Resume)
 	return s.Manager.ReloadWithConfig(ctx, id, cfg, func(ix *Index) (Source, error) {
-		return SQLQuerySource{DB: db.DB(), Query: req.Query, Args: req.Args, IDColumn: req.IDColumn, SeqColumn: req.SeqColumn, Columns: BindSQLColumns(ix, inferred)}, nil
+		cols := BindSQLColumns(ix, inferred)
+		if req.PageSize > 0 {
+			base := strings.TrimSpace(strings.TrimSuffix(strings.TrimSpace(req.Query), ";"))
+			page := func(last uint64, limit int) (string, []any) {
+				return buildSQLQueryPage(base, req.Args, req.SeqColumn, req.Driver, last, limit)
+			}
+			return PagedSQLQuerySource{DB: db.DB(), Page: page, IDColumn: req.IDColumn, SeqColumn: req.SeqColumn, Columns: cols, PageSize: req.PageSize}, nil
+		}
+		return SQLQuerySource{DB: db.DB(), Query: req.Query, Args: req.Args, IDColumn: req.IDColumn, SeqColumn: req.SeqColumn, Columns: cols}, nil
 	}, opt)
 }
 

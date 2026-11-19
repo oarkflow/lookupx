@@ -209,6 +209,7 @@ td:first-child { color: #263548; font-family: ui-monospace, SFMono-Regular, Menl
 .metric-icon { display: grid; place-items: center; width: 36px; height: 36px; border-radius: 7px; color: var(--accent); background: var(--accent-pale); }
 .metric-icon svg { width: 18px; height: 18px; fill: none; stroke: currentColor; stroke-width: 1.7; stroke-linecap: round; stroke-linejoin: round; }
 .index-card { margin-bottom: 0; }
+.index-progress-line { margin-top: 10px; color: var(--muted, #94a3b8); font: 500 12px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; white-space: nowrap; overflow-x: auto; }
 .index-card-top { display: flex; align-items: flex-start; justify-content: space-between; gap: 20px; margin-bottom: 16px; }
 .index-identity { display: flex; align-items: center; gap: 9px; min-width: 0; }
 .index-name { overflow: hidden; color: #29394d; font-size: 14px; font-weight: 650; text-overflow: ellipsis; white-space: nowrap; }

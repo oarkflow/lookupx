@@ -5,7 +5,9 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"net"
 	"strings"
+	"time"
 )
 
 // SQLDialect controls placeholder rendering for generated SQL. Raw SQLSource /
@@ -34,6 +36,42 @@ func (d SQLDialect) Placeholder(n int) string {
 	default:
 		return "?"
 	}
+}
+
+func buildSQLQueryPage(base string, baseArgs []any, seqColumn, driver string, lastSeq uint64, limit int) (string, []any) {
+	dialect := SQLDialectQuestion
+	switch strings.ToLower(driver) {
+	case "postgres", "postgresql", "pgx":
+		dialect = SQLDialectPostgres
+	case "sqlserver", "mssql":
+		dialect = SQLDialectSQLServer
+	case "named_colon":
+		dialect = SQLDialectNamedColon
+	}
+	quote := "`"
+	if dialect == SQLDialectPostgres || dialect == SQLDialectNamedColon {
+		quote = `"`
+	}
+	if dialect == SQLDialectSQLServer {
+		quote = "["
+	}
+	quotedSeq := quote + seqColumn + map[bool]string{true: "]", false: quote}[dialect == SQLDialectSQLServer]
+	qualified := "lookupx_page." + quotedSeq
+	args := append([]any(nil), baseArgs...)
+	pageSQL := "SELECT * FROM (" + base + ") AS lookupx_page"
+	if lastSeq > 0 {
+		args = append(args, lastSeq)
+		pageSQL += " WHERE " + qualified + " > " + dialect.Placeholder(len(args))
+	}
+	pageSQL += " ORDER BY " + qualified + " ASC"
+	if dialect == SQLDialectSQLServer {
+		args = append(args, limit)
+		pageSQL += " OFFSET 0 ROWS FETCH NEXT " + dialect.Placeholder(len(args)) + " ROWS ONLY"
+	} else {
+		args = append(args, limit)
+		pageSQL += " LIMIT " + dialect.Placeholder(len(args))
+	}
+	return pageSQL, args
 }
 
 // SQLQuerySource is a named alias over SQLSource intended for arbitrary SQL
@@ -98,8 +136,14 @@ func (s PagedSQLQuerySource) Open(ctx context.Context) (Cursor, error) {
 	if s.Page == nil {
 		return nil, errors.New("sql page function required")
 	}
+	if s.IDColumn == "" {
+		return nil, errors.New("sql page source requires a stable id_column")
+	}
+	if !validSQLIdentifier(s.SeqColumn) {
+		return nil, errors.New("sql page source requires a simple sequence output identifier")
+	}
 	if s.PageSize <= 0 {
-		s.PageSize = 100000
+		s.PageSize = 10000
 	}
 	return &pagedSQLQueryCursor{src: s, last: s.StartAfter}, nil
 }
@@ -112,16 +156,70 @@ type pagedSQLQueryCursor struct {
 	err  error
 }
 
+func transientSQLError(err error) bool {
+	if err == nil {
+		return false
+	}
+	var ne net.Error
+	if errors.As(err, &ne) {
+		return true
+	}
+	var state interface{ SQLState() string }
+	if errors.As(err, &state) {
+		code := state.SQLState()
+		if strings.HasPrefix(code, "08") || code == "40001" || code == "57P01" {
+			return true
+		}
+	}
+	message := strings.ToLower(err.Error())
+	for _, marker := range []string{"connection reset", "broken pipe", "server has gone away", "lost connection", "i/o timeout", "unexpected eof", "bad connection", "connection refused"} {
+		if strings.Contains(message, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+func retryPause(ctx context.Context, attempt int) error {
+	delay := time.Duration(1<<min(attempt, 5)) * 100 * time.Millisecond
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
+}
+
 func (c *pagedSQLQueryCursor) Next(ctx context.Context, dst *SourceRecord) bool {
+	if c.err != nil {
+		return false
+	}
+	retries := 0
 	for {
 		if c.cur != nil && c.cur.Next(ctx, dst) {
-			if dst.Seq > c.last {
-				c.last = dst.Seq
+			if dst.Seq <= c.last {
+				c.err = fmt.Errorf("SQL keyset sequence %d is not strictly greater than prior sequence %d; seq_column must be unique, numeric, and ordered", dst.Seq, c.last)
+				return false
 			}
+			c.last = dst.Seq
+			retries = 0
 			return true
 		}
 		if c.cur != nil {
 			if err := c.cur.Err(); err != nil {
+				_ = c.cur.Close()
+				c.cur = nil
+				if transientSQLError(err) && retries < 5 {
+					retries++
+					if pauseErr := retryPause(ctx, retries); pauseErr == nil {
+						continue
+					} else {
+						c.err = pauseErr
+						return false
+					}
+				}
 				c.err = err
 				return false
 			}
@@ -136,16 +234,34 @@ func (c *pagedSQLQueryCursor) Next(ctx context.Context, dst *SourceRecord) bool 
 			c.done = true
 			return false
 		}
-		src := SQLSource{DB: c.src.DB, Query: query, Args: args, IDColumn: c.src.IDColumn, SeqColumn: c.src.SeqColumn, Columns: c.src.Columns, FetchSize: c.src.FetchSize}
+		src := SQLSource{DB: c.src.DB, Query: query, Args: args, IDColumn: c.src.IDColumn, SeqColumn: c.src.SeqColumn, RequireNumericSeq: true, Columns: c.src.Columns, FetchSize: c.src.FetchSize}
 		cur, err := src.Open(ctx)
 		if err != nil {
+			if transientSQLError(err) && retries < 5 {
+				retries++
+				if pauseErr := retryPause(ctx, retries); pauseErr == nil {
+					continue
+				} else {
+					c.err = pauseErr
+					return false
+				}
+			}
 			c.err = err
 			return false
 		}
 		if !cur.Next(ctx, dst) {
 			if err := cur.Err(); err != nil {
-				c.err = err
 				_ = cur.Close()
+				if transientSQLError(err) && retries < 5 {
+					retries++
+					if pauseErr := retryPause(ctx, retries); pauseErr == nil {
+						continue
+					} else {
+						c.err = pauseErr
+						return false
+					}
+				}
+				c.err = err
 				return false
 			}
 			_ = cur.Close()
@@ -153,9 +269,11 @@ func (c *pagedSQLQueryCursor) Next(ctx context.Context, dst *SourceRecord) bool 
 			return false
 		}
 		c.cur = cur
-		if dst.Seq > c.last {
-			c.last = dst.Seq
+		if dst.Seq <= c.last {
+			c.err = fmt.Errorf("SQL keyset sequence %d is not strictly greater than prior sequence %d; seq_column must be unique, numeric, and ordered", dst.Seq, c.last)
+			return false
 		}
+		c.last = dst.Seq
 		return true
 	}
 }

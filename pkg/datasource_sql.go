@@ -2,6 +2,7 @@ package pkg
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"os"
@@ -52,7 +53,7 @@ func newSQLTableDatasource(config map[string]any, params map[string]any) (Dataso
 	idColumn := ConfigStringOr(config, "id_column", "id")
 	seqColumn := ConfigStringOr(config, "seq_column", idColumn)
 	orderColumn := ConfigStringOr(config, "order_column", "id")
-	pageSize := ConfigIntOr(config, "page_size", 100000)
+	pageSize := ConfigIntOr(config, "page_size", 10000)
 	where := ConfigStringOr(config, "where", "")
 	selectCols, _ := ConfigStringList(config, "columns")
 
@@ -100,6 +101,7 @@ func (d *SQLTableDatasource) Open(ctx context.Context) (Cursor, error) {
 	if err != nil {
 		return nil, fmt.Errorf("sql_table %s: open: %w", d.id, err)
 	}
+	configureBulkSQLPool(db.DB())
 	d.src.DB = db.DB()
 	cur, err := d.src.Open(ctx)
 	if err != nil {
@@ -188,6 +190,7 @@ func (d *SQLViewDatasource) Open(ctx context.Context) (Cursor, error) {
 	if err != nil {
 		return nil, fmt.Errorf("sql_view %s: open: %w", d.id, err)
 	}
+	configureBulkSQLPool(db.DB())
 	d.src.DB = db.DB()
 	cur, err := d.src.Open(ctx)
 	if err != nil {
@@ -204,11 +207,12 @@ func (d *SQLViewDatasource) Open(ctx context.Context) (Cursor, error) {
 // SQLQueryDatasource executes an arbitrary SQL statement. It supports parameterized
 // queries via the args config key.
 type SQLQueryDatasource struct {
-	id     string
-	src    SQLQuerySource
-	driver string
-	dsn    string
-	params map[string]any
+	id       string
+	src      SQLQuerySource
+	pageSize int
+	driver   string
+	dsn      string
+	params   map[string]any
 }
 
 func newSQLQueryDatasource(config map[string]any, params map[string]any) (Datasource, error) {
@@ -252,6 +256,10 @@ func newSQLQueryDatasource(config map[string]any, params map[string]any) (Dataso
 	}
 	idColumn := ConfigStringOr(config, "id_column", "id")
 	seqColumn := ConfigStringOr(config, "seq_column", "")
+	pageSize := ConfigIntOr(config, "page_size", 0)
+	if seqColumn != "" && pageSize == 0 {
+		pageSize = 10000
+	}
 	args := buildQueryArgs(config)
 
 	cols, err := parseColumnBindings(config)
@@ -271,6 +279,7 @@ func newSQLQueryDatasource(config map[string]any, params map[string]any) (Dataso
 			SeqColumn: seqColumn,
 			Columns:   cols,
 		},
+		pageSize: pageSize,
 	}, nil
 }
 
@@ -418,6 +427,18 @@ func (d *SQLQueryDatasource) Validate() error {
 	if d.src.Query == "" {
 		return errors.New("sql_query: query required")
 	}
+	if d.pageSize < 0 {
+		return errors.New("sql_query: page_size cannot be negative")
+	}
+	if d.pageSize > 0 && d.src.SeqColumn == "" {
+		return errors.New("sql_query: page_size requires a stable numeric seq_column")
+	}
+	if d.pageSize > 0 && d.src.IDColumn == "" {
+		return errors.New("sql_query: keyset paging requires an id_column for stable document IDs")
+	}
+	if d.pageSize > 0 && !validSQLIdentifier(d.src.SeqColumn) {
+		return fmt.Errorf("sql_query: seq_column %q must be a simple SELECT output identifier for keyset paging", d.src.SeqColumn)
+	}
 	return nil
 }
 
@@ -427,7 +448,17 @@ func (d *SQLQueryDatasource) Open(ctx context.Context) (Cursor, error) {
 		return nil, fmt.Errorf("sql_query %s: open: %w", d.id, err)
 	}
 	d.src.DB = db.DB()
-	cur, err := d.src.Open(ctx)
+	configureBulkSQLPool(d.src.DB)
+	var cur Cursor
+	if d.pageSize > 0 {
+		baseQuery := strings.TrimSpace(strings.TrimSuffix(strings.TrimSpace(d.src.Query), ";"))
+		page := func(lastSeq uint64, limit int) (string, []any) {
+			return buildSQLQueryPage(baseQuery, d.src.Args, d.src.SeqColumn, d.driver, lastSeq, limit)
+		}
+		cur, err = (PagedSQLQuerySource{DB: d.src.DB, Page: page, IDColumn: d.src.IDColumn, SeqColumn: d.src.SeqColumn, Columns: d.src.Columns, PageSize: d.pageSize}).Open(ctx)
+	} else {
+		cur, err = d.src.Open(ctx)
+	}
 	if err != nil {
 		db.Close()
 		return nil, fmt.Errorf("sql_query %s: open cursor: %w", d.id, err)
@@ -520,6 +551,7 @@ func (d *SQLFileDatasource) Open(ctx context.Context) (Cursor, error) {
 	if err != nil {
 		return nil, fmt.Errorf("sql_file %s: open: %w", d.id, err)
 	}
+	configureBulkSQLPool(db.DB())
 
 	src := SQLSource{
 		Query:     query,
@@ -640,4 +672,24 @@ func squealxDriver(driver string) string {
 	default:
 		return driver
 	}
+}
+
+func configureBulkSQLPool(db *sql.DB) {
+	// A bulk scan is deliberately single-stream per datasource. Keeping one
+	// physical connection avoids accidental connection storms against RDS.
+	db.SetMaxOpenConns(1)
+	db.SetMaxIdleConns(1)
+}
+
+func validSQLIdentifier(value string) bool {
+	if value == "" || !(value[0] == '_' || value[0] >= 'A' && value[0] <= 'Z' || value[0] >= 'a' && value[0] <= 'z') {
+		return false
+	}
+	for i := 1; i < len(value); i++ {
+		ch := value[i]
+		if !(ch == '_' || ch == '$' || ch >= 'A' && ch <= 'Z' || ch >= 'a' && ch <= 'z' || ch >= '0' && ch <= '9') {
+			return false
+		}
+	}
+	return true
 }

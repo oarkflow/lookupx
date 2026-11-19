@@ -574,12 +574,13 @@ const App = (() => {
       for (const mi of list) {
         const st = mi.stats || {};
         const lat = mi.latency || {};
+        const progress = mi.progress || {};
         html += `
           <div class="card index-card">
             <div class="index-card-top">
               <div class="index-identity">
                 <span class="index-name">${escHtml(mi.id)}</span>
-                ${mi.reloading ? '<span class="badge badge-yellow">Reloading</span>' : ''}
+                <span data-index-reloading="${escHtml(mi.id)}" class="badge badge-yellow${mi.reloading ? '' : ' hidden'}">Indexing</span>
                 <span class="index-generation">Generation ${fmtNum(mi.generation)}</span>
               </div>
               <div class="index-actions">
@@ -596,6 +597,7 @@ const App = (() => {
               <div class="index-stat">TERMS<strong>${fmtNum(st.terms)}</strong></div>
               <div class="index-stat">LAST INGEST RATE<strong>${lat.last_rows_per_second ? `${fmtNum(Math.round(lat.last_rows_per_second))} rows/s` : '—'}</strong></div>
             </div>
+            <div data-index-progress="${escHtml(mi.id)}" class="index-progress-line${mi.reloading ? '' : ' hidden'}">${indexProgressText(mi, progress)}</div>
             ${lat.last_error ? `<div class="text-xs text-red-400 mt-2">Last error: ${escHtml(lat.last_error)}</div>` : ''}
             <div id="detail-${escHtml(mi.id)}" class="mt-4 hidden"></div>
           </div>`;
@@ -998,6 +1000,33 @@ const App = (() => {
 
   function refresh() { render(); }
 
+  function indexProgressText(mi, progress = {}) {
+    if (!mi.reloading) return '';
+    const started = Date.parse(progress.started_at || '');
+    const elapsedSeconds = Number.isFinite(started) ? Math.max(0, (Date.now() - started) / 1000) : 0;
+    const rate = elapsedSeconds > 0 ? Math.round((progress.seen || 0) / elapsedSeconds) : 0;
+    const elapsed = Math.floor(elapsedSeconds);
+    const clock = `${String(Math.floor(elapsed / 3600)).padStart(2, '0')}:${String(Math.floor((elapsed % 3600) / 60)).padStart(2, '0')}:${String(elapsed % 60).padStart(2, '0')}`;
+    return `INDEXING · ${fmtNum(progress.seen || 0)} rows seen · ${fmtNum(progress.indexed || 0)} indexed · ${fmtNum(progress.skipped || 0)} skipped · ${fmtNum(rate)} rows/s · ${clock} elapsed`;
+  }
+
+  async function refreshIndexProgress() {
+    const nodes = [...document.querySelectorAll('[data-index-progress]')];
+    if (!nodes.length) return;
+    const list = await fetchIndexes();
+    const byId = new Map(list.map(mi => [mi.id, mi]));
+    for (const node of nodes) {
+      const mi = byId.get(node.dataset.indexProgress);
+      if (!mi) continue;
+      node.textContent = indexProgressText(mi, mi.progress || {});
+      node.classList.toggle('hidden', !mi.reloading);
+      const badge = document.querySelectorAll('[data-index-reloading]');
+      for (const item of badge) {
+        if (item.dataset.indexReloading === mi.id) item.classList.toggle('hidden', !mi.reloading);
+      }
+    }
+  }
+
   async function logout() {
     try {
       await api('POST', '/auth/logout');
@@ -1012,6 +1041,9 @@ const App = (() => {
   async function init() {
     $$('.nav-btn').forEach(btn => btn.addEventListener('click', () => switchTab(btn.dataset.tab)));
     $('#auth-form').addEventListener('submit', submitLogin);
+    window.setInterval(() => {
+      if (currentTab === 'indexes' && document.body.classList.contains('auth-ready')) refreshIndexProgress();
+    }, 2000);
     try {
       const res = await fetch(apiBase() + '/auth/session', { credentials: 'same-origin' });
       if (res.ok) {

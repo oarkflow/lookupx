@@ -6,6 +6,7 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"net"
 	"os"
 	"strconv"
 	"strings"
@@ -127,8 +128,9 @@ func serveCmd(args []string) {
 		log.Fatal("LOOKUPX_SESSION_SECRET must contain at least 32 characters in .env")
 	}
 
-	ctx := context.Background()
+	ctx, cancelStartup := context.WithCancel(context.Background())
 	var mgr *lookup.MultiIndexManager
+	var startupConfig *lookup.LookupXConfig
 	keys := []string{}
 	if strings.TrimSpace(*configPath) != "" {
 		cfg, err := lookup.LoadBCLConfig(*configPath, nil)
@@ -139,6 +141,7 @@ func serveCmd(args []string) {
 		if err != nil {
 			log.Fatalf("build indexes from BCL config: %v", err)
 		}
+		startupConfig = cfg
 		if *addr == "0.0.0.0:8089" && cfg.Addr != "" {
 			*addr = cfg.Addr
 		}
@@ -150,85 +153,242 @@ func serveCmd(args []string) {
 				keys = append(keys, key)
 			}
 		}
-		for _, info := range mgr.List() {
-			indexStarted := time.Now()
-			lookup.LogKV("index_load_started", "index", info.ID, "storage", *storage)
-			mi, ok := mgr.Get(info.ID)
-			if !ok {
-				log.Fatalf("configured index %s disappeared", info.ID)
-			}
-			restored := false
-			if *storage == "disk" {
-				var indexConfig lookup.Config
-				for _, indexDef := range cfg.Indexes {
-					if indexDef.ID == info.ID {
-						indexConfig = indexDef.ToConfig()
-						break
-					}
-				}
-				err := mgr.RestorePersistentIndex(ctx, lookup.FileSegmentStore{Root: *dataDir}, info.ID, indexConfig)
-				if err == nil {
-					restored = true
-				} else if !os.IsNotExist(err) {
-					log.Fatalf("restore persistent index %s: %v", info.ID, err)
-				}
-			}
-			if restored {
-				ready, _ := mgr.Managed(info.ID)
-				stats := ready.Index.Stats()
-				lookup.LogKV("index_ready", "index", info.ID, "state", "restored", "storage", "disk", "generation", ready.Generation, "docs", stats.Docs, "live_docs", stats.LiveDocs, "fields", stats.Fields, "terms", stats.Terms, "elapsed", time.Since(indexStarted))
-				continue
-			}
-			loadStats, err := mgr.Reload(ctx, info.ID)
-			if err != nil {
-				log.Fatalf("initial index load %s: %v", info.ID, err)
-			}
-			persistDuration := time.Duration(0)
-			if *storage == "disk" {
-				mi, ok = mgr.Get(info.ID)
-				if !ok {
-					log.Fatalf("loaded index %s disappeared", info.ID)
-				}
-				persistStarted := time.Now()
-				manifest, err := mi.SavePersistent(ctx, lookup.FileSegmentStore{Root: *dataDir}, info.ID)
-				if err != nil {
-					log.Fatalf("persist index %s: %v", info.ID, err)
-				}
-				persistDuration = time.Since(persistStarted)
-				lookup.LogKV("index_persisted", "index", info.ID, "generation", manifest.Generation, "docs", manifest.Docs, "format", manifest.Format, "path", manifest.Path, "elapsed", persistDuration)
-			}
-			ready, _ := mgr.Managed(info.ID)
-			stats := ready.Index.Stats()
-			indexFields := []any{"index", info.ID, "state", "indexed", "storage", *storage}
-			if loadStats.Seen == loadStats.Indexed && uint64(stats.Docs) == loadStats.Indexed {
-				indexFields = append(indexFields, "rows_indexed", loadStats.Indexed)
-			} else {
-				indexFields = append(indexFields, "rows_seen", loadStats.Seen, "rows_indexed", loadStats.Indexed, "docs", stats.Docs)
-			}
-			if loadStats.Skipped > 0 {
-				indexFields = append(indexFields, "rows_skipped", loadStats.Skipped)
-			}
-			indexFields = append(indexFields, "live_docs", stats.LiveDocs, "fields", stats.Fields, "terms", stats.Terms, "rows_per_second", fmt.Sprintf("%.1f", loadStats.RowsPerSecond), "index_elapsed", loadStats.Took)
-			if *storage == "disk" {
-				indexFields = append(indexFields, "persist_elapsed", persistDuration)
-			}
-			indexFields = append(indexFields, "total_elapsed", time.Since(indexStarted))
-			lookup.LogKV("index_ready", indexFields...)
-		}
 	} else {
 		mgr = lookup.NewMultiIndexManager()
-		if *storage == "disk" {
-			if err := mgr.RestorePersistent(ctx, lookup.FileSegmentStore{Root: *dataDir}); err != nil {
-				log.Fatalf("restore persistent indexes: %v", err)
-			}
-		}
 	}
 	if *apiKey != "" {
 		keys = append(keys, *apiKey)
 	}
-	lookup.LogKV("server_listening", "address", *addr, "storage", *storage, "indexes", len(mgr.List()), "web_console", "/")
 	app := lookup.NewFHApp(&lookup.MultiServer{Manager: mgr, APIKeys: keys, AdminUser: adminUser, AdminPassword: adminPassword, SessionSecret: sessionSecret, SessionSecure: sessionSecure, SessionTrustedProxies: sessionTrustedProxies, ConfigPath: *configPath, WebDir: *webDir, DataDir: *dataDir, Storage: *storage})
-	log.Fatal(app.ListenWithGracefulShutdown(*addr))
+	listenResult := make(chan error, 1)
+	go func() { listenResult <- app.ListenWithGracefulShutdown(*addr) }()
+	if err := waitForListener(*addr, listenResult, 15*time.Second); err != nil {
+		cancelStartup()
+		log.Fatal(err)
+	}
+	lookup.LogKV("server_listening", "address", *addr, "storage", *storage, "indexes", len(mgr.List()), "web_console", "/")
+	if startupConfig != nil {
+		go warmConfiguredIndexes(ctx, mgr, startupConfig, *storage, *dataDir)
+	} else if *storage == "disk" {
+		go func() {
+			if err := mgr.RestorePersistent(ctx, lookup.FileSegmentStore{Root: *dataDir}); err != nil && ctx.Err() == nil {
+				lookup.LogKV("index_restore_failed", "error", err)
+			}
+		}()
+	}
+	listenErr := <-listenResult
+	cancelStartup()
+	if listenErr != nil {
+		log.Fatal(listenErr)
+	}
+}
+
+func waitForListener(addr string, listenResult <-chan error, timeout time.Duration) error {
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return fmt.Errorf("parse listen address %q: %w", addr, err)
+	}
+	if host == "" || host == "0.0.0.0" {
+		host = "127.0.0.1"
+	}
+	if host == "::" {
+		host = "::1"
+	}
+	probe := net.JoinHostPort(host, port)
+	deadline := time.NewTimer(timeout)
+	ticker := time.NewTicker(50 * time.Millisecond)
+	defer deadline.Stop()
+	defer ticker.Stop()
+	for {
+		conn, dialErr := net.DialTimeout("tcp", probe, 100*time.Millisecond)
+		if dialErr == nil {
+			_ = conn.Close()
+			return nil
+		}
+		select {
+		case listenErr := <-listenResult:
+			if listenErr == nil {
+				return fmt.Errorf("server stopped before accepting connections")
+			}
+			return fmt.Errorf("start HTTP server: %w", listenErr)
+		case <-deadline.C:
+			return fmt.Errorf("server did not start listening on %s within %s", addr, timeout)
+		case <-ticker.C:
+		}
+	}
+}
+
+func warmConfiguredIndexes(ctx context.Context, mgr *lookup.MultiIndexManager, cfg *lookup.LookupXConfig, storage, dataDir string) {
+	store := lookup.FileSegmentStore{Root: dataDir}
+	indexes := mgr.List()
+	indexConfigs := make(map[string]lookup.Config, len(cfg.Indexes))
+	datasources := make(map[string]lookup.DatasourceDef, len(cfg.Datasources))
+	for _, def := range cfg.Indexes {
+		indexConfigs[def.ID] = def.ToConfig()
+	}
+	for _, ds := range cfg.Datasources {
+		datasources[ds.ID] = ds
+	}
+	for _, index := range cfg.Indexes {
+		ds, ok := datasources[index.DatasourceID]
+		if ok && strings.EqualFold(ds.Kind, "sql_query") && strings.TrimSpace(ds.SeqColumn) == "" {
+			lookup.LogKV("index_load_mode_warning", "index", index.ID, "datasource", ds.ID, "reason", "SQL query source is unpaged and streams one long-lived query; a connection drop fails this build. Configure seq_column and page_size with a stable, unique, indexed numeric query output to enable resumable keyset pages")
+		}
+	}
+
+	// Restore all completed generations before starting any source scan. This
+	// lets every previously-built index serve while potentially long RDS scans
+	// run in the background.
+	if storage == "disk" {
+		for _, info := range indexes {
+			if ctx.Err() != nil {
+				return
+			}
+			started := time.Now()
+			if err := mgr.RestorePersistentIndex(ctx, store, info.ID, indexConfigs[info.ID]); err == nil {
+				ready, _ := mgr.Managed(info.ID)
+				if ready != nil {
+					lookup.LogKV("index_ready", "index", info.ID, "state", "restored", "storage", "disk", "generation", ready.Generation, "docs", ready.Index.Stats().Docs, "elapsed", time.Since(started))
+				}
+			} else if !os.IsNotExist(err) && ctx.Err() == nil {
+				lookup.LogKV("index_restore_failed", "index", info.ID, "error", err)
+			}
+		}
+	}
+
+	for _, info := range indexes {
+		if ctx.Err() != nil {
+			return
+		}
+		started := time.Now()
+		lookup.LogKV("index_load_started", "index", info.ID, "storage", storage, "background", true)
+		stopProgress := startIndexProgress(ctx, mgr, info.ID)
+		stats, err := mgr.Reload(ctx, info.ID)
+		stopProgress()
+		if err != nil {
+			if ctx.Err() == nil {
+				lookup.LogKV("index_load_failed", "index", info.ID, "error", err, "elapsed", time.Since(started))
+			}
+			continue
+		}
+		if storage == "disk" {
+			mi, ok := mgr.Get(info.ID)
+			if !ok {
+				lookup.LogKV("index_persist_failed", "index", info.ID, "error", "index disappeared after reload")
+				continue
+			}
+			persistStarted := time.Now()
+			manifest, persistErr := mi.SavePersistent(ctx, store, info.ID)
+			if persistErr != nil {
+				lookup.LogKV("index_persist_failed", "index", info.ID, "error", persistErr)
+			} else {
+				lookup.LogKV("index_persisted", "index", info.ID, "generation", manifest.Generation, "docs", manifest.Docs, "format", manifest.Format, "path", manifest.Path, "elapsed", time.Since(persistStarted))
+			}
+		}
+		ready, _ := mgr.Managed(info.ID)
+		if ready == nil {
+			continue
+		}
+		indexFields := []any{"index", info.ID, "state", "indexed", "storage", storage, "rows_seen", stats.Seen, "rows_indexed", stats.Indexed, "rows_skipped", stats.Skipped, "docs", ready.Index.Stats().Docs, "rows_per_second", fmt.Sprintf("%.1f", stats.RowsPerSecond), "elapsed", time.Since(started)}
+		lookup.LogKV("index_ready", indexFields...)
+	}
+}
+
+// startIndexProgress renders a single updating terminal line. When output is
+// redirected, it emits periodic structured progress events instead.
+func startIndexProgress(ctx context.Context, mgr *lookup.MultiIndexManager, id string) func() {
+	stop := make(chan struct{})
+	done := make(chan struct{})
+	info, err := os.Stderr.Stat()
+	terminal := err == nil && info.Mode()&os.ModeCharDevice != 0
+	go func() {
+		defer close(done)
+		ticker := time.NewTicker(time.Second)
+		defer ticker.Stop()
+		spin := []string{"|", "/", "-", "\\"}
+		lastLog := time.Now()
+		drawn := false
+		observedReload := false
+		for {
+			select {
+			case <-ctx.Done():
+				if terminal && drawn {
+					fmt.Fprintln(os.Stderr)
+				}
+				return
+			case <-stop:
+				if terminal && drawn {
+					fmt.Fprintln(os.Stderr)
+				}
+				return
+			case now := <-ticker.C:
+				var current *lookup.ManagedIndexInfo
+				for _, item := range mgr.List() {
+					if item.ID == id {
+						copy := item
+						current = &copy
+						break
+					}
+				}
+				if current == nil {
+					continue
+				}
+				progress := current.Progress
+				elapsed := now.Sub(progress.StartedAt)
+				if elapsed < 0 {
+					elapsed = 0
+				}
+				rate := float64(0)
+				if elapsed > 0 {
+					rate = float64(progress.Seen) / elapsed.Seconds()
+				}
+				if terminal {
+					fmt.Fprintf(os.Stderr, "\r\033[36m%s\033[0m  %-18s  %s rows seen  %s indexed  %s skipped  %s rows/s  %s elapsed\033[K",
+						spin[int(now.Unix())%len(spin)], id, formatProgressNumber(progress.Seen), formatProgressNumber(progress.Indexed), formatProgressNumber(progress.Skipped), formatProgressNumber(uint64(rate)), formatProgressDuration(elapsed))
+					drawn = true
+				} else if now.Sub(lastLog) >= 5*time.Second {
+					lookup.LogKV("index_load_progress", "index", id, "rows_seen", progress.Seen, "rows_indexed", progress.Indexed, "rows_skipped", progress.Skipped, "rows_per_second", fmt.Sprintf("%.1f", rate), "elapsed", elapsed.Round(time.Second))
+					lastLog = now
+				}
+				if current.Reloading {
+					observedReload = true
+				} else if observedReload {
+					return
+				}
+			}
+		}
+	}()
+	return func() {
+		close(stop)
+		<-done
+	}
+}
+
+func formatProgressNumber(n uint64) string {
+	value := strconv.FormatUint(n, 10)
+	if len(value) <= 3 {
+		return value
+	}
+	first := len(value) % 3
+	if first == 0 {
+		first = 3
+	}
+	var formatted strings.Builder
+	formatted.Grow(len(value) + len(value)/3)
+	formatted.WriteString(value[:first])
+	for i := first; i < len(value); i += 3 {
+		formatted.WriteByte(',')
+		formatted.WriteString(value[i : i+3])
+	}
+	return formatted.String()
+}
+
+func formatProgressDuration(d time.Duration) string {
+	if d < 0 {
+		d = 0
+	}
+	seconds := int64(d.Round(time.Second).Seconds())
+	return fmt.Sprintf("%02d:%02d:%02d", seconds/3600, (seconds/60)%60, seconds%60)
 }
 
 func splitNonEmptyCSV(value string) []string {

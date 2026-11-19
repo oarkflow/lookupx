@@ -278,19 +278,48 @@ func (s PartitionScheme) TuplePartition(term string, groupID uint32, date_key st
 }
 
 type PartitionDataset struct {
-	Root       string              `json:"root"`
-	Partitions []PartitionManifest `json:"partitions"`
+	Root        string               `json:"root"`
+	BuildID     string               `json:"build_id,omitempty"`
+	Partitions  []PartitionManifest  `json:"partitions,omitempty"`
+	Generations []PersistentManifest `json:"generations,omitempty"`
 }
 
 func (c *PartitionDataset) Save(path string) error {
-	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0755); err != nil {
 		return err
 	}
 	b, err := json.MarshalIndent(c, "", "  ")
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(path, b, 0644)
+	f, err := os.CreateTemp(dir, ".partition-catalog-*.tmp")
+	if err != nil {
+		return err
+	}
+	tmp := f.Name()
+	defer os.Remove(tmp)
+	if err = f.Chmod(0600); err == nil {
+		_, err = f.Write(b)
+	}
+	if err == nil {
+		err = f.Sync()
+	}
+	closeErr := f.Close()
+	if err != nil {
+		return err
+	}
+	if closeErr != nil {
+		return closeErr
+	}
+	if err = os.Rename(tmp, path); err != nil {
+		return err
+	}
+	if d, openErr := os.Open(dir); openErr == nil {
+		_ = d.Sync()
+		_ = d.Close()
+	}
+	return nil
 }
 func LoadPartitionDataset(path string) (PartitionDataset, error) {
 	var c PartitionDataset
@@ -309,12 +338,19 @@ func PlanBillionRowDeployment(indexID string, estimatedRows int64, budget Memory
 		rowsPer = (estimatedRows + int64(parts) - 1) / int64(parts)
 	}
 	return map[string]any{
-		"index_id":                     cleanIndexID(indexID),
-		"estimated_rows":               estimatedRows,
-		"recommended_partitions":       parts,
-		"estimated_rows_per_partition": rowsPer,
-		"recommended_batch_size":       budget.BulkOptions(indexID, nil, false).BatchSize,
-		"layout":                       "multi-partition persistent generations with frozen composite indexes",
+		"index_id":                          cleanIndexID(indexID),
+		"estimated_rows":                    estimatedRows,
+		"recommended_partitions":            parts,
+		"estimated_rows_per_partition":      rowsPer,
+		"recommended_batch_size":            budget.BulkOptions(indexID, nil, false).BatchSize,
+		"layout":                            "partitioned build helper; search integration required",
+		"production_ready_for_billion_rows": false,
+		"readiness_warnings": []string{
+			"persistent generations are decoded into process memory; the current store is not an mmap query engine",
+			"partition search is a library helper and is not wired into the HTTP lookup/search routes",
+			"RDS sql_query builds need a stable indexed paging key; a computed document ID is not a paging index",
+			"single-index heap requirements depend on indexed fields and analyzers and are not estimated by this row-count plan",
+		},
 	}
 }
 

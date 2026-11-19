@@ -127,7 +127,7 @@ datasource "cpt" {
   driver "mysql"
   dsn MYSQL_DSN
   id_column "record_id"
-  query "SELECT CONCAT_WS(':', work_item, charge_type, effective_date, cpt_code, SHA2(JSON_ARRAY(work_item, charge_type, effective_date, cpt_code, end_effective_date, patient_status, ld), 256)) AS record_id, cpt_code AS code, REPLACE(LOWER(cpt_code), '.', '') AS code_no_period, ld AS description, ld AS `fulltext`, work_item AS work_item_uid, work_item, effective_date, end_effective_date, patient_status, charge_type FROM vw_cpt_master WHERE is_cpt = 1"
+  query "SELECT CONCAT_WS(':', work_item, charge_type, effective_date, cpt_code, SHA2(JSON_ARRAY(work_item, charge_type, effective_date, cpt_code, end_effective_date, patient_status, ld), 256)) AS record_id, cpt_code AS code, REPLACE(LOWER(cpt_code), '.', '') AS code_no_period, ld AS description, ld AS `fulltext`, work_item AS work_item_uid, work_item, effective_date, end_effective_date, patient_status, charge_type FROM vw_cpt_master"
   column "work_item" {
     kind "keyword"
     normalized true
@@ -160,7 +160,7 @@ datasource "hcpcs" {
   driver "mysql"
   dsn MYSQL_DSN
   id_column "record_id"
-  query "SELECT CONCAT_WS(':', work_item, charge_type, effective_date, cpt_code, SHA2(JSON_ARRAY(work_item, charge_type, effective_date, cpt_code, end_effective_date, patient_status, ld), 256)) AS record_id, cpt_code AS code, REPLACE(LOWER(cpt_code), '.', '') AS code_no_period, ld AS description, ld AS `fulltext`, work_item AS work_item_uid, work_item, effective_date, end_effective_date, patient_status, charge_type FROM vw_cpt_master WHERE is_cpt = 0"
+  query "SELECT CONCAT_WS(':', work_item, charge_type, effective_date, cpt_code, SHA2(JSON_ARRAY(work_item, charge_type, effective_date, cpt_code, end_effective_date, patient_status, ld), 256)) AS record_id, cpt_code AS code, REPLACE(LOWER(cpt_code), '.', '') AS code_no_period, ld AS description, ld AS `fulltext`, work_item AS work_item_uid, work_item, effective_date, end_effective_date, patient_status, charge_type FROM vw_cpt_master"
   column "work_item" {
     kind "keyword"
     normalized true

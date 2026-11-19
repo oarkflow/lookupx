@@ -113,6 +113,22 @@ datasource "catalog" {
 statement (a `WITH` query ending in `SELECT` is also accepted). To keep SQL
 inline, use `query { string "SELECT id, name FROM catalog" }`. Existing
 `query "SELECT ..."` and `query_file "..."` configurations remain supported.
+For large result sets, add `seq_column` with a stable, unique, increasing
+numeric key returned by the query, plus `page_size`; LookupX then applies
+keyset pagination in batches (10000 by default when `seq_column` is set). The
+result must also include the configured `id_column`, which can differ from the
+numeric paging key. Use a source key backed by an RDS index; a computed ID such
+as `CONCAT(...)` is not a scalable paging key merely because it is unique.
+Paged reads retry transient connection failures from the last successfully
+read key. The paging key must be unique and strictly increasing; the database
+must support the `>` predicate and `ORDER BY` with an index, or every page may
+rescan the source. Without `seq_column`, LookupX streams one long-lived query;
+a connection loss fails that build because there is no safe position from
+which to resume. Table reloads without a key use offset pagination, which is
+only appropriate for small, stable sources and becomes increasingly expensive
+as the offset grows. For billion-row imports, inspect the view's underlying
+tables and query plan, then expose an indexed stable key before enabling the
+build.
 
 ## Clear fulltext indexes from BCL
 
@@ -121,18 +137,21 @@ queries: `cpt`, `hcpcs`, `cpt-hm`, `dx-fac1`, `dx-fac3`, `dx-icd10`,
 `dx-icd10-pcs`, `special-fac`, and `special-pro`. The BCL fallback targets the
 local Clear database used by the Scala fulltext service. For another
 environment, set `MYSQL_DSN` to a MySQL DSN with read access to the Clear
-lookup views and charge-master tables. The server loads the BCL file and
-streams each source into its index before accepting requests. The database
-needs the Clear views, including the `vw_cpt_master.is_cpt` column exposed by
-the latest lookup-view migration.
+lookup views and charge-master tables. The server starts accepting requests
+before it scans the configured sources. With disk storage, it restores all
+available completed generations first, then rebuilds indexes in the
+background. During a first build, each indexed batch is immediately searchable
+while the index reports `reloading=true`; when rebuilding an existing populated
+index, searches continue against the prior generation until the replacement is
+complete. The database needs the Clear views, including the
+`vw_cpt_master.is_cpt` column exposed by the latest lookup-view migration.
 
 ```bash
 export MYSQL_DSN='user:password@tcp(db-host:3306)/clear?parseTime=true'
 go run ./cmd/lookupx serve -config config/lookupx.bcl
 ```
 
-The configured indexes are loaded before the server starts. The browser
-console is served from the filesystem at `./web` by default. Use
+The browser console is served from the filesystem at `./web` by default. Use
 `-web <directory>` or `LOOKUPX_WEB_DIR` to serve frontend files from another
 directory. Keep the `web` directory alongside the server's working directory
 when using the default path.
@@ -184,11 +203,13 @@ events identifies the actual disk snapshot and helps track or roll back index
 versions. Memory storage omits `persist_elapsed` because no disk write occurred.
 
 The same BCL file is the default for `serve`; `-config` selects another file.
-Use `-config ""` for an empty server, or `-storage disk` to persist the loaded
-indexes under `data_dir` and restore saved generations on later starts. The
-persisted index is decoded into Go memory at startup; this is durable disk
-storage, not memory-mapped search. Set `LOOKUPX_API_KEY` to protect the HTTP
-endpoints. API examples below use the key from `.env`:
+Use `-config ""` for an empty server, or `-storage disk` to persist indexes
+under `data_dir` and restore saved generations on later starts. Disk storage
+is required to make completed generations available again after a process
+restart; with memory storage, an index becomes searchable when its background
+build completes. The persisted index is decoded into Go memory when restored;
+this is durable disk storage, not memory-mapped search. Set `LOOKUPX_API_KEY`
+to protect the HTTP endpoints. API examples below use the key from `.env`:
 
 ```bash
 export LOOKUPX_API_KEY='your-configured-api-key'
@@ -1117,9 +1138,18 @@ _ = stats
 _ = hits
 ```
 
-## Production-scale indexing: 100M / 1B row support
+## Large-index building: 100M / 1B row planning
 
-This version includes a production-scale layer for very large lookup indexes. The target operating model for 100M/1B rows is:
+The partition builder bounds ingestion memory by partition size, but the current
+HTTP search service is not a billion-row-ready partitioned engine: persistent
+generations decode into Go memory, the HTTP routes do not search partition
+manifests, and per-partition BM25 scores are not globally calibrated. Treat the
+planner's partition count as an ingestion estimate, not a production-readiness
+guarantee. A production deployment at this scale needs indexed RDS keyset
+pagination and a query-serving design that can route/prune partitions or merge
+globally scored postings.
+
+The intended operating model for very large lookup indexes is:
 
 1. Stream rows from SQL with keyset pagination or CDC-style incremental queries.
 2. Build each logical index independently, for example `dataset_a`, `dataset_b`, and `dataset_c`.
@@ -1387,6 +1417,8 @@ src := lookup.StreamingDatasetSource{Rows: rows, Term: term, Group: work, DateKe
 stats, err := lookup.BuildPartitionedPersistent(ctx, src, lookup.PartitionedBuildOptions{
     IndexID: "dataset_a",
     Store: lookup.FileMMapSegmentStore{Root: "./data"},
+    CatalogPath: "./data/dataset_a/partitions.json",
+    DatasetRoot: "./data",
     Config: lookup.Config{Schema: lookup.TupleLookupSchema(), DisableSource: true},
     RowsPerPartition: uint64(budget.TargetRowsPerPartition),
     Bulk: budget.BulkOptions("dataset_a", nil, false),
@@ -1394,6 +1426,12 @@ stats, err := lookup.BuildPartitionedPersistent(ctx, src, lookup.PartitionedBuil
     Freeze: true,
 })
 ```
+
+When `CatalogPath` is set, each build writes partitions under a unique build ID
+and atomically replaces the catalog only after every partition is saved. A
+failed build leaves the previous catalog intact; its unreferenced new files can
+be removed later. The catalog is a consistent partition list for a serving
+layer, but LookupX's normal HTTP lookup route does not yet read this catalog.
 
 ### Cold vs warm partition query latency
 

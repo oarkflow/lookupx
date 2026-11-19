@@ -49,6 +49,7 @@ type SourceRecord struct {
 func (r *SourceRecord) Reset() {
 	r.ID = ""
 	r.Seq = 0
+	clear(r.Values)
 	r.Values = r.Values[:0]
 }
 func (r *SourceRecord) AddKeyword(fid FieldID, value string, normalized bool) {
@@ -120,7 +121,12 @@ func (m *MemoryCheckpoint) Reset(ctx context.Context, name string) error {
 
 type FileCheckpoint struct{ Path string }
 
+var fileCheckpointMu sync.Mutex
+
 func (f FileCheckpoint) Load(ctx context.Context, name string) (uint64, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
 	b, err := os.ReadFile(f.Path)
 	if errors.Is(err, os.ErrNotExist) {
 		return 0, nil
@@ -135,9 +141,21 @@ func (f FileCheckpoint) Load(ctx context.Context, name string) (uint64, error) {
 	return all[name], nil
 }
 func (f FileCheckpoint) Save(ctx context.Context, name string, seq uint64) error {
+	fileCheckpointMu.Lock()
+	defer fileCheckpointMu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	all := map[string]uint64{}
 	if b, err := os.ReadFile(f.Path); err == nil {
-		_ = json.Unmarshal(b, &all)
+		if err := json.Unmarshal(b, &all); err != nil {
+			return fmt.Errorf("decode checkpoint file: %w", err)
+		}
+		if all == nil {
+			all = map[string]uint64{}
+		}
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return err
 	}
 	all[name] = seq
 	b, err := json.MarshalIndent(all, "", "  ")
@@ -147,12 +165,63 @@ func (f FileCheckpoint) Save(ctx context.Context, name string, seq uint64) error
 	if err := os.MkdirAll(dir(f.Path), 0755); err != nil {
 		return err
 	}
-	return os.WriteFile(f.Path, b, 0644)
+	tmpFile, err := os.CreateTemp(dir(f.Path), ".checkpoint-*.tmp")
+	if err != nil {
+		return err
+	}
+	tmp := tmpFile.Name()
+	if err := tmpFile.Chmod(0600); err != nil {
+		_ = tmpFile.Close()
+		_ = os.Remove(tmp)
+		return err
+	}
+	file := tmpFile
+	if _, err = file.Write(b); err == nil {
+		err = file.Sync()
+	}
+	closeErr := file.Close()
+	if err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	if closeErr != nil {
+		_ = os.Remove(tmp)
+		return closeErr
+	}
+	if err := ctx.Err(); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	if err := os.Rename(tmp, f.Path); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	dirFile, err := os.Open(dir(f.Path))
+	if err != nil {
+		return err
+	}
+	if err := dirFile.Sync(); err != nil {
+		_ = dirFile.Close()
+		return err
+	}
+	if err := dirFile.Close(); err != nil {
+		return err
+	}
+	return nil
 }
 func (f FileCheckpoint) Reset(ctx context.Context, name string) error {
+	fileCheckpointMu.Lock()
+	defer fileCheckpointMu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	all := map[string]uint64{}
 	if b, err := os.ReadFile(f.Path); err == nil {
-		_ = json.Unmarshal(b, &all)
+		if err := json.Unmarshal(b, &all); err != nil {
+			return fmt.Errorf("decode checkpoint file: %w", err)
+		}
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return err
 	}
 	delete(all, name)
 	b, err := json.MarshalIndent(all, "", "  ")
@@ -162,7 +231,41 @@ func (f FileCheckpoint) Reset(ctx context.Context, name string) error {
 	if err := os.MkdirAll(dir(f.Path), 0755); err != nil {
 		return err
 	}
-	return os.WriteFile(f.Path, b, 0644)
+	tmpFile, err := os.CreateTemp(dir(f.Path), ".checkpoint-*.tmp")
+	if err != nil {
+		return err
+	}
+	tmp := tmpFile.Name()
+	if err := tmpFile.Chmod(0600); err != nil {
+		_ = tmpFile.Close()
+		_ = os.Remove(tmp)
+		return err
+	}
+	if _, err := tmpFile.Write(b); err == nil {
+		err = tmpFile.Sync()
+	}
+	closeErr := tmpFile.Close()
+	if err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	if closeErr != nil {
+		_ = os.Remove(tmp)
+		return closeErr
+	}
+	if err := os.Rename(tmp, f.Path); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	dirFile, err := os.Open(dir(f.Path))
+	if err != nil {
+		return err
+	}
+	if err := dirFile.Sync(); err != nil {
+		_ = dirFile.Close()
+		return err
+	}
+	return dirFile.Close()
 }
 
 type BulkOptions struct {
@@ -176,13 +279,13 @@ type BulkOptions struct {
 }
 
 type BulkProgress struct {
-	SourceName string
-	Seen       uint64
-	Indexed    uint64
-	Skipped    uint64
-	LastSeq    uint64
-	StartedAt  time.Time
-	Took       time.Duration
+	SourceName string        `json:"source_name"`
+	Seen       uint64        `json:"seen"`
+	Indexed    uint64        `json:"indexed"`
+	Skipped    uint64        `json:"skipped"`
+	LastSeq    uint64        `json:"last_seq"`
+	StartedAt  time.Time     `json:"started_at"`
+	Took       time.Duration `json:"took"`
 }
 
 type BulkStats struct {
@@ -217,6 +320,14 @@ func (ix *Index) IndexFrom(ctx context.Context, src Source, opt BulkOptions) (Bu
 			return BulkStats{}, err
 		}
 		resumeAfter = v
+		if v > 0 {
+			ix.mu.RLock()
+			empty := ix.nextDocID <= 1
+			ix.mu.RUnlock()
+			if empty {
+				return BulkStats{}, fmt.Errorf("cannot resume from source checkpoint %d into an empty index", v)
+			}
+		}
 	}
 	cur, err := src.Open(ctx)
 	if err != nil {
@@ -228,6 +339,7 @@ func (ix *Index) IndexFrom(ctx context.Context, src Source, opt BulkOptions) (Bu
 	batch := make([]SourceRecord, 0, opt.BatchSize)
 	var stats BulkStats
 	stats.SourceName = opt.Name
+	lastCheckpointSeen := uint64(0)
 	flush := func() error {
 		if len(batch) == 0 {
 			return nil
@@ -241,16 +353,20 @@ func (ix *Index) IndexFrom(ctx context.Context, src Source, opt BulkOptions) (Bu
 			stats.LastSeq = lastSeq
 		}
 		for i := range batch {
+			clear(batch[i].Values)
 			batch[i].Values = batch[i].Values[:0]
+			batch[i].ID = ""
+			batch[i].Seq = 0
 		}
 		batch = batch[:0]
 		if err != nil {
 			return err
 		}
-		if opt.Checkpoint != nil && stats.LastSeq > 0 && stats.Indexed%uint64(opt.CheckpointEvery) == 0 {
+		if opt.Checkpoint != nil && stats.LastSeq > 0 && stats.Seen-lastCheckpointSeen >= uint64(opt.CheckpointEvery) {
 			if err := opt.Checkpoint.Save(ctx, opt.Name, stats.LastSeq); err != nil {
 				return err
 			}
+			lastCheckpointSeen = stats.Seen
 		}
 		if opt.Progress != nil {
 			opt.Progress(BulkProgress{SourceName: opt.Name, Seen: stats.Seen, Indexed: stats.Indexed, Skipped: stats.Skipped, LastSeq: stats.LastSeq, StartedAt: started, Took: time.Since(started)})
@@ -259,6 +375,9 @@ func (ix *Index) IndexFrom(ctx context.Context, src Source, opt BulkOptions) (Bu
 	}
 
 	for cur.Next(ctx, &rec) {
+		if err := ctx.Err(); err != nil {
+			return stats, err
+		}
 		stats.Seen++
 		if rec.Seq == 0 {
 			rec.Seq = stats.Seen
@@ -526,8 +645,12 @@ type SQLSource struct {
 	Args      []any
 	IDColumn  string
 	SeqColumn string
-	Columns   []SQLColumn
-	FetchSize int
+	// RequireNumericSeq is used by keyset-paged sources. Ordinary table
+	// ingestion may use a string primary key for its page cursor and keeps the
+	// per-query row ordinal as Seq in that case.
+	RequireNumericSeq bool
+	Columns           []SQLColumn
+	FetchSize         int
 }
 
 func (s SQLSource) Open(ctx context.Context) (Cursor, error) {
@@ -558,7 +681,12 @@ func (s SQLSource) Open(ctx context.Context) (Cursor, error) {
 	}
 	seqIdx := -1
 	if s.SeqColumn != "" {
-		if idx, ok := colIndex[strings.ToLower(s.SeqColumn)]; ok {
+		idx, ok := colIndex[strings.ToLower(s.SeqColumn)]
+		if !ok && s.RequireNumericSeq {
+			rows.Close()
+			return nil, fmt.Errorf("sequence column %q not found", s.SeqColumn)
+		}
+		if ok {
 			seqIdx = idx
 		}
 	}
@@ -576,7 +704,7 @@ func (s SQLSource) Open(ctx context.Context) (Cursor, error) {
 	for i := range vals {
 		dest[i] = &vals[i]
 	}
-	return &sqlCursor{rows: rows, vals: vals, dest: dest, idIdx: idIdx, seqIdx: seqIdx, bindings: bindings}, nil
+	return &sqlCursor{rows: rows, vals: vals, dest: dest, idIdx: idIdx, seqIdx: seqIdx, seqName: s.SeqColumn, strictSeq: s.RequireNumericSeq, bindings: bindings}, nil
 }
 
 type sqlBinding struct {
@@ -588,6 +716,8 @@ type sqlCursor struct {
 	vals          []sql.NullString
 	dest          []any
 	idIdx, seqIdx int
+	seqName       string
+	strictSeq     bool
 	bindings      []sqlBinding
 	n             uint64
 	err           error
@@ -603,16 +733,35 @@ func (c *sqlCursor) Next(ctx context.Context, dst *SourceRecord) bool {
 	}
 	c.n++
 	dst.Reset()
-	if c.idIdx >= 0 && c.vals[c.idIdx].Valid {
+	if c.idIdx >= 0 {
+		if !c.vals[c.idIdx].Valid || c.vals[c.idIdx].String == "" {
+			c.err = fmt.Errorf("ID column contains NULL or an empty value")
+			return false
+		}
 		dst.ID = c.vals[c.idIdx].String
 	}
 	dst.Seq = c.n
 	if dst.ID == "" {
 		dst.ID = "row-" + strconv.FormatUint(c.n, 10)
 	}
-	if c.seqIdx >= 0 && c.vals[c.seqIdx].Valid {
-		if u, err := strconv.ParseUint(c.vals[c.seqIdx].String, 10, 64); err == nil {
-			dst.Seq = u
+	if c.seqIdx >= 0 {
+		if !c.vals[c.seqIdx].Valid && c.strictSeq {
+			c.err = fmt.Errorf("sequence column %q contains NULL", c.seqName)
+			return false
+		}
+		if c.vals[c.seqIdx].Valid {
+			u, err := strconv.ParseUint(c.vals[c.seqIdx].String, 10, 64)
+			if err != nil || u == 0 {
+				if c.strictSeq {
+					if err == nil {
+						err = errors.New("sequence value must be positive")
+					}
+					c.err = fmt.Errorf("parse sequence column %q value %q: %w", c.seqName, c.vals[c.seqIdx].String, err)
+					return false
+				}
+			} else {
+				dst.Seq = u
+			}
 		}
 	}
 	for _, b := range c.bindings {
@@ -1268,6 +1417,15 @@ func (s PagedSQLSource) Open(ctx context.Context) (Cursor, error) {
 	if s.SeqColumn == "" && s.OrderColumn != "" {
 		s.SeqColumn = s.OrderColumn
 	}
+	if s.OrderColumn != "" && s.OrderColumn != s.IDColumn && s.SeqColumn != s.OrderColumn {
+		return nil, errors.New("paged SQL source requires seq_column to match the numeric order_column")
+	}
+	if s.OrderColumn != "" && !validSQLIdentifier(s.OrderColumn) {
+		return nil, errors.New("paged SQL source order_column must be a simple identifier")
+	}
+	if s.IDColumn != "" && !validSQLIdentifier(s.IDColumn) {
+		return nil, errors.New("paged SQL source id_column must be a simple identifier")
+	}
 	if s.PageSize <= 0 {
 		s.PageSize = 100000
 	}
@@ -1286,24 +1444,32 @@ type pagedSQLCursor struct {
 }
 
 func (c *pagedSQLCursor) Next(ctx context.Context, dst *SourceRecord) bool {
+	if c.err != nil {
+		return false
+	}
+	retries := 0
 	for {
-		if c.cur != nil && c.cur.Next(ctx, dst) {
-			if c.src.OrderColumn == "" {
-				c.offset++
-				dst.Seq = c.offset
-				dst.ID = "row-" + strconv.FormatUint(c.offset, 10)
-			} else {
-				if c.src.OrderColumn == c.src.IDColumn {
-					c.lastID = dst.ID
-				}
-				if dst.Seq > c.last {
-					c.last = dst.Seq
-				}
-			}
-			return true
-		}
 		if c.cur != nil {
+			if c.cur.Next(ctx, dst) {
+				if c.src.OrderColumn != "" && c.src.OrderColumn != c.src.IDColumn && dst.Seq <= c.last {
+					c.err = fmt.Errorf("SQL keyset sequence %d is not strictly greater than prior sequence %d; order_column must be unique, numeric, and ordered", dst.Seq, c.last)
+					return false
+				}
+				c.recordCursor(dst)
+				return true
+			}
 			if err := c.cur.Err(); err != nil {
+				_ = c.cur.Close()
+				c.cur = nil
+				if transientSQLError(err) && retries < 5 {
+					retries++
+					if pauseErr := retryPause(ctx, retries); pauseErr == nil {
+						continue
+					} else {
+						c.err = pauseErr
+						return false
+					}
+				}
 				c.err = err
 				return false
 			}
@@ -1314,17 +1480,35 @@ func (c *pagedSQLCursor) Next(ctx context.Context, dst *SourceRecord) bool {
 			return false
 		}
 		query, args := c.nextQuery()
-		src := SQLSource{DB: c.src.DB, Query: query, Args: args, IDColumn: c.src.IDColumn, SeqColumn: c.src.SeqColumn, Columns: c.src.ColumnBindings}
+		src := SQLSource{DB: c.src.DB, Query: query, Args: args, IDColumn: c.src.IDColumn, SeqColumn: c.src.SeqColumn, RequireNumericSeq: c.src.OrderColumn != "" && c.src.OrderColumn != c.src.IDColumn, Columns: c.src.ColumnBindings}
 		cur, err := src.Open(ctx)
 		if err != nil {
+			if transientSQLError(err) && retries < 5 {
+				retries++
+				if pauseErr := retryPause(ctx, retries); pauseErr == nil {
+					continue
+				} else {
+					c.err = pauseErr
+					return false
+				}
+			}
 			c.err = err
 			return false
 		}
 		// Detect an empty page by attempting the first Next immediately.
 		if !cur.Next(ctx, dst) {
 			if err := cur.Err(); err != nil {
-				c.err = err
 				_ = cur.Close()
+				if transientSQLError(err) && retries < 5 {
+					retries++
+					if pauseErr := retryPause(ctx, retries); pauseErr == nil {
+						continue
+					} else {
+						c.err = pauseErr
+						return false
+					}
+				}
+				c.err = err
 				return false
 			}
 			_ = cur.Close()
@@ -1332,19 +1516,27 @@ func (c *pagedSQLCursor) Next(ctx context.Context, dst *SourceRecord) bool {
 			return false
 		}
 		c.cur = cur
-		if c.src.OrderColumn == "" {
-			c.offset++
-			dst.Seq = c.offset
-			dst.ID = "row-" + strconv.FormatUint(c.offset, 10)
-		} else {
-			if c.src.OrderColumn == c.src.IDColumn {
-				c.lastID = dst.ID
-			}
-			if dst.Seq > c.last {
-				c.last = dst.Seq
-			}
+		if c.src.OrderColumn != "" && c.src.OrderColumn != c.src.IDColumn && dst.Seq <= c.last {
+			c.err = fmt.Errorf("SQL keyset sequence %d is not strictly greater than prior sequence %d; order_column must be unique, numeric, and ordered", dst.Seq, c.last)
+			return false
 		}
+		c.recordCursor(dst)
 		return true
+	}
+}
+
+func (c *pagedSQLCursor) recordCursor(dst *SourceRecord) {
+	if c.src.OrderColumn == "" {
+		c.offset++
+		dst.Seq = c.offset
+		dst.ID = "row-" + strconv.FormatUint(c.offset, 10)
+		return
+	}
+	if c.src.OrderColumn == c.src.IDColumn {
+		c.lastID = dst.ID
+	}
+	if dst.Seq > c.last {
+		c.last = dst.Seq
 	}
 }
 func (c *pagedSQLCursor) nextQuery() (string, []any) {

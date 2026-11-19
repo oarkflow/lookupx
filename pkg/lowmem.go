@@ -2,8 +2,12 @@ package pkg
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
+	"math"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -87,6 +91,8 @@ func (c *streamingDatasetCursor) Close() error { return nil }
 type PartitionedBuildOptions struct {
 	IndexID          string
 	Store            PersistentStore
+	CatalogPath      string
+	DatasetRoot      string
 	Config           Config
 	RowsPerPartition uint64
 	Bulk             BulkOptions
@@ -111,6 +117,7 @@ type PartitionedBuildProgress struct {
 
 type PartitionedBuildStats struct {
 	IndexID    string               `json:"index_id"`
+	BuildID    string               `json:"build_id"`
 	Seen       uint64               `json:"seen"`
 	Indexed    uint64               `json:"indexed"`
 	Skipped    uint64               `json:"skipped"`
@@ -129,6 +136,19 @@ func BuildPartitionedPersistent(ctx context.Context, src Source, opt Partitioned
 	}
 	if opt.Store == nil {
 		return PartitionedBuildStats{}, errors.New("persistent store required")
+	}
+	if opt.Bulk.Resume && opt.Bulk.Checkpoint != nil {
+		name := opt.Bulk.Name
+		if name == "" {
+			name = opt.IndexID
+		}
+		seq, err := opt.Bulk.Checkpoint.Load(ctx, name)
+		if err != nil {
+			return PartitionedBuildStats{}, fmt.Errorf("load partition build checkpoint: %w", err)
+		}
+		if seq > 0 {
+			return PartitionedBuildStats{}, fmt.Errorf("cannot resume partition build from source checkpoint %d without restoring the matching completed partitions", seq)
+		}
 	}
 	if opt.IndexID == "" {
 		opt.IndexID = "index"
@@ -187,9 +207,14 @@ func BuildPartitionedPersistent(ctx context.Context, src Source, opt Partitioned
 	rec := SourceRecord{Values: make([]SourceValue, 0, len(ix.fieldList))}
 	var stats PartitionedBuildStats
 	stats.IndexID = cleanIndexID(opt.IndexID)
+	var buildID [12]byte
+	if _, err := rand.Read(buildID[:]); err != nil {
+		return stats, fmt.Errorf("create partition build ID: %w", err)
+	}
+	stats.BuildID = hex.EncodeToString(buildID[:])
 	partitionNo := 0
 	partitionRows := uint64(0)
-	currentPartitionID := func() string { return fmt.Sprintf("%s-p%06d", stats.IndexID, partitionNo) }
+	currentPartitionID := func() string { return fmt.Sprintf("%s-b%s-p%06d", stats.IndexID, stats.BuildID, partitionNo) }
 
 	flush := func() error {
 		if len(batch) == 0 {
@@ -203,7 +228,10 @@ func BuildPartitionedPersistent(ctx context.Context, src Source, opt Partitioned
 			stats.LastSeq = lastSeq
 		}
 		for i := range batch {
+			clear(batch[i].Values)
 			batch[i].Values = batch[i].Values[:0]
+			batch[i].ID = ""
+			batch[i].Seq = 0
 		}
 		batch = batch[:0]
 		if err != nil {
@@ -289,6 +317,12 @@ func BuildPartitionedPersistent(ctx context.Context, src Source, opt Partitioned
 		}
 	}
 	stats.Took = time.Since(started)
+	if opt.CatalogPath != "" {
+		dataset := PartitionDataset{Root: opt.DatasetRoot, BuildID: stats.BuildID, Generations: append([]PersistentManifest(nil), stats.Manifests...)}
+		if err := dataset.Save(opt.CatalogPath); err != nil {
+			return stats, fmt.Errorf("publish partition catalog: %w", err)
+		}
+	}
 	return stats, nil
 }
 
@@ -303,31 +337,90 @@ func LowMemoryBillionBudget() MemoryBudget {
 // scanning. For production, pair this with partition pruning so only relevant
 // manifests are passed for a given query.
 func SearchPartitionedPersistent(ctx context.Context, store PersistentStore, manifests []PersistentManifest, cfg Config, req SearchRequest, dst []Hit) ([]Hit, error) {
+	result, err := SearchPartitionedPersistentResult(ctx, store, manifests, cfg, req, dst)
+	return result.Hits, err
+}
+
+// SearchPartitionedPersistentResult searches every supplied partition and
+// merges local candidates by their returned scores. BM25 scores calculated
+// against separate partition corpora are not globally calibrated, so this is
+// suitable only where per-partition score ordering is acceptable. Partitions
+// must be pruned by the caller when query fields allow it; this function does
+// not return early when an early partition fills the requested page.
+func SearchPartitionedPersistentResult(ctx context.Context, store PersistentStore, manifests []PersistentManifest, cfg Config, req SearchRequest, dst []Hit) (Result, error) {
+	started := time.Now()
 	if store == nil {
-		return dst[:0], errors.New("persistent store required")
+		return Result{}, errors.New("persistent store required")
+	}
+	if len(req.Sort) > 0 {
+		return Result{}, errors.New("partitioned persistent search does not support field sorting")
+	}
+	if len(req.Facets) > 0 {
+		return Result{}, errors.New("partitioned persistent search does not support facets")
+	}
+	if req.AfterDocID > 0 {
+		return Result{}, errors.New("partitioned persistent search does not support after_doc_id pagination")
 	}
 	limit := req.Limit
 	if limit <= 0 {
 		limit = 20
 	}
+	if req.Offset < 0 || limit > math.MaxInt-req.Offset {
+		return Result{}, errors.New("invalid partitioned search limit or offset")
+	}
+	pageSize := limit + req.Offset
 	dst = dst[:0]
+	total := 0
 	for _, man := range manifests {
 		select {
 		case <-ctx.Done():
-			return dst, ctx.Err()
+			return Result{Hits: dst, Total: total, Took: time.Since(started).Nanoseconds()}, ctx.Err()
 		default:
 		}
 		ix, _, err := store.LoadIndex(ctx, man.IndexID, cfg)
 		if err != nil {
-			return dst, err
+			return Result{Hits: dst, Total: total, Took: time.Since(started).Nanoseconds()}, err
 		}
-		local := make([]Hit, 0, limit-len(dst))
-		_, local = ix.SearchInto(SearchRequest{Query: req.Query, Limit: limit - len(dst)}, local)
-		_ = ix.Close()
+		localReq := req
+		localReq.Limit = pageSize
+		localReq.Offset = 0
+		localReq.AfterDocID = 0
+		local := make([]Hit, 0, pageSize)
+		localResult, local := ix.SearchInto(localReq, local)
+		closeErr := ix.Close()
+		if closeErr != nil {
+			return Result{Hits: dst, Total: total, Took: time.Since(started).Nanoseconds()}, closeErr
+		}
+		if !req.SkipTotal {
+			if localResult.Total > math.MaxInt-total {
+				return Result{Hits: dst, Total: total, Took: time.Since(started).Nanoseconds()}, errors.New("partitioned search total exceeds platform integer range")
+			}
+			total += localResult.Total
+		}
 		dst = append(dst, local...)
-		if len(dst) >= limit {
-			return dst, nil
+		sort.SliceStable(dst, func(i, j int) bool {
+			if dst[i].Score != dst[j].Score {
+				return dst[i].Score > dst[j].Score
+			}
+			if dst[i].ID != dst[j].ID {
+				return dst[i].ID < dst[j].ID
+			}
+			return dst[i].DocID < dst[j].DocID
+		})
+		if len(dst) > pageSize {
+			dst = dst[:pageSize]
 		}
 	}
-	return dst, nil
+	if req.Offset >= len(dst) {
+		dst = dst[:0]
+	} else if req.Offset > 0 {
+		dst = dst[req.Offset:]
+	}
+	if len(dst) > limit {
+		dst = dst[:limit]
+	}
+	if req.SkipTotal {
+		total = 0
+	}
+	return Result{Hits: dst, Total: total, Took: time.Since(started).Nanoseconds()}, nil
 }
