@@ -47,6 +47,7 @@ type WireQuery struct {
 	AfterDocID     DocID       `json:"after_doc_id,omitempty"`
 	SkipTotal      bool        `json:"skip_total,omitempty"`
 	WithDocs       bool        `json:"with_docs,omitempty"`
+	Verbose        bool        `json:"verbose,omitempty"`
 	Sort           []SortField `json:"sort,omitempty"`
 	Facets         []string    `json:"facets,omitempty"`
 }

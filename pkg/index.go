@@ -406,6 +406,17 @@ func (ix *Index) upsertLocked(id string, doc Document, log bool) error {
 	}
 	ix.live.Add(did)
 	ix.docToExt = append(ix.docToExt, id)
+	doc = cloneDoc(doc)
+	for _, sf := range ix.fieldList {
+		if sf.opt.Kind != FieldTime || sf.opt.TimeFormat == "" || doc[sf.name] == nil {
+			continue
+		}
+		if raw, ok := doc[sf.name].(string); ok {
+			if parsed, err := parseTemporalValue(raw, sf.opt.TimeFormat); err == nil {
+				doc[sf.name] = formatTemporalValue(parsed, sf.opt.TimeFormat)
+			}
+		}
+	}
 	if !ix.cfg.DisableSource {
 		ix.docs = append(ix.docs, cloneDoc(doc))
 	}
@@ -483,7 +494,7 @@ func (ix *Index) documentLocked(id DocID) Document {
 		values := ix.numericDense[field.name]
 		exists := ix.numericExists[field.name]
 		if int(id) < len(values) && exists != nil && exists.Has(id) {
-			doc[field.name] = time.Unix(int64(values[id]), 0).UTC().Format(time.RFC3339)
+			doc[field.name] = formatTemporalValue(int64(values[id]), field.opt.TimeFormat)
 		}
 	}
 	return doc
@@ -750,6 +761,8 @@ func globalTermFromQuery(q Query) (GlobalTerm, bool) {
 	switch x := q.(type) {
 	case GlobalTerm:
 		return x, true
+	case latestPerGroupQuery:
+		return globalTermFromQuery(x.Candidate)
 	case Bool:
 		for _, list := range [][]Query{x.Must, x.Filter, x.Should} {
 			for _, child := range list {
@@ -1053,13 +1066,25 @@ func (ix *Index) indexDocLocked(id DocID, doc Document) {
 		// them to strings and indexing a unique term bitmap for every value; range
 		// and exact numeric matching use the numeric column.
 		if opt.Kind == FieldInt || opt.Kind == FieldFloat || opt.Kind == FieldTime {
-			if n, ok := toFloat(v); ok {
+			n, ok := toFloat(v)
+			if opt.Kind == FieldTime && opt.TimeFormat != "" {
+				if raw, isString := v.(string); isString {
+					parsed, err := parseTemporalValue(raw, opt.TimeFormat)
+					n, ok = float64(parsed), err == nil
+				}
+			}
+			if ok {
 				if ix.numeric[field] == nil {
 					ix.numeric[field] = make(map[DocID]float64, ix.cfg.InitialCapacity)
 				}
 				ix.setNumericLocked(field, id, n)
 				if opt.Kind == FieldTime && sf.stringsCol != nil {
 					if raw, ok := v.(string); ok && raw != "" {
+						if opt.TimeFormat != "" {
+							if parsed, err := parseTemporalValue(raw, opt.TimeFormat); err == nil {
+								raw = formatTemporalValue(parsed, opt.TimeFormat)
+							}
+						}
 						ix.setStringColumnLocked(field, id, raw)
 					}
 				}

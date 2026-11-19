@@ -23,6 +23,7 @@ type sqlSampleRequest struct {
 	IDColumn    string `json:"id_column"`
 	SeqColumn   string `json:"seq_column,omitempty"`
 	SampleSize  int    `json:"sample_size,omitempty"`
+	DataDir     string `json:"-"`
 }
 
 // AutoIndexColumn mirrors one detected column, using the same string kind
@@ -49,7 +50,11 @@ func connectAndSample(ctx context.Context, req sqlSampleRequest) (*squealx.DB, [
 		sampleSize = 200
 	}
 
-	db, err := squealx.Connect(squealxDriver(req.Driver), req.DSN, "")
+	dsn, err := secureSQLiteDSN(req.Driver, req.DSN, req.DataDir)
+	if err != nil {
+		return nil, nil, err
+	}
+	db, err := squealx.Connect(squealxDriver(req.Driver), dsn, "")
 	if err != nil {
 		return nil, nil, err
 	}
@@ -98,7 +103,7 @@ func autoColumnsWire(cols []AutoColumn) []AutoIndexColumn {
 	for _, c := range cols {
 		out = append(out, AutoIndexColumn{
 			Column: c.Column, Field: c.Field, Kind: valueKindName(c.Kind),
-			Layout: c.Layout, FieldKind: fieldKindName(c.Options.Kind),
+			Layout: c.Layout, FieldKind: fieldKindName(c.Options),
 		})
 	}
 	return out
@@ -135,16 +140,20 @@ func schemaFieldsWire(fields map[string]FieldOptions) map[string]any {
 	out := make(map[string]any, len(fields))
 	for name, o := range fields {
 		out[name] = map[string]any{
-			"kind": int(o.Kind), "kind_name": fieldKindName(o.Kind),
+			"kind": int(o.Kind), "kind_name": fieldKindName(o),
 			"indexed": o.Indexed, "lookup": o.Lookup, "term_search": o.TermSearch, "prefix": o.Prefix,
 			"sortable": o.Sortable, "facetable": o.Facetable, "lowercase": o.Lowercase,
 			"min_prefix": o.MinPrefix, "max_prefix": o.MaxPrefix,
+		}
+		if o.TimeFormat != "" {
+			out[name].(map[string]any)["time_format"] = o.TimeFormat
 		}
 	}
 	return out
 }
 
-func fieldKindName(k FieldKind) string {
+func fieldKindName(o FieldOptions) string {
+	k := o.Kind
 	switch k {
 	case FieldText:
 		return "text"
@@ -155,7 +164,10 @@ func fieldKindName(k FieldKind) string {
 	case FieldBool:
 		return "bool"
 	case FieldTime:
-		return "time"
+		if o.TimeFormat != "" {
+			return o.TimeFormat
+		}
+		return "datetimez"
 	case FieldVector:
 		return "vector"
 	default:

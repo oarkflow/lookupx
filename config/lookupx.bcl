@@ -5,7 +5,7 @@ bcl {
 # Clear fulltext replacement index configuration.
 # Set MYSQL_DSN to a MySQL DSN for a user that can SELECT the Clear lookup views
 # and charge-master tables. The mysql driver is registered by cmd/lookupx.
-addr env("ADDR", ":8089")
+addr env("ADDR", "0.0.0.0:8089")
 data_dir env("LOOKUPX_DATA_DIR", "./data/indexes")
 api_keys [env("LOOKUPX_API_KEY", "")]
 
@@ -108,7 +108,8 @@ schema_field_set "lookup_fields_with_alias" {
 lookup_rule_set "dos_from_date" {
   lookup_rule "DOS" {
     target_field "effective_date"
-    operator "gte"
+    operator "latest_gte"
+    group_by "code"
   }
 }
 
@@ -313,13 +314,13 @@ index "cpt" {
     lookup true
   }
   schema_field "effective_date" {
-    kind "time"
+    kind "date"
     indexed true
     stored true
     lookup true
   }
   schema_field "end_effective_date" {
-    kind "time"
+    kind "date"
     indexed true
     stored true
     lookup true
@@ -364,13 +365,13 @@ index "hcpcs" {
     lookup true
   }
   schema_field "effective_date" {
-    kind "time"
+    kind "date"
     indexed true
     stored true
     lookup true
   }
   schema_field "end_effective_date" {
-    kind "time"
+    kind "date"
     indexed true
     stored true
     lookup true
@@ -436,7 +437,7 @@ index "dx-icd10" {
     lowercase true
   }
   schema_field "effective_date" {
-    kind "time"
+    kind "date"
     indexed true
     stored true
     lookup true
@@ -452,7 +453,7 @@ index "dx-icd10-pcs" {
   &schema_field_set.lookup_fields
   &lookup_rule_set.dos_from_date
   schema_field "effective_date" {
-    kind "time"
+    kind "date"
     indexed true
     stored true
     lookup true
@@ -481,7 +482,7 @@ index "special-fac" {
     lookup true
   }
   schema_field "effective_date" {
-    kind "time"
+    kind "date"
     indexed true
     stored true
     lookup true
@@ -516,7 +517,7 @@ index "special-pro" {
     lookup true
   }
   schema_field "effective_date" {
-    kind "time"
+    kind "date"
     indexed true
     stored true
     lookup true

@@ -39,11 +39,80 @@ go run ./examples/basic
 go run ./cmd/lookupx
 ```
 
-The server starts on `:8089` by default. To start without a config file, run `go run ./cmd/lookupx serve -config ""`.
+The server binds to `0.0.0.0:8089` by default and loads `FH_*` settings from
+`.env` using `fh`'s config loader; process environment values take precedence.
+The secure profile is enabled by default with a 4 GiB heap ceiling. Copy
+`.env.example` to `.env` and tune the ceiling for the host. Set a 32-byte
+`LOOKUPX_SESSION_SECRET` before starting. On first visit, the browser asks you
+to create the admin username and password; the password is stored as an
+Argon2id hash in the private auth store. Alternatively, set both
+`LOOKUPX_ADMIN_USERNAME` and `LOOKUPX_ADMIN_PASSWORD` to bootstrap the first
+admin account. Once created, the stored account is authoritative. The API
+accepts `X-API-Key` or `Authorization: Bearer`; browser login sends Basic
+credentials once to `/auth/login`, then uses a server-side session cookie. The
+cookie is HttpOnly, SameSite Strict, and rotated at login. Browser writes also
+require a CSRF token and matching Origin. Because the default binds every
+interface for EC2/LAN deployments, restrict inbound traffic with the host or
+cloud firewall. Put the app behind a TLS reverse proxy or load balancer; expose
+the app port only to that proxy, overwrite `X-Forwarded-Proto` with `https`, set
+`LOOKUPX_SESSION_SECURE=true`, list the proxy peer in
+`LOOKUPX_SESSION_TRUSTED_PROXIES`, and set `FH_ALLOWED_HOSTS` for the deployed
+hostname. Do not expose the plain HTTP app port to the public internet.
+
+To start without a BCL config file, run `go run ./cmd/lookupx serve -config ""`.
 
 ```bash
-ADDR=:8089 go run ./cmd/lookupx serve
+go run ./cmd/lookupx serve
 ```
+
+Set `ADDR` to override the listen address. `FH_*` settings configure the fh
+server; see `.env.example` for the resource and host controls used by default.
+The CLI reads `.env` before expanding BCL `env()` expressions. Protect that
+file with mode `0600`; the repository ignores it.
+
+The browser console starts at a sign-in screen. After signing in, use **Admin**
+or open `/admin.html` for the dedicated configuration workspace. The SQL
+query library is a separate page at `/admin-queries.html`. The BCL map
+is a collapsed tree: expand blocks to browse settings, then select a setting
+to see its value, explanation, and source location. Reference links expand the
+map to the referenced definition. Index summaries show schema and rule counts
+without dumping every field. Select a `query.file` entry to open its SQL in the
+editor. Create SQL folders and files there; paths stay inside the directory
+containing the active BCL file. The admin workspace stays hidden until its
+session check succeeds.
+API keys are stored as hashes in `<LOOKUPX_DATA_DIR>/auth`; the secret is
+displayed only when created or rotated. Rotating a key immediately revokes its
+previous value while preserving its owner, scopes, IP restrictions, and expiry.
+Removing `LOOKUPX_DATA_DIR` also resets the local admin account and API key
+registry. The BCL editor validates changes and requires a restart to apply
+them. API routes, including `/health` and
+`/metrics`, require either an admin session or an API key. Read-only keys can
+search and inspect indexes; write operations require `lookup:write`.
+
+SQLite DSNs used by BCL datasources and SQL reload endpoints are restricted to
+`LOOKUPX_DATA_DIR/sqlite` (default `./data/indexes/sqlite`). Relative filenames
+are resolved there, directories are private, and database files are mode
+`0600`. `:memory:` is available for temporary databases. URI options, remote
+SQLite hosts, and paths outside that directory are rejected.
+
+For `sql_query` datasources, use a query object to make the SQL source explicit:
+
+```bcl
+datasource "catalog" {
+  kind "sql_query"
+  driver "mysql"
+  dsn env("MYSQL_DSN")
+  id_column "id"
+  query {
+    file "queries/catalog.sql"
+  }
+}
+```
+
+`queries/catalog.sql` is relative to the BCL file and must contain one `SELECT`
+statement (a `WITH` query ending in `SELECT` is also accepted). To keep SQL
+inline, use `query { string "SELECT id, name FROM catalog" }`. Existing
+`query "SELECT ..."` and `query_file "..."` configurations remain supported.
 
 ## Clear fulltext indexes from BCL
 
@@ -84,6 +153,13 @@ from the operator-based field filters. `term_field` can narrow a term query
 to one of the configured fields. Both candidate retrieval and BM25 scoring use
 this field list, avoiding work on unrelated searchable fields.
 
+Temporal `schema_field` kinds control accepted values and canonical result
+format: `date` uses `YYYY-MM-DD`, `datetime` uses a timezone-free
+`YYYY-MM-DDTHH:mm:ss` value interpreted as UTC, `time` uses `HH:mm:ss` and is
+indexed as seconds since midnight, and `datetimez` uses RFC3339 with a timezone
+and is normalized to UTC. Legacy Go schemas with `FieldTime` and no
+`TimeFormat` keep RFC3339 behavior.
+
 ```bcl
 schema_field "description" {
   kind "text"
@@ -95,7 +171,8 @@ schema_field "description" {
 # schema field/operator filter. Parameter names are case-insensitive.
 lookup_rule "DOS" {
   target_field "effective_date"
-  operator "gte"
+  operator "latest_gte"
+  group_by "code"
 }
 ```
 
@@ -111,19 +188,23 @@ Use `-config ""` for an empty server, or `-storage disk` to persist the loaded
 indexes under `data_dir` and restore saved generations on later starts. The
 persisted index is decoded into Go memory at startup; this is durable disk
 storage, not memory-mapped search. Set `LOOKUPX_API_KEY` to protect the HTTP
-endpoints.
+endpoints. API examples below use the key from `.env`:
+
+```bash
+export LOOKUPX_API_KEY='your-configured-api-key'
+```
 
 List configured indexes and check their indexed row counts:
 
 ```bash
-curl localhost:8089/v1/indexes
-curl localhost:8089/v1/indexes/cpt/stats
+curl -H "X-API-Key: $LOOKUPX_API_KEY" localhost:8089/v1/indexes
+curl -H "X-API-Key: $LOOKUPX_API_KEY" localhost:8089/v1/indexes/cpt/stats
 ```
 
 Each index can be rebuilt from its configured SQL source:
 
 ```bash
-curl -X POST localhost:8089/v1/indexes/dx-icd10/reload
+curl -X POST -H "X-API-Key: $LOOKUPX_API_KEY" localhost:8089/v1/indexes/dx-icd10/reload
 ```
 
 Search a code prefix or description text. Text prefix, suffix, and infix
@@ -135,6 +216,7 @@ indexed fields by default, including the canonical code and description.
 
 ```bash
 curl -X POST localhost:8089/v1/indexes/cpt/search \
+  -H "X-API-Key: $LOOKUPX_API_KEY" \
   -H 'Content-Type: application/json' \
   -d '{"type":"bool","should":[{"type":"prefix","field":"code","value":"992"},{"type":"prefix","field":"fulltext","value":"office"}],"min_should_match":1,"limit":10,"with_docs":true}'
 ```
@@ -148,16 +230,38 @@ For example, this searches only CPT descriptions, while `code=99213` performs a
 field-specific lookup using the `code` field:
 
 ```bash
-curl 'localhost:8089/v1/indexes/cpt/lookup?term=office&term_field=description&work_item_uid=33&limit=10'
-curl 'localhost:8089/v1/indexes/cpt/lookup?code=99213&limit=10'
+curl -H "X-API-Key: $LOOKUPX_API_KEY" 'localhost:8089/v1/indexes/cpt/lookup?term=office&term_field=description&work_item_uid=33&limit=10'
+curl -H "X-API-Key: $LOOKUPX_API_KEY" 'localhost:8089/v1/indexes/cpt/lookup?code=99213&limit=10'
+curl -H "X-API-Key: $LOOKUPX_API_KEY" 'localhost:8089/v1/indexes/cpt/lookup?term=10060&work_item_uid=37&dos=2016-01-01&charge_type=ED_PROFEE&limit=25'
+```
+
+`GET /v1/indexes/{id}/lookup` accepts these parameters directly. `term` is
+compiled as the configured full-text lookup; ordinary schema fields such as
+`work_item_uid` and `charge_type` become exact filters; configured lookup rule
+parameters such as `DOS` are matched without regard to case, so `dos` applies
+the same date rule. The filters are combined before the lookup runs. By
+default, lookup and search responses contain only document records in `hits`,
+without a `doc` wrapper, score, or document ID. Add `verbose=true` to a GET
+lookup URL or set `"verbose": true` in a POST search body to include hit
+metadata, `total`, and `latency_ns`.
+
+```bash
+curl -H "X-API-Key: $LOOKUPX_API_KEY" 'localhost:8089/v1/indexes/cpt/lookup?term=10060&verbose=true'
+curl -X POST -H "X-API-Key: $LOOKUPX_API_KEY" -H 'Content-Type: application/json' \
+  'localhost:8089/v1/indexes/cpt/search' \
+  -d '{"type":"term","field":"code","value":"10060","verbose":true}'
 ```
 
 Multiple term words can match across different fields, and can be combined
 with additional exact filters such as `charge_type=ED_FACILITY`.
 Configured `lookup_rule` parameters use the same `name=value` syntax and can
 map to any supported field operator, including `eq`, `between`, `gt`, `gte`,
-`lt`, `lte`, `contains`, `exists`, and `missing`. For example, a rule mapping
-`DOS` to a time field with `gte` can be combined with ordinary filters as
+`lt`, `lte`, `contains`, `exists`, and `missing`. The special `latest_gte`
+operator selects the greatest date for each `group_by` value after applying
+the other request filters, then keeps the group only when that date is on or
+after the supplied date. For example, `DOS=2016-01-01` returns only the latest
+effective-date record for each matching code whose latest date meets the cutoff.
+It can be combined with ordinary filters as
 `...?term=98925&work_item_uid=114&charge_type=ED_PROFEE&DOS=2016-01-01`.
 In the browser, add `DOS` and its date in the separate Field values section;
 the operator-based field filters remain available for schema fields.
@@ -834,7 +938,7 @@ go run ./cmd/lookupx demo -rows 100000
 go run ./cmd/lookupx search -index dataset_a -rows 100000 -q 'term=key-0013&group_id=4&date_key=2026-01-01'
 
 # Start the HTTP API. Add -demo to preload dataset_a/dataset_b/dataset_c demo indexes.
-go run ./cmd/lookupx serve -addr :8089 -demo -rows 100000
+go run ./cmd/lookupx serve -addr 127.0.0.1:8089 -demo -rows 100000
 ```
 
 ### HTTP API
@@ -842,7 +946,7 @@ go run ./cmd/lookupx serve -addr :8089 -demo -rows 100000
 Start:
 
 ```bash
-go run ./cmd/lookupx serve -addr :8089 -demo -rows 100000
+go run ./cmd/lookupx serve -addr 127.0.0.1:8089 -demo -rows 100000
 ```
 
 List indexes:

@@ -6,6 +6,12 @@
   <title>LookupX — Search Console</title>
   <script src="https://cdn.tailwindcss.com"></script>
   <link rel="stylesheet" href="styles.css?v=15" />
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/codemirror.min.css" />
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/theme/material-darker.min.css" />
+  <style>
+    .CodeMirror { min-height: 180px; border: 1px solid #334155; border-radius: 8px; font: 13px/1.55 ui-monospace, SFMono-Regular, Menlo, monospace; }
+    .editor-label { display:block; margin: 12px 0 6px; color:#94a3b8; font-size:12px; font-weight:600; }
+  </style>
   <script>
     tailwind.config = {
       theme: {
@@ -17,8 +23,32 @@
       }
     }
   </script>
+  <style>
+    body:not(.auth-ready) .app-shell { display: none; }
+    .auth-gate { min-height: 100vh; display: grid; place-items: center; padding: 24px; background: #f5f7fa; }
+    body.auth-ready .auth-gate { display: none; }
+    .auth-card { width: min(100%, 390px); padding: 30px; border: 1px solid #e2e8f0; border-radius: 14px; background: white; box-shadow: 0 12px 36px #17212f14; }
+    .auth-card h1 { margin: 0 0 8px; font-size: 22px; }
+    .auth-card p { margin: 0 0 22px; color: #64748b; }
+    .auth-card label { display: block; margin: 14px 0 6px; font-weight: 600; }
+    .auth-card input { width: 100%; padding: 11px 12px; border: 1px solid #cbd5e1; border-radius: 8px; }
+    .auth-card button { width: 100%; margin-top: 20px; padding: 11px; border: 0; border-radius: 8px; background: #176b87; color: white; font-weight: 700; cursor: pointer; }
+    .auth-error { min-height: 20px; margin-top: 12px; color: #b42318; }
+  </style>
 </head>
 <body class="h-full">
+  <section id="auth-gate" class="auth-gate" aria-label="Admin setup or sign in">
+    <form id="auth-form" class="auth-card" method="post" action="/auth/setup">
+      <h1>Set up LookupX admin</h1>
+      <p>Create the first administrator account.</p>
+      <label for="auth-username">Username</label>
+      <input id="auth-username" name="username" autocomplete="username" required />
+      <label for="auth-password">Password</label>
+      <input id="auth-password" name="password" type="password" autocomplete="new-password" minlength="12" required />
+      <button type="submit">Create admin account</button>
+      <div id="auth-error" class="auth-error" role="alert" aria-live="polite"></div>
+    </form>
+  </section>
   <div class="app-shell">
     <aside class="sidebar">
       <a class="brand" href="#search" aria-label="LookupX home">
@@ -36,6 +66,9 @@
         <button data-tab="integrations" class="nav-btn" aria-label="Integrations" title="Integrations">
           <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8.5 15.5 6 18a3.5 3.5 0 0 1-5-5l4-4a3.5 3.5 0 0 1 5 0M15.5 8.5 18 6a3.5 3.5 0 0 1 5 5l-4 4a3.5 3.5 0 0 1-5 0M8 16l8-8"></path></svg><span>Integrations</span>
         </button>
+        <button data-tab="admin" class="nav-btn" aria-label="Admin" title="Admin">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3 4 6v5c0 5 3.4 8.2 8 10 4.6-1.8 8-5 8-10V6l-8-3Z"></path><path d="m9 12 2 2 4-4"></path></svg><span>Admin</span>
+        </button>
       </nav>
       <div class="sidebar-bottom">
         <div class="engine-mark"><span class="engine-dot"></span><div><strong>LookupX engine</strong><small>Embedded search service</small></div></div>
@@ -48,14 +81,18 @@
         <div class="topbar-title"><span class="topbar-kicker">LOOKUPX</span><span class="topbar-divider">/</span><h2 id="page-title">Search</h2></div>
         <div class="topbar-actions">
           <label class="api-label" for="api-base">API endpoint</label>
-          <input id="api-base" type="text" value="" placeholder="http://localhost:8089" />
+          <input id="api-base" type="text" value="" placeholder="Same origin as this console" title="The console sends session credentials only to its own origin." />
           <button onclick="App.refresh()" class="btn btn-secondary btn-refresh"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 7v5h-5M4 17v-5h5"></path><path d="M5.6 9A7 7 0 0 1 18 6l2 6M4 12l2 6a7 7 0 0 0 12.4-3"></path></svg><span>Refresh</span></button>
+          <button onclick="App.logout()" class="btn btn-secondary">Sign out</button>
         </div>
       </header>
       <div id="content"></div>
     </main>
   </div>
 
-  <script src="app.js?v=15"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/codemirror.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/addon/mode/simple.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/mode/sql/sql.min.js"></script>
+  <script src="app.js?v=27"></script>
 </body>
 </html>

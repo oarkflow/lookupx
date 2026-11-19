@@ -708,8 +708,8 @@ func TestClearBCLConfigDeclaresTermSearchFields(t *testing.T) {
 			t.Errorf("index %q work_item_uid should remain a field-value filter, not a term-search field", idx.ID)
 		}
 		if dosRuleIndexes[idx.ID] {
-			if len(idx.ToConfig().LookupRules) != 1 || idx.ToConfig().LookupRules[0] != (LookupRule{Parameter: "DOS", Field: "effective_date", Operator: "gte"}) {
-				t.Errorf("index %q should map DOS to effective_date gte: %#v", idx.ID, idx.ToConfig().LookupRules)
+			if len(idx.ToConfig().LookupRules) != 1 || idx.ToConfig().LookupRules[0] != (LookupRule{Parameter: "DOS", Field: "effective_date", Operator: "latest_gte", GroupBy: "code"}) {
+				t.Errorf("index %q should map DOS to the latest effective_date per code: %#v", idx.ID, idx.ToConfig().LookupRules)
 			}
 			if fields["effective_date"].Kind != FieldTime {
 				t.Errorf("index %q effective_date must be a time field", idx.ID)

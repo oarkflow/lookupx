@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"path/filepath"
+	"strings"
 )
 
 // ---------------------------------------------------------------------------
@@ -28,7 +30,15 @@ func LoadBCLConfig(path string, registry *DatasourceRegistry) (*LookupXConfig, e
 	if err != nil {
 		return nil, fmt.Errorf("read config: %w", err)
 	}
-	return ParseBCLBytes(b, registry)
+	cfg, err := ParseBCLBytes(b, registry)
+	if err != nil {
+		return nil, err
+	}
+	cfg.BaseDir, err = filepath.Abs(filepath.Dir(path))
+	if err != nil {
+		return nil, fmt.Errorf("resolve config directory: %w", err)
+	}
+	return cfg, nil
 }
 
 // ParseBCLBytes parses BCL bytes into a LookupXConfig using bcl.Unmarshal.
@@ -40,6 +50,10 @@ func ParseBCLBytes(src []byte, registry *DatasourceRegistry) (*LookupXConfig, er
 	if err := unmarshalBCL(src, &cfg); err != nil {
 		return nil, fmt.Errorf("bcl unmarshal: %w", err)
 	}
+	if err := applyBCLQueryObjects(src, &cfg); err != nil {
+		return nil, err
+	}
+	cfg.BaseDir, _ = os.Getwd()
 	// Validate that all referenced datasource types are registered.
 	for _, ds := range cfg.Datasources {
 		if !registry.Has(ds.Kind) {
@@ -47,6 +61,47 @@ func ParseBCLBytes(src []byte, registry *DatasourceRegistry) (*LookupXConfig, er
 		}
 	}
 	return &cfg, nil
+}
+
+func resolveConfigSQLFile(baseDir, configuredPath string) (string, error) {
+	configuredPath = strings.TrimSpace(configuredPath)
+	if configuredPath == "" || filepath.IsAbs(configuredPath) || strings.Contains(configuredPath, "\\") || strings.ToLower(filepath.Ext(configuredPath)) != ".sql" {
+		return "", fmt.Errorf("file must be a relative .sql path under the BCL directory")
+	}
+	rel := filepath.Clean(filepath.FromSlash(configuredPath))
+	if rel == "." || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return "", fmt.Errorf("file path escapes the BCL directory")
+	}
+	root, err := filepath.Abs(baseDir)
+	if err != nil {
+		return "", err
+	}
+	full := filepath.Join(root, rel)
+	if inside, err := filepath.Rel(root, full); err != nil || inside == ".." || strings.HasPrefix(inside, ".."+string(filepath.Separator)) {
+		return "", fmt.Errorf("file path escapes the BCL directory")
+	}
+	current := root
+	parts := strings.Split(rel, string(filepath.Separator))
+	for i, part := range parts {
+		current = filepath.Join(current, part)
+		info, err := os.Lstat(current)
+		if err != nil {
+			return "", fmt.Errorf("open %q: %w", configuredPath, err)
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			return "", fmt.Errorf("symlinks are not allowed in SQL file paths")
+		}
+		if i < len(parts)-1 && !info.IsDir() {
+			return "", fmt.Errorf("SQL path parent is not a directory")
+		}
+		if i == len(parts)-1 && !info.Mode().IsRegular() {
+			return "", fmt.Errorf("SQL query file must be a regular file")
+		}
+		if i == len(parts)-1 && info.Size() > 1<<20 {
+			return "", fmt.Errorf("SQL query file exceeds the 1 MiB limit")
+		}
+	}
+	return full, nil
 }
 
 // BuildFromBCLConfig creates a MultiIndexManager from a parsed BCL config.
@@ -80,6 +135,24 @@ func BuildFromBCLConfig(ctx context.Context, cfg *LookupXConfig, registry *Datas
 				return nil, fmt.Errorf("index %q references unknown datasource %q", idx.ID, idx.DatasourceID)
 			}
 			dsConfig := dsDef.ToMap()
+			if queryFile, ok := dsConfig["query_file"].(string); ok && strings.TrimSpace(queryFile) != "" {
+				baseDir := cfg.BaseDir
+				if baseDir == "" {
+					baseDir, _ = os.Getwd()
+				}
+				resolved, err := resolveConfigSQLFile(baseDir, queryFile)
+				if err != nil {
+					return nil, fmt.Errorf("index %q datasource %q query file: %w", idx.ID, dsDef.ID, err)
+				}
+				dsConfig["query_file"] = resolved
+			}
+			if dsn, ok := dsConfig["dsn"].(string); ok {
+				secureDSN, err := secureSQLiteDSN(dsDef.Driver, dsn, cfg.DataDir)
+				if err != nil {
+					return nil, fmt.Errorf("index %q secure datasource DSN: %w", idx.ID, err)
+				}
+				dsConfig["dsn"] = secureDSN
+			}
 			ds, err := registry.Create(dsDef.Kind, dsConfig, dsDef.Params)
 			if err != nil {
 				return nil, fmt.Errorf("index %q create datasource: %w", idx.ID, err)

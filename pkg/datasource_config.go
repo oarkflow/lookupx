@@ -33,6 +33,7 @@ import "strings"
 type LookupXConfig struct {
 	Addr        string          `bcl:"addr"        json:"addr,omitempty"`
 	DataDir     string          `bcl:"data_dir"    json:"data_dir,omitempty"`
+	BaseDir     string          `bcl:"-"            json:"-"`
 	APIKeys     []string        `bcl:"api_keys"    json:"api_keys,omitempty"`
 	Datasources []DatasourceDef `bcl:"datasource,block" json:"datasources"`
 	Indexes     []IndexDef      `bcl:"index,block"      json:"indexes"`
@@ -49,6 +50,7 @@ type DatasourceDef struct {
 	View           string            `bcl:"view"     json:"view,omitempty"`
 	Query          string            `bcl:"query"    json:"query,omitempty"`
 	QueryFile      string            `bcl:"query_file" json:"query_file,omitempty"`
+	QuerySpec      *SQLQuerySpec     `bcl:"-" json:"query_spec,omitempty"`
 	File           string            `bcl:"file"     json:"file,omitempty"`
 	URL            string            `bcl:"url"      json:"url,omitempty"`
 	Method         string            `bcl:"method"   json:"method,omitempty"`
@@ -65,6 +67,13 @@ type DatasourceDef struct {
 	Headers        map[string]string `bcl:"headers"  json:"headers,omitempty"`
 	Params         map[string]any    `bcl:"params"   json:"params,omitempty"`
 	Columns        []ColumnDef       `bcl:"column,block" json:"columns"`
+}
+
+// SQLQuerySpec is the explicit source form for a sql_query datasource. Set
+// exactly one of String or File; File is relative to the containing BCL file.
+type SQLQuerySpec struct {
+	File   string `json:"file,omitempty"`
+	String string `json:"string,omitempty"`
 }
 
 // IndexDef represents an index block in the BCL config.
@@ -85,6 +94,7 @@ type LookupRuleDef struct {
 	Parameter   string `bcl:",id" json:"parameter"`
 	TargetField string `bcl:"target_field" json:"field"`
 	Operator    string `bcl:"operator" json:"operator"`
+	GroupBy     string `bcl:"group_by" json:"group_by,omitempty"`
 }
 
 // SchemaFieldDef configures one field in an index schema.
@@ -157,15 +167,22 @@ func (idx IndexDef) ToConfig() Config {
 				kind = FieldFloat
 			} else if strings.EqualFold(field.Kind, "int") || strings.EqualFold(field.Kind, "integer") {
 				kind = FieldInt
-			} else if strings.EqualFold(field.Kind, "time") {
+			} else if strings.EqualFold(field.Kind, "time") || strings.EqualFold(field.Kind, "date") || strings.EqualFold(field.Kind, "datetime") || strings.EqualFold(field.Kind, "datetimez") {
 				kind = FieldTime
 			}
-			schema.Fields[field.ID] = FieldOptions{Kind: kind, Indexed: field.Indexed, Stored: field.Stored, StoredOnly: field.StoredOnly, IndexAlias: field.IndexAlias, StoredAlias: field.StoredAlias, Lookup: field.Lookup, TermSearch: field.TermSearch, Lowercase: field.Lowercase, Prefix: field.Prefix, Sortable: field.Sortable, Facetable: field.Facetable}
+			timeFormat := ""
+			if kind == FieldTime {
+				switch strings.ToLower(field.Kind) {
+				case "date", "datetime", "time", "datetimez":
+					timeFormat = strings.ToLower(field.Kind)
+				}
+			}
+			schema.Fields[field.ID] = FieldOptions{Kind: kind, TimeFormat: timeFormat, Indexed: field.Indexed, Stored: field.Stored, StoredOnly: field.StoredOnly, IndexAlias: field.IndexAlias, StoredAlias: field.StoredAlias, Lookup: field.Lookup, TermSearch: field.TermSearch, Lowercase: field.Lowercase, Prefix: field.Prefix, Sortable: field.Sortable, Facetable: field.Facetable}
 		}
 	}
 	rules := make([]LookupRule, 0, len(idx.LookupRules))
 	for _, rule := range idx.LookupRules {
-		rules = append(rules, LookupRule{Parameter: rule.Parameter, Field: rule.TargetField, Operator: rule.Operator})
+		rules = append(rules, LookupRule{Parameter: rule.Parameter, Field: rule.TargetField, Operator: rule.Operator, GroupBy: rule.GroupBy})
 	}
 	return Config{
 		Schema:          schema,
@@ -233,11 +250,15 @@ func (d *DatasourceDef) ToMap() map[string]any {
 	if d.View != "" {
 		m["view"] = d.View
 	}
-	if d.Query != "" {
-		m["query"] = d.Query
+	query, queryFile := d.Query, d.QueryFile
+	if d.QuerySpec != nil {
+		query, queryFile = d.QuerySpec.String, d.QuerySpec.File
 	}
-	if d.QueryFile != "" {
-		m["query_file"] = d.QueryFile
+	if query != "" {
+		m["query"] = query
+	}
+	if queryFile != "" {
+		m["query_file"] = queryFile
 	}
 	if d.File != "" {
 		m["file"] = d.File

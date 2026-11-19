@@ -1,0 +1,49 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>LookupX — Administration</title>
+  <link rel="stylesheet" href="admin.css?v=9">
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/codemirror.min.css">
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/theme/material-darker.min.css">
+</head>
+<body>
+  <div id="admin-gate" class="admin-gate" role="status">Checking administrator session…</div>
+  <header class="topbar" hidden>
+    <div><a class="brand" href="/">LookupX</a><span class="crumb">/ Administration</span></div>
+    <div class="actions"><span id="config-path"></span><a class="button" href="/admin-queries.html">SQL query library</a><a class="button" href="/">Search console</a><button id="logout" class="button">Sign out</button></div>
+  </header>
+  <main hidden>
+    <section class="intro"><div><p class="eyebrow">ADMIN WORKSPACE</p><h1>Configuration</h1><p>Navigate the complete BCL, follow references, and edit SQL query files stored beside the configuration.</p></div><div id="save-state" class="state" role="status">Loading configuration…</div></section>
+    <section class="toolbar">
+      <button id="validate-bcl" class="button">Validate BCL</button><button id="save-bcl" class="button primary">Save BCL</button>
+      <span class="restart-note">Configuration changes require a server restart.</span>
+    </section>
+    <section class="workspace">
+      <aside class="navigator">
+        <div class="section-head"><div><h2>Configuration map</h2><p>Expand a block to browse its settings.</p></div></div>
+        <div id="bcl-tree" class="tree"><p class="muted">Loading…</p></div>
+        <div class="help-panel"><h3 id="help-title">Field guide</h3><p id="help-text">Select a BCL item to see what it controls and follow references.</p><div id="help-links"></div></div>
+      </aside>
+      <section class="editor-pane">
+        <div class="section-head"><div><h2 id="selection-title">Configuration details</h2><p id="selection-summary">Select a block in the map to see its settings here.</p></div></div>
+        <div id="selection-fields" class="selection-fields"><p class="muted">Choose a block from the configuration map.</p></div>
+        <div class="section-head editor-heading"><div><h2>Complete BCL</h2><p>Click a setting to jump to its source line.</p></div><span id="bcl-dirty" class="dirty"></span></div>
+        <textarea id="bcl-source" spellcheck="false" aria-label="Complete BCL configuration"></textarea>
+      </section>
+    </section>
+    <section class="access-workspace">
+      <div class="section-head"><div><p class="eyebrow">API ACCESS</p><h2>Machine users and keys</h2><p>Keys are shown once when created or rotated. Revoke any key that may have been exposed.</p></div></div>
+      <div class="access-grid">
+        <section class="access-panel"><h3>Users</h3><form id="user-form" class="access-form"><input id="user-id" placeholder="User ID" required maxlength="64"><input id="user-name" placeholder="Display name" required maxlength="120"><select id="user-scope"><option value="readwrite">Read and write</option><option value="read">Read only</option></select><button class="button primary">Create user</button></form><div id="users-list"></div></section>
+        <section class="access-panel"><h3>API keys</h3><form id="key-form" class="access-form"><select id="key-user" required></select><input id="key-name" placeholder="Key name" required maxlength="120"><input id="key-expiry" type="date" aria-label="Optional expiry"><input id="key-ips" placeholder="Allowed IPs/CIDRs (optional)"><button class="button primary">Create API key</button></form><pre id="generated-key" hidden></pre><div id="keys-list"></div></section>
+      </div>
+    </section>
+    <section class="index-overview"><div class="section-head"><div><p class="eyebrow">INDEX CONFIGURATION</p><h2>Configured indexes</h2><p>Each card explains the source and provides direct links to the index and datasource definitions.</p></div></div><div id="index-cards" class="index-grid"><p class="muted">Loading indexes…</p></div></section>
+  </main>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/codemirror.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/addon/mode/simple.min.js"></script>
+  <script src="admin.js?v=13"></script>
+</body>
+</html>

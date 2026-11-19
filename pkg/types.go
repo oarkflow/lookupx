@@ -17,9 +17,12 @@ const (
 )
 
 type FieldOptions struct {
-	Kind    FieldKind `json:"kind"`
-	Indexed bool      `json:"indexed"`
-	Stored  bool      `json:"stored"`
+	Kind FieldKind `json:"kind"`
+	// TimeFormat controls canonical parsing and rendering for FieldTime:
+	// date, datetime, time, or datetimez. Empty preserves legacy RFC3339 behavior.
+	TimeFormat string `json:"time_format,omitempty"`
+	Indexed    bool   `json:"indexed"`
+	Stored     bool   `json:"stored"`
 	// IndexAlias shares the term/postings index of another field. Use only when
 	// both fields have identical indexed values for every document.
 	IndexAlias string `json:"index_alias,omitempty"`
@@ -132,6 +135,7 @@ type LookupRule struct {
 	Parameter string `json:"parameter"`
 	Field     string `json:"field"`
 	Operator  string `json:"operator"`
+	GroupBy   string `json:"group_by,omitempty"`
 }
 
 type Stats struct {
@@ -155,7 +159,9 @@ type Stats struct {
 }
 
 type Hit struct {
-	ID          string   `json:"id"`
+	// ID is retained for in-process callers; JSON search and lookup responses
+	// use DocID as their result identifier to avoid sending both values.
+	ID          string   `json:"-"`
 	DocID       DocID    `json:"doc_id"`
 	Score       float64  `json:"score"`
 	Doc         Document `json:"doc,omitempty"`

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"flag"
 	"fmt"
@@ -21,6 +22,7 @@ import (
 )
 
 func main() {
+	loadDotEnvFile(".env")
 	if len(os.Args) < 2 {
 		serveCmd(nil)
 		return
@@ -67,7 +69,7 @@ Commands:
   plan            Print a 1B-row partition/batch deployment plan
 
 Examples:
-  lookupx serve -addr :8089
+  lookupx serve -addr 0.0.0.0:8089
   lookupx demo -rows 100000
   lookupx search -index my_index -rows 100000 -q 'term=key-0013&group_id=4&date_key=2026-01-01'
   lookupx persist-demo -rows 100000 -data ./data/indexes
@@ -96,16 +98,33 @@ HTTP API:
 
 func serveCmd(args []string) {
 	fs := flag.NewFlagSet("serve", flag.ExitOnError)
-	addr := fs.String("addr", getenv("ADDR", ":8089"), "listen address")
+	addr := fs.String("addr", getenv("ADDR", "0.0.0.0:8089"), "listen address")
 	configPath := fs.String("config", getenv("LOOKUPX_CONFIG", "config/lookupx.bcl"), "BCL configuration file; set empty to start without configured indexes")
 	apiKey := fs.String("api-key", getenv("LOOKUPX_API_KEY", ""), "optional API key")
 	webDir := fs.String("web", getenv("LOOKUPX_WEB_DIR", ""), "serve frontend files from this directory (default: ./web)")
 	dataDir := fs.String("data", getenv("LOOKUPX_DATA_DIR", "./data/indexes"), "persistent index directory")
 	storage := fs.String("storage", getenv("LOOKUPX_STORAGE", "memory"), "index storage: memory or disk")
+	adminUser := getenv("LOOKUPX_ADMIN_USERNAME", "")
+	adminPassword := getenv("LOOKUPX_ADMIN_PASSWORD", "")
+	adminUser = strings.TrimSpace(adminUser)
+	if adminUser == "" || strings.TrimSpace(adminPassword) == "" {
+		// An incomplete pair is not a bootstrap credential; let the browser
+		// create the first admin account instead.
+		adminUser, adminPassword = "", ""
+	}
+	sessionSecret := getenv("LOOKUPX_SESSION_SECRET", "")
+	sessionTrustedProxies := splitNonEmptyCSV(getenv("LOOKUPX_SESSION_TRUSTED_PROXIES", ""))
+	sessionSecure, err := strconv.ParseBool(getenv("LOOKUPX_SESSION_SECURE", "true"))
+	if err != nil {
+		log.Fatalf("LOOKUPX_SESSION_SECURE must be true or false: %v", err)
+	}
 	_ = fs.Parse(args)
 	*storage = strings.ToLower(strings.TrimSpace(*storage))
 	if *storage != "memory" && *storage != "disk" {
 		log.Fatal("-storage must be memory or disk")
+	}
+	if len(sessionSecret) < 32 {
+		log.Fatal("LOOKUPX_SESSION_SECRET must contain at least 32 characters in .env")
 	}
 
 	ctx := context.Background()
@@ -120,7 +139,7 @@ func serveCmd(args []string) {
 		if err != nil {
 			log.Fatalf("build indexes from BCL config: %v", err)
 		}
-		if *addr == ":8089" && cfg.Addr != "" {
+		if *addr == "0.0.0.0:8089" && cfg.Addr != "" {
 			*addr = cfg.Addr
 		}
 		if *dataDir == "./data/indexes" && cfg.DataDir != "" {
@@ -208,8 +227,47 @@ func serveCmd(args []string) {
 		keys = append(keys, *apiKey)
 	}
 	lookup.LogKV("server_listening", "address", *addr, "storage", *storage, "indexes", len(mgr.List()), "web_console", "/")
-	app := lookup.NewFHApp(&lookup.MultiServer{Manager: mgr, APIKeys: keys, WebDir: *webDir, DataDir: *dataDir, Storage: *storage})
+	app := lookup.NewFHApp(&lookup.MultiServer{Manager: mgr, APIKeys: keys, AdminUser: adminUser, AdminPassword: adminPassword, SessionSecret: sessionSecret, SessionSecure: sessionSecure, SessionTrustedProxies: sessionTrustedProxies, ConfigPath: *configPath, WebDir: *webDir, DataDir: *dataDir, Storage: *storage})
 	log.Fatal(app.ListenWithGracefulShutdown(*addr))
+}
+
+func splitNonEmptyCSV(value string) []string {
+	var values []string
+	for _, item := range strings.Split(value, ",") {
+		if item = strings.TrimSpace(item); item != "" {
+			values = append(values, item)
+		}
+	}
+	return values
+}
+
+// loadDotEnvFile loads simple KEY=VALUE entries without replacing values already
+// supplied by the process environment. It runs before BCL env() interpolation.
+func loadDotEnvFile(path string) {
+	f, err := os.Open(path)
+	if err != nil {
+		return
+	}
+	defer f.Close()
+	scanner := bufio.NewScanner(f)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		line = strings.TrimPrefix(line, "export ")
+		key, value, ok := strings.Cut(line, "=")
+		key, value = strings.TrimSpace(key), strings.TrimSpace(value)
+		if !ok || key == "" {
+			continue
+		}
+		if len(value) >= 2 && ((value[0] == '"' && value[len(value)-1] == '"') || (value[0] == '\'' && value[len(value)-1] == '\'')) {
+			value = value[1 : len(value)-1]
+		}
+		if _, exists := os.LookupEnv(key); !exists {
+			_ = os.Setenv(key, value)
+		}
+	}
 }
 
 func demoCmd(args []string) {

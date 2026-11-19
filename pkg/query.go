@@ -11,6 +11,69 @@ type Query interface{ eval(*Index) *Bitmap }
 
 type MatchAll struct{}
 
+// latestPerGroupQuery keeps the newest document within each group after all
+// supplied lookup filters have matched. Candidate includes the DOS lower bound
+// and any code, tenant, or other filters from the request.
+type latestPerGroupQuery struct {
+	Candidate Query
+	DateField string
+	GroupBy   []string
+}
+
+func (q latestPerGroupQuery) eval(ix *Index) *Bitmap {
+	candidates := q.Candidate.eval(ix)
+	if candidates.Empty() || len(q.GroupBy) == 0 {
+		return NewBitmap()
+	}
+	ix.mu.RLock()
+	defer ix.mu.RUnlock()
+	dates := ix.numericDense[q.DateField]
+	exists := ix.numericExists[q.DateField]
+	if dates == nil || exists == nil {
+		return NewBitmap()
+	}
+	groupColumns := make([][]string, len(q.GroupBy))
+	groupOptions := make([]FieldOptions, len(q.GroupBy))
+	for i, field := range q.GroupBy {
+		groupColumns[i] = ix.strings[field]
+		groupOptions[i] = ix.cfg.Schema.Fields[field]
+		if groupColumns[i] == nil {
+			return NewBitmap()
+		}
+	}
+	groupKey := func(id DocID) string {
+		var b strings.Builder
+		for i, column := range groupColumns {
+			value := normalize(column[id], groupOptions[i].Lowercase)
+			fmt.Fprintf(&b, "%d:", len(value))
+			b.WriteString(value)
+		}
+		return b.String()
+	}
+	maxByGroup := make(map[string]float64, candidates.Count())
+	candidates.Each(func(id DocID) bool {
+		if id == 0 || id >= ix.nextDocID || !exists.Has(id) || ix.isDeletedOrExpiredLocked(id) {
+			return true
+		}
+		key, date := groupKey(id), dates[id]
+		if current, ok := maxByGroup[key]; !ok || date > current {
+			maxByGroup[key] = date
+		}
+		return true
+	})
+	out := NewBitmapCap(ix.nextDocID)
+	candidates.Each(func(id DocID) bool {
+		if id == 0 || id >= ix.nextDocID || !exists.Has(id) || ix.isDeletedOrExpiredLocked(id) {
+			return true
+		}
+		if maxByGroup[groupKey(id)] == dates[id] {
+			out.AddUnsafe(id)
+		}
+		return true
+	})
+	return out
+}
+
 func (MatchAll) eval(ix *Index) *Bitmap {
 	ix.mu.RLock()
 	defer ix.mu.RUnlock()

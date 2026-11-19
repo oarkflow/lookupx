@@ -1,0 +1,25 @@
+.query-toolbar {
+  display:flex;
+  align-items:center;
+  justify-content:space-between;
+  gap:16px;
+  padding:12px 0 18px;
+}
+.query-path-note { color:var(--muted); font-size:12px; }
+.query-grid { grid-template-columns:minmax(230px,300px) minmax(0,1fr); padding:14px 0; }
+.file-browser,.sql-editor { border:1px solid var(--line); border-radius:8px; min-width:0; }
+.breadcrumb { padding:11px 12px; border-bottom:1px solid var(--line); color:#42586a; font:12px ui-monospace,monospace; overflow-wrap:anywhere; }
+.file-list { padding:7px; min-height:205px; max-height:calc(72vh - 32px); overflow:auto; }
+.file-entry { display:flex; width:100%; gap:8px; align-items:center; border:0; background:transparent; text-align:left; padding:8px; border-radius:5px; cursor:pointer; color:#314657; }
+.file-entry:hover,.file-entry.active { background:var(--soft); color:#105d78; }
+.file-entry.directory { font-weight:700; }
+.sql-editor { background:var(--panel); }
+.sql-editor .CodeMirror { height:calc(72vh - 90px); min-height:360px; }
+.sql-editor textarea { display:block; width:100%; height:65vh; min-height:360px; padding:14px; border:0; resize:vertical; font:12px/1.55 ui-monospace,monospace; }
+.sql-actions { padding:12px; border-top:1px solid var(--line); }
+#sql-state { font-size:12px; color:var(--muted); }
+@media(max-width:900px) {
+  .query-grid { grid-template-columns:1fr; }
+  .query-toolbar { align-items:flex-start; flex-direction:column; }
+  .sql-editor .CodeMirror,.sql-editor textarea { height:60vh; min-height:360px; }
+}

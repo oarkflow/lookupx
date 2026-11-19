@@ -225,17 +225,30 @@ func newSQLQueryDatasource(config map[string]any, params map[string]any) (Dataso
 	if err != nil {
 		return nil, fmt.Errorf("sql_query %s: %w", id, err)
 	}
-	queryStr, err := ConfigString(config, "query")
-	if err != nil {
-		return nil, fmt.Errorf("sql_query %s: %w", id, err)
-	}
+	queryStr := ConfigStringOr(config, "query", "")
 	queryFile := ConfigStringOr(config, "query_file", "")
+	if strings.TrimSpace(queryStr) == "" && strings.TrimSpace(queryFile) == "" {
+		return nil, fmt.Errorf("sql_query %s: query string or query_file is required", id)
+	}
+	if strings.TrimSpace(queryStr) != "" && strings.TrimSpace(queryFile) != "" {
+		return nil, fmt.Errorf("sql_query %s: query and query_file cannot both be set", id)
+	}
 	if queryFile != "" {
+		info, statErr := os.Stat(queryFile)
+		if statErr != nil {
+			return nil, fmt.Errorf("sql_query %s: stat query_file: %w", id, statErr)
+		}
+		if !info.Mode().IsRegular() || info.Size() > 1<<20 {
+			return nil, fmt.Errorf("sql_query %s: query_file must be a regular file no larger than 1 MiB", id)
+		}
 		b, readErr := os.ReadFile(queryFile)
 		if readErr != nil {
 			return nil, fmt.Errorf("sql_query %s: read query_file: %w", id, readErr)
 		}
 		queryStr = string(b)
+	}
+	if err := validateSelectSQL(queryStr); err != nil {
+		return nil, fmt.Errorf("sql_query %s: %w", id, err)
 	}
 	idColumn := ConfigStringOr(config, "id_column", "id")
 	seqColumn := ConfigStringOr(config, "seq_column", "")
@@ -259,6 +272,137 @@ func newSQLQueryDatasource(config map[string]any, params map[string]any) (Dataso
 			Columns:   cols,
 		},
 	}, nil
+}
+
+// validateSelectSQL accepts a single SELECT or CTE-backed SELECT statement.
+// It ignores leading SQL comments and semicolons inside quoted strings.
+func validateSelectSQL(query string) error {
+	query = strings.TrimSpace(query)
+	for {
+		switch {
+		case strings.HasPrefix(query, "--") || strings.HasPrefix(query, "#"):
+			end := strings.IndexByte(query, '\n')
+			if end < 0 {
+				return fmt.Errorf("query must contain a SELECT statement")
+			}
+			query = strings.TrimSpace(query[end+1:])
+		case strings.HasPrefix(query, "/*"):
+			end := strings.Index(query[2:], "*/")
+			if end < 0 {
+				return fmt.Errorf("query has an unterminated SQL comment")
+			}
+			query = strings.TrimSpace(query[end+4:])
+		default:
+			goto commentsDone
+		}
+	}
+commentsDone:
+	upper := strings.ToUpper(query)
+	keyword := ""
+	for _, candidate := range []string{"SELECT", "WITH"} {
+		if strings.HasPrefix(upper, candidate) && (len(query) == len(candidate) || query[len(candidate)] == ' ' || query[len(candidate)] == '\n' || query[len(candidate)] == '\t' || query[len(candidate)] == '(') {
+			keyword = candidate
+			break
+		}
+	}
+	if keyword == "" {
+		return fmt.Errorf("query must be a single SELECT statement (WITH is allowed)")
+	}
+	if keyword == "WITH" && !hasTopLevelSelect(query) {
+		return fmt.Errorf("WITH query must end in a SELECT statement")
+	}
+	quote := byte(0)
+	for i := 0; i < len(query); i++ {
+		ch := query[i]
+		if quote != 0 {
+			if ch == '\\' && i+1 < len(query) {
+				i++
+				continue
+			}
+			if ch == quote {
+				if i+1 < len(query) && query[i+1] == quote {
+					i++
+					continue
+				}
+				quote = 0
+			}
+			continue
+		}
+		if ch == '\'' || ch == '"' || ch == '`' {
+			quote = ch
+			continue
+		}
+		if ch == ';' && strings.TrimSpace(query[i+1:]) != "" {
+			return fmt.Errorf("query must contain only one SELECT statement")
+		}
+	}
+	return nil
+}
+
+func hasTopLevelSelect(query string) bool {
+	depth, quote := 0, byte(0)
+	for i := 0; i < len(query); {
+		ch := query[i]
+		if quote != 0 {
+			if ch == '\\' && i+1 < len(query) {
+				i += 2
+				continue
+			}
+			if ch == quote {
+				if i+1 < len(query) && query[i+1] == quote {
+					i += 2
+					continue
+				}
+				quote = 0
+			}
+			i++
+			continue
+		}
+		if ch == '\'' || ch == '"' || ch == '`' {
+			quote = ch
+			i++
+			continue
+		}
+		if ch == '-' && i+1 < len(query) && query[i+1] == '-' {
+			if end := strings.IndexByte(query[i+2:], '\n'); end >= 0 {
+				i += end + 3
+				continue
+			}
+			return false
+		}
+		if ch == '/' && i+1 < len(query) && query[i+1] == '*' {
+			if end := strings.Index(query[i+2:], "*/"); end >= 0 {
+				i += end + 4
+				continue
+			}
+			return false
+		}
+		if ch == '(' {
+			depth++
+			i++
+			continue
+		}
+		if ch == ')' {
+			if depth > 0 {
+				depth--
+			}
+			i++
+			continue
+		}
+		if depth == 0 && (ch == 's' || ch == 'S') && i+6 <= len(query) && strings.EqualFold(query[i:i+6], "SELECT") {
+			beforeOK := i == 0 || !isSQLIdentByte(query[i-1])
+			afterOK := i+6 == len(query) || !isSQLIdentByte(query[i+6])
+			if beforeOK && afterOK {
+				return true
+			}
+		}
+		i++
+	}
+	return false
+}
+
+func isSQLIdentByte(ch byte) bool {
+	return ch >= 'a' && ch <= 'z' || ch >= 'A' && ch <= 'Z' || ch >= '0' && ch <= '9' || ch == '_'
 }
 
 func (d *SQLQueryDatasource) ID() string   { return d.id }

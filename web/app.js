@@ -2,6 +2,8 @@ const App = (() => {
   const $ = (sel) => document.querySelector(sel);
   const $$ = (sel) => document.querySelectorAll(sel);
   const content = () => $('#content');
+  let csrfToken = '';
+  let adminSetupRequired = false;
 
   // Numeric FieldKind values from pkg/types.go — FieldOptions.Kind is encoded
   // as a plain integer over the wire (no string enum on the Go side).
@@ -11,11 +13,19 @@ const App = (() => {
   ];
 
   function apiBase() {
-    return ($('#api-base').value || '').replace(/\/+$/, '');
+    const raw = ($('#api-base').value || '').trim();
+    if (!raw) return '';
+    const target = new URL(raw, window.location.origin);
+    if (target.origin !== window.location.origin || target.username || target.password || target.search || target.hash) {
+      throw new Error('The console API endpoint must use this page’s origin.');
+    }
+    return target.pathname.replace(/\/+$/, '');
   }
 
   async function api(method, path, body) {
     const opts = { method, headers: {} };
+    opts.credentials = 'same-origin';
+    if (!['GET', 'HEAD', 'OPTIONS'].includes(method.toUpperCase()) && csrfToken) opts.headers['X-CSRF-Token'] = csrfToken;
     if (body !== undefined) {
       if (body instanceof FormData) {
         opts.body = body;
@@ -24,10 +34,79 @@ const App = (() => {
         opts.body = JSON.stringify(body);
       }
     }
-    const res = await fetch(apiBase() + path, opts);
+    let res = await fetch(apiBase() + path, opts);
+    if (res.status === 401 && !path.startsWith('/auth/')) {
+      showAuthGate('Your admin session expired. Sign in again.');
+    }
     const text = await res.text();
     if (!res.ok) throw new Error(`${res.status} ${text}`);
     try { return JSON.parse(text); } catch { return text; }
+  }
+
+  function showAuthGate(message = '') {
+    document.body.classList.remove('auth-ready');
+    $('#auth-error').textContent = message;
+  }
+
+  function setAuthMode(setup) {
+    adminSetupRequired = setup;
+    const form = $('#auth-form');
+    form.querySelectorAll('label, input, button[type="submit"]').forEach(el => { el.hidden = false; el.disabled = false; });
+    form.action = setup ? '/auth/setup' : '/auth/login';
+    form.method = 'post';
+    form.querySelector('h1').textContent = setup ? 'Set up LookupX admin' : 'LookupX admin';
+    form.querySelector('p').textContent = setup
+      ? 'Create the first administrator account. This cannot be changed here later.'
+      : 'Sign in to open the console.';
+    $('#auth-password').autocomplete = setup ? 'new-password' : 'current-password';
+    $('#auth-password').minLength = setup ? 12 : 1;
+    form.querySelector('button[type="submit"]').textContent = setup ? 'Create admin account' : 'Sign in';
+  }
+
+  function setAuthUnavailable(message) {
+    setAuthMode(false);
+    const form = $('#auth-form');
+    form.querySelector('h1').textContent = 'Admin status unavailable';
+    form.querySelector('p').textContent = 'LookupX could not determine whether setup is complete.';
+    form.querySelectorAll('label, input, button[type="submit"]').forEach(el => { el.hidden = true; el.disabled = true; });
+    $('#auth-error').textContent = message;
+  }
+
+  async function submitLogin(event) {
+    event.preventDefault();
+    const error = $('#auth-error');
+    error.textContent = '';
+    const username = $('#auth-username').value;
+    const passwordInput = $('#auth-password');
+    const password = passwordInput.value;
+    try {
+      let opts = { method: 'POST', credentials: 'same-origin', headers: {} };
+      let endpoint = '/auth/login';
+      if (adminSetupRequired) {
+        if (password.length < 12) { error.textContent = 'Use a password with at least 12 characters.'; return; }
+        endpoint = '/auth/setup';
+        opts.headers['Content-Type'] = 'application/json';
+        opts.body = JSON.stringify({ username, password });
+      } else {
+        const bytes = new TextEncoder().encode(`${username}:${password}`);
+        const credentials = btoa(Array.from(bytes, byte => String.fromCharCode(byte)).join(''));
+        opts.headers.Authorization = `Basic ${credentials}`;
+      }
+      const res = await fetch(apiBase() + endpoint, opts);
+      if (!res.ok) {
+        const detail = await res.text();
+        error.textContent = res.status === 401 ? 'Invalid username or password.' : `Sign in failed (${res.status}): ${detail}`;
+        return;
+      }
+      const data = await res.json();
+      csrfToken = data.csrf_token || '';
+      if (!csrfToken) { error.textContent = 'Sign in did not establish a session.'; return; }
+      passwordInput.value = '';
+      document.body.classList.add('auth-ready');
+      render();
+    } catch (err) {
+      error.textContent = `Sign in failed: ${err.message}`;
+    }
   }
 
   async function fetchIndexes() {
@@ -105,6 +184,10 @@ const App = (() => {
   let activeIntegrationSource = 'sql-query';
 
   function switchTab(tab) {
+    if (tab === 'admin') {
+      window.location.assign('/admin.html');
+      return;
+    }
     currentTab = tab;
     $$('.nav-btn').forEach(b => b.classList.toggle('active', b.dataset.tab === tab));
     const titles = { search: 'Search', indexes: 'Indexes', integrations: 'Integrations' };
@@ -143,6 +226,7 @@ const App = (() => {
           <div class="search-control search-index"><label class="control-label" for="lookup-index">INDEX</label>${indexSelect('lookup-index')}</div>
           <div class="search-control term-control"><label class="control-label" for="lookup-term">SEARCH TERM</label><div class="term-input-row"><input id="lookup-term" type="search" placeholder="Search text" aria-label="Full-text search term" /><select id="lookup-term-field" aria-label="Search term field"><option value="">All searchable fields</option></select></div></div>
           <label class="search-fuzzy"><input id="lookup-fuzzy" type="checkbox" /> Fuzzy</label>
+          <label class="search-fuzzy"><input id="lookup-verbose" type="checkbox" /> Verbose</label>
           <label class="search-fuzzy"><input id="lookup-profile" type="checkbox" /> Profile</label>
           <div class="search-control limit-control"><label class="control-label" for="lookup-limit">LIMIT</label><input id="lookup-limit" type="number" min="1" max="500" value="25" aria-label="Result limit" /></div>
           <button class="btn btn-primary" type="submit">Search</button>
@@ -239,7 +323,15 @@ const App = (() => {
   }
 
   function fieldKind(name) {
-    return Number((searchSchema[name] || {}).kind);
+    const field = searchSchema[name] || {};
+    return field.kind_name || Number(field.kind);
+  }
+
+  function temporalInputType(kind) {
+    if (kind === 'date') return 'date';
+    if (kind === 'datetime') return 'datetime-local';
+    if (kind === 'time') return 'time';
+    return 'text'; // datetimez keeps its explicit offset (RFC3339).
   }
 
   let fieldValueRowSeq = 0;
@@ -249,7 +341,7 @@ const App = (() => {
     const rowID = ++fieldValueRowSeq;
     host.insertAdjacentHTML('beforeend', `
       <div class="field-value-row" data-field-value-id="${rowID}">
-        <input class="field-value-name" type="text" list="field-value-name-options" placeholder="Field name" aria-label="Field name" onkeydown="if(event.key==='Enter'){event.preventDefault();App.doLookup()}" />
+        <input class="field-value-name" type="text" list="field-value-name-options" placeholder="Field name" aria-label="Field name" onchange="App.updateFieldValueType(this)" onkeydown="if(event.key==='Enter'){event.preventDefault();App.doLookup()}" />
         <input class="field-value-value" type="text" placeholder="Value" aria-label="Field value" onkeydown="if(event.key==='Enter'){event.preventDefault();App.doLookup()}" />
         <button class="filter-remove" type="button" title="Remove field value" aria-label="Remove field value" onclick="App.removeFieldValue(${rowID})">×</button>
       </div>`);
@@ -258,6 +350,16 @@ const App = (() => {
   function removeFieldValue(rowID) {
     const row = document.querySelector(`[data-field-value-id="${rowID}"]`);
     if (row) row.remove();
+  }
+
+  function updateFieldValueType(nameInput) {
+    const value = nameInput.closest('.field-value-row')?.querySelector('.field-value-value');
+    if (!value) return;
+    const name = nameInput.value.trim();
+    const kind = fieldKind(name);
+    const temporal = ['date', 'datetime', 'time', 'datetimez'].includes(kind);
+    value.type = temporal ? temporalInputType(kind) : [2, 3].includes(Number(kind)) ? 'number' : 'text';
+    value.placeholder = kind === 'datetimez' ? 'RFC3339, e.g. 2015-01-01T00:00:00Z' : 'Value';
   }
 
   function updateFilterValueState(id) {
@@ -270,8 +372,9 @@ const App = (() => {
     const input2 = row.querySelector('.filter-value-2');
     const noValue = ['exists', 'missing', 'not_zero'].includes(op);
     const isBetween = op === 'between';
-    const isTime = kind === 5;
-    const isNumeric = [2, 3, 5].includes(kind);
+    const timeType = temporalInputType(kind);
+    const isTime = ['date', 'datetime', 'time', 'datetimez'].includes(kind);
+    const isNumeric = [2, 3, 5].includes(Number(kind));
 
     if (noValue) {
       input.disabled = true;
@@ -286,8 +389,8 @@ const App = (() => {
       input2.style.display = '';
       input.placeholder = 'Minimum';
       input2.placeholder = 'Maximum';
-      input.type = isTime ? 'date' : isNumeric ? 'number' : 'text';
-      input2.type = isTime ? 'date' : isNumeric ? 'number' : 'text';
+      input.type = isTime ? timeType : isNumeric ? 'number' : 'text';
+      input2.type = isTime ? timeType : isNumeric ? 'number' : 'text';
       row.style.gridTemplateColumns = '';
     } else {
       input.disabled = false;
@@ -296,7 +399,8 @@ const App = (() => {
       input2.value = '';
       row.style.gridTemplateColumns = '';
       input.placeholder = ['in', 'not_in'].includes(op) ? 'Value 1, value 2' : 'Value';
-      input.type = 'text';
+      input.type = isTime ? timeType : isNumeric ? 'number' : 'text';
+      if (kind === 'datetimez') input.placeholder = 'RFC3339, e.g. 2015-01-01T00:00:00Z';
     }
   }
 
@@ -313,6 +417,8 @@ const App = (() => {
 
   function renderHits(hits) {
     if (!hits || !hits.length) return empty('No results.');
+    const verbose = hits.some(h => h && Object.prototype.hasOwnProperty.call(h, 'doc'));
+    const recordOf = h => h && h.doc && typeof h.doc === 'object' ? h.doc : h;
 
     // One column per document field actually present, including a database
     // field named "id". The hit's internal index ID is not a document field
@@ -321,9 +427,10 @@ const App = (() => {
     const seen = new Set(fieldOrder);
     let anyDoc = false;
     for (const h of hits) {
-      if (!h.doc) continue;
+      const record = recordOf(h);
+      if (!record || typeof record !== 'object') continue;
       anyDoc = true;
-      for (const k of Object.keys(h.doc)) {
+      for (const k of Object.keys(record)) {
         if (!seen.has(k)) { seen.add(k); fieldOrder.push(k); }
       }
     }
@@ -333,20 +440,22 @@ const App = (() => {
       html += `<p class="text-xs text-gray-500 mb-2">This index doesn't store full documents, so the table can only show relevance scores.</p>`;
     }
     html += `<div class="table-wrap"><table><thead>
-      <tr><th>Score</th>${fieldOrder.map(f => `<th>${escHtml(f)}</th>`).join('')}</tr>
-      <tr class="column-filter-row"><th></th>${fieldOrder.map(f => {
+      <tr>${verbose ? '<th>Score</th>' : ''}${fieldOrder.map(f => `<th>${escHtml(f)}</th>`).join('')}</tr>
+      <tr class="column-filter-row">${verbose ? '<th></th>' : ''}${fieldOrder.map(f => {
         const kind = fieldKind(f);
-        const numeric = [2, 3].includes(kind);
-        const type = numeric ? 'number' : kind === 5 ? 'date' : 'search';
-        const operator = numeric || kind === 4 || kind === 5 ? 'eq' : 'contains';
+        const numeric = [2, 3].includes(Number(kind));
+        const temporal = ['date', 'datetime', 'time', 'datetimez'].includes(kind) || Number(kind) === 5;
+        const type = temporal ? temporalInputType(kind === 'datetimez' || kind === 'datetime' || kind === 'date' || kind === 'time' ? kind : 'datetimez') : numeric ? 'number' : 'search';
+        const operator = numeric || Number(kind) === 4 || temporal ? 'eq' : 'contains';
         const value = columnFilterValues[f] || '';
         return `<th><input class="column-filter" data-column="${escHtml(f)}" data-operator="${operator}" type="${type}" value="${escHtml(value)}" placeholder="Filter…" aria-label="Filter ${escHtml(f)}" onkeydown="if(event.key==='Enter'){event.preventDefault();App.doLookup()}" /></th>`;
       }).join('')}</tr>
     </thead><tbody>`;
     for (const h of hits) {
+      const record = recordOf(h);
       html += `<tr>
-        <td>${h.score !== undefined ? h.score.toFixed(4) : '—'}</td>
-        ${fieldOrder.map(f => `<td class="text-sm max-w-xs truncate" title="${h.doc && h.doc[f] !== undefined ? escHtml(String(h.doc[f])) : ''}">${fmtCell(h.doc && h.doc[f])}</td>`).join('')}
+        ${verbose ? `<td>${h.score !== undefined ? h.score.toFixed(4) : '—'}</td>` : ''}
+        ${fieldOrder.map(f => `<td class="text-sm max-w-xs truncate" title="${record && record[f] !== undefined ? escHtml(String(record[f])) : ''}">${fmtCell(record && record[f])}</td>`).join('')}
       </tr>`;
     }
     html += '</tbody></table></div></div>';
@@ -365,6 +474,7 @@ const App = (() => {
 	  if (termField) params.set('term_field', termField);
 	  if ($('#lookup-fuzzy').checked) params.set('fuzzy', 'true');
 	}
+	if ($('#lookup-verbose').checked) params.set('verbose', 'true');
 	if ($('#lookup-profile').checked) params.set('profile', 'true');
     for (const row of $$('.filter-row')) {
       const fieldName = row.querySelector('.filter-field').value;
@@ -403,11 +513,14 @@ const App = (() => {
     try {
       const data = await api('GET', `/v1/indexes/${encodeURIComponent(id)}/lookup?${params.toString()}`);
 	  const usage = data.resources || {};
-	  const perf = [`${fmtNum(data.latency_ns)} ns`];
-	  if (usage.cpu_seconds !== undefined) perf.push(`${(usage.cpu_seconds * 1000).toFixed(2)} ms CPU`);
-	  if (usage.total_alloc_bytes !== undefined) perf.push(`${(usage.total_alloc_bytes / 1048576).toFixed(2)} MB allocated`);
-	  if (usage.heap_bytes !== undefined) perf.push(`${(usage.heap_bytes / 1048576).toFixed(1)} MB heap`);
-      res.innerHTML = `<div class="result-meta"><span>${fmtNum(data.total)} results</span><span>${perf.join(' · ')}</span></div>${renderHits(data.hits)}`;
+	  const meta = [];
+	  if (data.total !== undefined) meta.push(`${fmtNum(data.total)} total`);
+	  if (data.latency_ns !== undefined) meta.push(`${fmtNum(data.latency_ns)} ns`);
+	  if (usage.cpu_seconds !== undefined) meta.push(`${(usage.cpu_seconds * 1000).toFixed(2)} ms CPU`);
+	  if (usage.total_alloc_bytes !== undefined) meta.push(`${(usage.total_alloc_bytes / 1048576).toFixed(2)} MB allocated`);
+	  if (usage.heap_bytes !== undefined) meta.push(`${(usage.heap_bytes / 1048576).toFixed(1)} MB heap`);
+	  const metaHTML = meta.length ? `<div class="result-meta"><span>${meta.join(' · ')}</span></div>` : '';
+	  res.innerHTML = `${metaHTML}${renderHits(data.hits)}`;
     } catch (e) {
       res.innerHTML = `<div class="card text-red-400 text-sm">Lookup error: ${escHtml(e.message)}</div>`;
     }
@@ -885,9 +998,43 @@ const App = (() => {
 
   function refresh() { render(); }
 
-  function init() {
+  async function logout() {
+    try {
+      await api('POST', '/auth/logout');
+      csrfToken = '';
+      showAuthGate();
+      $('#auth-password').value = '';
+    } catch (err) {
+      toast(`Sign out failed: ${err.message}`, false);
+    }
+  }
+
+  async function init() {
     $$('.nav-btn').forEach(btn => btn.addEventListener('click', () => switchTab(btn.dataset.tab)));
-    render();
+    $('#auth-form').addEventListener('submit', submitLogin);
+    try {
+      const res = await fetch(apiBase() + '/auth/session', { credentials: 'same-origin' });
+      if (res.ok) {
+        const data = await res.json();
+        csrfToken = data.csrf_token || '';
+        if (data.authenticated && csrfToken) {
+          setAuthMode(false);
+          document.body.classList.add('auth-ready');
+          render();
+          return;
+        }
+        if (typeof data.setup_required !== 'boolean') {
+          setAuthUnavailable('The server could not determine whether admin setup is complete. Restart the current LookupX server and reload.');
+          return;
+        }
+        setAuthMode(Boolean(data.setup_required));
+        showAuthGate();
+        return;
+      }
+      setAuthUnavailable(`Could not determine admin setup status (HTTP ${res.status}). Restart the current LookupX server and reload.`);
+    } catch (err) {
+      setAuthUnavailable(`Could not determine admin setup status: ${err.message}`);
+    }
   }
 
   document.addEventListener('DOMContentLoaded', init);
@@ -911,8 +1058,8 @@ const App = (() => {
   }
 
   const handlers = {
-    refresh, render,
-    doLookup, addFilter, updateFilterOperators, removeFilter, addFieldValue, removeFieldValue,
+    refresh, render, logout,
+    doLookup, addFilter, updateFilterOperators, removeFilter, addFieldValue, removeFieldValue, updateFieldValueType,
     addSchemaFieldRow, createIndex, reloadIndex, freezeIndex, persistIndex, deleteIndex,
     toggleDetail, upsertDoc, deleteDoc, listGenerations, validateIndex, repairIndex, compactIndex,
     loadSQLQuery, loadSQLTable, loadJSONRecords, loadFile, chooseIntegrationSource,

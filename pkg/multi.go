@@ -357,12 +357,20 @@ func cleanIndexID(id string) string {
 
 // MultiServer exposes operational APIs for many indexes.
 type MultiServer struct {
-	Manager  *MultiIndexManager
-	APIKeys  []string
-	WebDir   string // optional: directory to serve static frontend files
-	DataDir  string // persistent index root; defaults to LOOKUPX_DATA_DIR or data/indexes
-	Storage  string // "memory" (default) or "disk"; disk persists after reload
-	Requests uint64
+	Manager               *MultiIndexManager
+	APIKeys               []string
+	AdminUser             string
+	AdminPassword         string
+	SessionSecret         string
+	SessionSecure         bool
+	SessionTrustedProxies []string
+	ConfigPath            string
+	auth                  *adminAuth
+	configMu              sync.Mutex
+	WebDir                string // optional: directory to serve static frontend files
+	DataDir               string // persistent index root; defaults to LOOKUPX_DATA_DIR or data/indexes
+	Storage               string // "memory" (default) or "disk"; disk persists after reload
+	Requests              uint64
 }
 
 // wireQueryShape returns query structure without values, which can contain
@@ -472,7 +480,11 @@ type SQLColumnSpec struct {
 
 func (s *MultiServer) reloadSQLRequest(ctx context.Context, id string, req SQLReloadRequest) (BulkStats, error) {
 	mi, ok := s.Manager.Managed(id)
-	db, err := squealx.Connect(squealxDriver(req.Driver), req.DSN, "")
+	dsn, err := secureSQLiteDSN(req.Driver, req.DSN, s.DataDir)
+	if err != nil {
+		return BulkStats{}, err
+	}
+	db, err := squealx.Connect(squealxDriver(req.Driver), dsn, "")
 	if err != nil {
 		return BulkStats{}, err
 	}
@@ -505,7 +517,7 @@ func (s *MultiServer) reloadTableRequest(ctx context.Context, id string, req SQL
 	db, inferred, err := connectAndSample(ctx, sqlSampleRequest{
 		Driver: req.Driver, DSN: req.DSN, Source: "sql_table", Table: req.Table,
 		Where: req.Where, IDColumn: req.IDColumn, SeqColumn: req.SeqColumn,
-		OrderColumn: req.OrderColumn, SampleSize: 200,
+		OrderColumn: req.OrderColumn, SampleSize: 200, DataDir: s.DataDir,
 	})
 	if err != nil {
 		return BulkStats{}, err

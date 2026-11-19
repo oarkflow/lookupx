@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>LookupX — SQL query library</title>
+  <link rel="stylesheet" href="admin.css?v=9">
+  <link rel="stylesheet" href="admin-queries.css?v=1">
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/codemirror.min.css">
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/theme/material-darker.min.css">
+</head>
+<body>
+  <div id="query-gate" class="admin-gate" role="status">Checking administrator session…</div>
+  <header class="topbar" hidden>
+    <div><a class="brand" href="/">LookupX</a><span class="crumb">/ SQL query library</span></div>
+    <div class="actions"><span id="query-config-path"></span><a class="button" href="/admin.html">Configuration</a><a class="button" href="/">Search console</a></div>
+  </header>
+  <main hidden>
+    <section class="intro"><div><p class="eyebrow">SQL QUERY FILES</p><h1>Query library</h1><p>Manage read-only SELECT statements stored beside the active BCL file.</p></div><div id="query-state" class="state" role="status">Loading query files…</div></section>
+    <section class="query-toolbar"><div class="query-path-note">Paths are relative to the active BCL directory. Link a file with <code>query { file "queries/name.sql" }</code>; use <code>query { string "SELECT …" }</code> for inline SQL.</div><div><button id="new-folder" class="button">Create folder</button> <button id="new-sql" class="button">New SQL file</button></div></section>
+    <section class="query-grid">
+      <aside class="file-browser"><div id="file-breadcrumb" class="breadcrumb">/</div><div id="file-list" class="file-list"><p class="muted">Loading SQL files…</p></div></aside>
+      <section class="sql-editor"><div class="section-head"><div><h2 id="sql-title">Select a SQL file</h2><p id="sql-hint">SQL files must contain a single SELECT or WITH…SELECT statement.</p></div><span id="sql-state" role="status"></span></div><textarea id="sql-source" spellcheck="false" aria-label="SQL SELECT statement"></textarea><div class="sql-actions"><button id="save-sql" class="button primary" disabled>Save SQL file</button><button id="open-query-ref" class="button" hidden>Open BCL reference</button></div></section>
+    </section>
+  </main>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/codemirror.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/mode/sql/sql.min.js"></script>
+  <script src="admin-queries.js?v=1"></script>
+</body>
+</html>

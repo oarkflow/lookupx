@@ -363,9 +363,19 @@ func (s *MultiServer) searchIndexFH(c fh.Ctx, ix *Index, id string) error {
 	}
 	started := time.Now()
 	res, hits := ix.SearchInto(SearchRequest{Query: q.ToQuery(), Limit: limit, Offset: q.Offset, AfterDocID: q.AfterDocID, SkipTotal: q.SkipTotal, WithDocs: withDocs, Sort: q.Sort, Facets: q.Facets}, nil)
-	res.Hits = hits
-	LogKV("query_search", "index", id, "query", wireQueryShape(q), "limit", limit, "offset", q.Offset, "hits", len(hits), "total", res.Total, "latency", time.Since(started))
-	return c.JSON(map[string]any{"result": res, "latency_ns": time.Since(started).Nanoseconds()})
+	latency := time.Since(started)
+	verbose := q.Verbose
+	if raw := c.Query("verbose"); raw != "" {
+		if parsed, err := strconv.ParseBool(raw); err == nil {
+			verbose = verbose || parsed
+		}
+	}
+	LogKV("query_search", "index", id, "query", wireQueryShape(q), "limit", limit, "offset", q.Offset, "hits", len(hits), "total", res.Total, "latency", latency)
+	response := hitResponse(hits, res.Total, latency, verbose)
+	if len(res.Facets) > 0 {
+		response["facets"] = res.Facets
+	}
+	return c.JSON(response)
 }
 func (s *MultiServer) countIndexFH(c fh.Ctx, ix *Index, id string) error {
 	var q WireQuery
@@ -398,17 +408,32 @@ func (s *MultiServer) lookupFH(c fh.Ctx, ix *Index, id string) error {
 	limit := ParseIntDefault(c.Query("limit"), 20)
 	started := time.Now()
 	result, hits := ix.SearchInto(SearchRequest{Query: query, Limit: limit, WithDocs: true}, nil)
+	latency := time.Since(started)
 	fields := make([]string, 0, len(rawURL.Query()))
 	for key := range rawURL.Query() {
 		fields = append(fields, key)
 	}
 	sort.Strings(fields)
 	LogKV("query_lookup", "index", id, "filters", strings.Join(fields, ","), "limit", limit, "hits", len(hits), "total", result.Total, "latency", time.Since(started))
-	response := map[string]any{"hits": hits, "total": result.Total, "latency_ns": time.Since(started).Nanoseconds()}
+	verbose, _ := strconv.ParseBool(c.Query("verbose"))
+	response := hitResponse(hits, result.Total, latency, verbose)
 	if profile {
 		response["resources"] = usageDelta(before, readResourceUsage())
 	}
 	return c.JSON(response)
+}
+
+// hitResponse keeps the common lookup payload compact: hits are document
+// records directly. Verbose mode adds Hit metadata and aggregate diagnostics.
+func hitResponse(hits []Hit, total int, latency time.Duration, verbose bool) map[string]any {
+	if verbose {
+		return map[string]any{"hits": hits, "total": total, "latency_ns": latency.Nanoseconds()}
+	}
+	records := make([]Document, 0, len(hits))
+	for _, hit := range hits {
+		records = append(records, hit.Doc)
+	}
+	return map[string]any{"hits": records}
 }
 
 func (s *MultiServer) reloadFileFH(c fh.Ctx, id string) error {
@@ -487,6 +512,7 @@ func (s *MultiServer) writeReloadResultFH(c fh.Ctx, ctx context.Context, id stri
 }
 
 func (s *MultiServer) inferColumnsFH(ctx context.Context, req sqlSampleRequest) (InferColumnsResponse, error) {
+	req.DataDir = s.DataDir
 	db, cols, err := connectAndSample(ctx, req)
 	if err != nil {
 		return InferColumnsResponse{}, err
@@ -500,6 +526,7 @@ func (s *MultiServer) autoCreateIndexFH(ctx context.Context, req AutoIndexReques
 	if id == "" {
 		return AutoIndexResponse{}, fmt.Errorf("id required")
 	}
+	req.sqlSampleRequest.DataDir = s.DataDir
 	db, cols, err := connectAndSample(ctx, req.sqlSampleRequest)
 	if err != nil {
 		return AutoIndexResponse{}, err

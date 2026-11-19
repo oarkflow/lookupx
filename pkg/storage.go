@@ -988,8 +988,10 @@ func (ix *Index) CompileDatasourceLookup(raw string) (Query, error) {
 		return nil, fmt.Errorf("term_field requires term")
 	}
 	filters := make([]Query, 0, len(vals))
+	latestDateField := ""
+	var latestGroupBy []string
 	for field, values := range vals {
-		if field == "limit" || field == "offset" || field == "fuzzy" || field == "profile" || field == "with_docs" || field == "term_field" {
+		if field == "limit" || field == "offset" || field == "fuzzy" || field == "profile" || field == "verbose" || field == "with_docs" || field == "term_field" {
 			continue
 		}
 		if field == "term" {
@@ -1007,15 +1009,57 @@ func (ix *Index) CompileDatasourceLookup(raw string) (Query, error) {
 			}
 		}
 		name, operator := lookupFieldOperator(field)
+		var matchedRule *LookupRule
 		for _, rule := range ix.cfg.LookupRules {
 			if strings.EqualFold(field, rule.Parameter) {
 				name, operator = rule.Field, strings.ToLower(rule.Operator)
+				ruleCopy := rule
+				matchedRule = &ruleCopy
 				break
 			}
 		}
 		opt, ok := ix.cfg.Schema.Fields[name]
 		if !ok {
 			return nil, fmt.Errorf("unknown filter field %q", name)
+		}
+		// Stored-only aliases are exposed in documents and in the UI, but have
+		// no postings of their own. Compile their filters against the indexed
+		// source field so a visible alias such as work_item can be searched.
+		if opt.StoredOnly && opt.StoredAlias != "" {
+			name = opt.StoredAlias
+			opt, ok = ix.cfg.Schema.Fields[name]
+			if !ok {
+				return nil, fmt.Errorf("filter field %q has unknown stored alias %q", field, name)
+			}
+		}
+		if operator == "latest_gte" {
+			if matchedRule == nil || len(matchedRule.GroupBy) == 0 {
+				return nil, fmt.Errorf("lookup rule %q requires group_by", field)
+			}
+			if opt.Kind != FieldInt && opt.Kind != FieldFloat && opt.Kind != FieldTime {
+				return nil, fmt.Errorf("lookup rule %q requires a numeric or time field", field)
+			}
+			for _, groupField := range strings.Split(matchedRule.GroupBy, ",") {
+				groupField = strings.TrimSpace(groupField)
+				groupOpt, exists := ix.cfg.Schema.Fields[groupField]
+				if !exists || ix.strings[groupField] == nil || (groupOpt.Kind != FieldKeyword && groupOpt.Kind != FieldText && groupOpt.Kind != FieldBool) {
+					return nil, fmt.Errorf("lookup rule %q group_by field %q must be a stored string field", field, groupField)
+				}
+				latestGroupBy = append(latestGroupBy, groupField)
+			}
+			for _, value := range values {
+				value = strings.TrimSpace(value)
+				if value == "" {
+					continue
+				}
+				q, err := compileDatasourceFilter(name, "gte", value, opt)
+				if err != nil {
+					return nil, err
+				}
+				filters = append(filters, q)
+				latestDateField = name
+			}
+			continue
 		}
 		for _, value := range values {
 			value = strings.TrimSpace(value)
@@ -1031,6 +1075,9 @@ func (ix *Index) CompileDatasourceLookup(raw string) (Query, error) {
 	}
 	if len(filters) == 0 {
 		return MatchAll{}, nil
+	}
+	if latestDateField != "" {
+		return latestPerGroupQuery{Candidate: Bool{Filter: filters}, DateField: latestDateField, GroupBy: latestGroupBy}, nil
 	}
 	return Bool{Filter: filters}, nil
 }
@@ -1058,7 +1105,7 @@ func compileDatasourceFilter(field, op, value string, opt FieldOptions) (Query, 
 	numeric := opt.Kind == FieldInt || opt.Kind == FieldFloat || opt.Kind == FieldTime
 	parseNumber := func(raw string) (float64, error) {
 		if opt.Kind == FieldTime {
-			n, err := parseSourceTime(raw, "")
+			n, err := parseTemporalValue(raw, opt.TimeFormat)
 			return float64(n), err
 		}
 		n, err := strconv.ParseFloat(raw, 64)
