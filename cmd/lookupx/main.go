@@ -392,18 +392,20 @@ func warmConfiguredIndexes(ctx context.Context, mgr *lookup.MultiIndexManager, c
 			}
 			mgr.SetBuildProgress(info.ID, lookup.BulkProgress{SourceName: info.ID, Seen: stats.Seen, Indexed: stats.Indexed, Skipped: stats.Skipped, LastSeq: stats.LastSeq, Partition: stats.Partitions, Partitions: stats.Partitions, StartedAt: started, Took: time.Since(started)}, false, "")
 			lookup.LogKV("index_ready", "index", info.ID, "state", "partitioned", "storage", "disk", "rows_seen", stats.Seen, "rows_indexed", stats.Indexed, "rows_skipped", stats.Skipped, "partitions", stats.Partitions, "elapsed", time.Since(started))
-			// Open every partition into the shared serving cache now, in the
-			// background, so the first real user query does not pay the cold
-			// mmap-decode cost that would otherwise land on it inline.
-			go func(indexID string, manifests []lookup.PersistentManifest, warmCfg lookup.Config) {
-				warmStarted := time.Now()
-				warmed, warmErr := lookup.WarmPartitions(context.Background(), lookup.FileMMapSegmentStore{Root: dataDir}, manifests, warmCfg)
-				if warmErr != nil {
-					lookup.LogKV("index_partitions_warm_failed", "index", indexID, "warmed", warmed, "error", warmErr, "elapsed", time.Since(warmStarted))
-					return
-				}
-				lookup.LogKV("index_partitions_warmed", "index", indexID, "partitions", warmed, "elapsed", time.Since(warmStarted))
-			}(info.ID, stats.Manifests, managed.Config)
+			// Open every partition into the shared serving cache before moving
+			// on to the next index, so the first real user query does not pay
+			// the cold mmap-decode cost. This stays on the same goroutine as
+			// the sequential build loop deliberately: running it in its own
+			// goroutine let it overlap with the next index's SQL streaming and
+			// build, which contended for CPU/GC and showed up as elevated
+			// latency on whichever query landed during that window.
+			warmStarted := time.Now()
+			warmed, warmErr := lookup.WarmPartitions(ctx, lookup.FileMMapSegmentStore{Root: dataDir}, stats.Manifests, managed.Config)
+			if warmErr != nil {
+				lookup.LogKV("index_partitions_warm_failed", "index", info.ID, "warmed", warmed, "error", warmErr, "elapsed", time.Since(warmStarted))
+			} else {
+				lookup.LogKV("index_partitions_warmed", "index", info.ID, "partitions", warmed, "elapsed", time.Since(warmStarted))
+			}
 			continue
 		}
 		stopProgress := startIndexProgress(ctx, mgr, info.ID)
