@@ -9,6 +9,7 @@ require (
 	github.com/oarkflow/squealx/drivers/mysql v0.0.82
 	github.com/oarkflow/squealx/drivers/postgres v0.0.82
 	github.com/oarkflow/squealx/drivers/sqlite v0.0.82
+	github.com/oarkflow/sse v0.0.3
 	github.com/xuri/excelize/v2 v2.11.1
 	golang.org/x/crypto v0.59.0
 	golang.org/x/sys v0.50.0

@@ -57,6 +57,57 @@ func registerMultiServerRoutes(app *fh.App, s *MultiServer) {
 	indexes.Post("/:id/validate", s.indexValidateFH)
 	indexes.Post("/:id/repair", s.indexRepairFH)
 	indexes.Post("/:id/compact", s.indexCompactFH)
+	indexes.Post("/:id/rebuild", s.indexRebuildFH)
+}
+
+// indexRebuildFH triggers a full partitioned rebuild of a disk-storage index
+// from its configured datasource, in the background. Disk-storage indexes
+// are served from partition catalogs rather than a live in-memory Index, so
+// the older Reload/Freeze/Persist endpoints (which operate on mi.Index) do
+// not apply to them; this is their equivalent. Progress is reported through
+// the same Reloading/Progress fields GET /v1/indexes already exposes.
+func (s *MultiServer) indexRebuildFH(c fh.Ctx) error {
+	if !s.diskStorageEnabled() {
+		return fhError(c, 400, errRebuildRequiresDiskStorage.Error())
+	}
+	id := strings.Clone(c.Param("id"))
+	managed, ok := s.Manager.Managed(id)
+	if !ok {
+		return fhError(c, 404, "index not found")
+	}
+	if managed.Reloading {
+		return fhError(c, 409, fmt.Sprintf("index %q is already rebuilding", id))
+	}
+	go func() {
+		if _, err := RebuildPartitionedIndex(context.Background(), s.Manager, s.DataDir, id); err != nil {
+			LogKV("index_rebuild_failed", "index", id, "error", err)
+		}
+	}()
+	return c.JSON(map[string]any{"ok": true, "index": id, "state": "rebuilding"})
+}
+
+// requireMemoryStorageFH rejects operations that act on a managed index's
+// in-memory shadow Index. Every registered index gets one (Manager.Register
+// always calls New()), but an index built through the partitioned disk-mode
+// path (cmd/lookupx's BCL loader, via RebuildPartitionedIndex) never adds a
+// single document to it — the real served data lives only in its partition
+// catalog on disk. Letting reload/freeze/persist/etc. through for such an
+// index would silently act on zero documents while reporting success.
+// Storage=="disk" alone isn't a reliable signal: it is also used by plain
+// in-memory indexes that persist a generation for restart recovery (see
+// TestHTTPReloadPersistsForServerRestart), where mi.Index is the real,
+// populated, served index and these operations are exactly correct. The
+// precise signal is whether a partition catalog actually exists for this
+// specific index; Rebuild is the equivalent action when it does.
+func (s *MultiServer) requireMemoryStorageFH(c fh.Ctx, action string) error {
+	if !s.diskStorageEnabled() {
+		return nil
+	}
+	id := strings.Clone(c.Param("id"))
+	if _, _, ok := s.partitionCatalogStats(id, Config{}); ok {
+		return fhError(c, 400, fmt.Sprintf("%s applies only to memory-resident indexes; %q is served from a partition catalog, use rebuild instead", action, id))
+	}
+	return nil
 }
 
 func (s *MultiServer) requireManagerFH(c fh.Ctx) error {
@@ -70,7 +121,7 @@ func (s *MultiServer) healthFH(c fh.Ctx) error {
 	if s.Manager == nil {
 		return fhError(c, 500, "manager required")
 	}
-	return c.JSON(map[string]any{"ok": true, "indexes": len(s.Manager.List())})
+	return c.JSON(map[string]any{"ok": true, "indexes": len(s.Manager.List()), "storage": s.Storage})
 }
 
 func (s *MultiServer) metricsFH(c fh.Ctx) error {
@@ -273,6 +324,9 @@ func (s *MultiServer) indexSearchFH(c fh.Ctx) error { return s.withIndexFH(c, s.
 func (s *MultiServer) indexCountFH(c fh.Ctx) error  { return s.withIndexFH(c, s.countIndexFH) }
 func (s *MultiServer) indexLookupFH(c fh.Ctx) error { return s.withIndexFH(c, s.lookupIndexFH) }
 func (s *MultiServer) indexReloadFH(c fh.Ctx) error {
+	if err := s.requireMemoryStorageFH(c, "reload"); err != nil {
+		return err
+	}
 	return s.withIndexFH(c, func(c fh.Ctx, _ *Index, id string) error {
 		stats, err := s.Manager.Reload(c.Context(), id)
 		if err != nil {
@@ -282,15 +336,24 @@ func (s *MultiServer) indexReloadFH(c fh.Ctx) error {
 	})
 }
 func (s *MultiServer) indexReloadAsyncFH(c fh.Ctx) error {
+	if err := s.requireMemoryStorageFH(c, "reload-async"); err != nil {
+		return err
+	}
 	return s.withIndexFH(c, func(c fh.Ctx, _ *Index, id string) error {
 		return c.JSON(map[string]any{"task_id": s.Manager.Tasks().StartReload(c.Context(), s.Manager, id)})
 	})
 }
 func (s *MultiServer) reloadFileRouteFH(c fh.Ctx) error {
+	if err := s.requireMemoryStorageFH(c, "reload-file"); err != nil {
+		return err
+	}
 	return s.reloadFileFH(c, strings.Clone(c.Param("id")))
 }
 func (s *MultiServer) indexReloadSQLFH(c fh.Ctx) error {
 	id := strings.Clone(c.Param("id"))
+	if err := s.requireMemoryStorageFH(c, "reload-sql"); err != nil {
+		return err
+	}
 	var req SQLReloadRequest
 	if err := c.BodyParser(&req); err != nil {
 		return fhError(c, 400, err.Error())
@@ -303,6 +366,9 @@ func (s *MultiServer) indexReloadSQLFH(c fh.Ctx) error {
 }
 func (s *MultiServer) indexReloadTableFH(c fh.Ctx) error {
 	id := strings.Clone(c.Param("id"))
+	if err := s.requireMemoryStorageFH(c, "reload-table"); err != nil {
+		return err
+	}
 	var req SQLTableReloadRequest
 	if err := c.BodyParser(&req); err != nil {
 		return fhError(c, 400, err.Error())
@@ -314,6 +380,9 @@ func (s *MultiServer) indexReloadTableFH(c fh.Ctx) error {
 	return s.writeReloadResultFH(c, c.Context(), id, stats)
 }
 func (s *MultiServer) indexSnapshotFH(c fh.Ctx) error {
+	if err := s.requireMemoryStorageFH(c, "snapshot"); err != nil {
+		return err
+	}
 	return s.withIndexFH(c, func(c fh.Ctx, ix *Index, id string) error {
 		var body struct {
 			Path string `json:"path"`
@@ -329,6 +398,9 @@ func (s *MultiServer) indexSnapshotFH(c fh.Ctx) error {
 	})
 }
 func (s *MultiServer) indexUpsertDocumentFH(c fh.Ctx) error {
+	if err := s.requireMemoryStorageFH(c, "document upsert"); err != nil {
+		return err
+	}
 	return s.withIndexFH(c, func(c fh.Ctx, ix *Index, _ string) error {
 		id := strings.Clone(c.Param("docid"))
 		var doc Document
@@ -342,12 +414,18 @@ func (s *MultiServer) indexUpsertDocumentFH(c fh.Ctx) error {
 	})
 }
 func (s *MultiServer) indexDeleteDocumentFH(c fh.Ctx) error {
+	if err := s.requireMemoryStorageFH(c, "document delete"); err != nil {
+		return err
+	}
 	return s.withIndexFH(c, func(c fh.Ctx, ix *Index, _ string) error {
 		_ = ix.Delete(strings.Clone(c.Param("docid")))
 		return c.JSON(map[string]any{"ok": true})
 	})
 }
 func (s *MultiServer) indexFreezeFH(c fh.Ctx) error {
+	if err := s.requireMemoryStorageFH(c, "freeze"); err != nil {
+		return err
+	}
 	return s.withIndexFH(c, func(c fh.Ctx, ix *Index, _ string) error {
 		if err := ix.Freeze(); err != nil {
 			return fhError(c, 500, err.Error())
@@ -356,6 +434,9 @@ func (s *MultiServer) indexFreezeFH(c fh.Ctx) error {
 	})
 }
 func (s *MultiServer) indexPersistFH(c fh.Ctx) error {
+	if err := s.requireMemoryStorageFH(c, "persist"); err != nil {
+		return err
+	}
 	return s.withIndexFH(c, func(c fh.Ctx, ix *Index, id string) error {
 		manifest, err := s.persistentStore().SaveIndex(c.Context(), id, ix)
 		if err != nil {
@@ -365,6 +446,9 @@ func (s *MultiServer) indexPersistFH(c fh.Ctx) error {
 	})
 }
 func (s *MultiServer) indexCompositeLookupFH(c fh.Ctx) error {
+	if err := s.requireMemoryStorageFH(c, "composite lookup"); err != nil {
+		return err
+	}
 	return s.withIndexFH(c, func(c fh.Ctx, ix *Index, _ string) error {
 		groupID, _ := strconv.ParseUint(c.Query("group_id"), 10, 32)
 		limit := (&Server{Index: ix}).sanitizeLimit(ParseIntDefault(c.Query("limit"), 20))
@@ -373,6 +457,9 @@ func (s *MultiServer) indexCompositeLookupFH(c fh.Ctx) error {
 	})
 }
 func (s *MultiServer) indexGenerationsFH(c fh.Ctx) error {
+	if err := s.requireMemoryStorageFH(c, "generations"); err != nil {
+		return err
+	}
 	return s.withIndexFH(c, func(c fh.Ctx, _ *Index, id string) error {
 		generations, err := s.persistentStore().ListGenerations(c.Context(), id)
 		if err != nil {
@@ -382,6 +469,9 @@ func (s *MultiServer) indexGenerationsFH(c fh.Ctx) error {
 	})
 }
 func (s *MultiServer) indexValidateFH(c fh.Ctx) error {
+	if err := s.requireMemoryStorageFH(c, "validate"); err != nil {
+		return err
+	}
 	return s.withIndexFH(c, func(c fh.Ctx, _ *Index, id string) error {
 		report, err := ValidatePersistentIndex(c.Context(), s.persistentStore(), id, Config{})
 		if err != nil && len(report.Issues) == 0 {
@@ -391,6 +481,9 @@ func (s *MultiServer) indexValidateFH(c fh.Ctx) error {
 	})
 }
 func (s *MultiServer) indexRepairFH(c fh.Ctx) error {
+	if err := s.requireMemoryStorageFH(c, "repair"); err != nil {
+		return err
+	}
 	return s.withIndexFH(c, func(c fh.Ctx, _ *Index, id string) error {
 		manifest, report, err := RepairPersistentIndex(c.Context(), s.persistentStore(), id, Config{})
 		if err != nil {
@@ -405,6 +498,9 @@ func (s *MultiServer) indexRepairFH(c fh.Ctx) error {
 // graph (Add has no corresponding Remove), so churn on a long-running vector
 // index leaks memory and keeps biasing neighbor search forever.
 func (s *MultiServer) indexCompactFH(c fh.Ctx) error {
+	if err := s.requireMemoryStorageFH(c, "compact"); err != nil {
+		return err
+	}
 	return s.withIndexFH(c, func(c fh.Ctx, ix *Index, id string) error {
 		var policy GenerationPolicy
 		if len(c.Body()) > 0 {

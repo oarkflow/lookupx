@@ -23,7 +23,7 @@ func TestCleanupPreservesPublishedAndResumablePartitions(t *testing.T) {
 	if err := progress.Save(catalog + ".progress.json"); err != nil {
 		t.Fatal(err)
 	}
-	removed, err := cleanupUnreferencedPartitionBuilds(root, "cpt")
+	removed, err := lookup.CleanupUnreferencedPartitionBuilds(root, "cpt")
 	if err != nil || removed != 1 {
 		t.Fatalf("removed=%d err=%v", removed, err)
 	}

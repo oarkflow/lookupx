@@ -257,6 +257,10 @@ func (m *MultiIndexManager) List() []ManagedIndexInfo {
 		out = append(out, info)
 	}
 	m.mu.RUnlock()
+	// Go randomizes map iteration order per process; without this sort, the
+	// startup build order (and therefore its logs) would appear to change on
+	// every restart even though nothing about the data changes.
+	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
 	return out
 }
 

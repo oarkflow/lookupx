@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/oarkflow/fh"
+	"github.com/oarkflow/sse"
 )
 
 type bclContentRequest struct {
@@ -14,6 +15,7 @@ type bclContentRequest struct {
 }
 
 func registerAdminRoutes(app *fh.App, server *MultiServer) {
+	app.Get("/admin/api/logs/stream", server.streamLogsFH)
 	app.Get("/admin/api/config", server.getBCLConfigFH)
 	app.Post("/admin/api/config/validate", server.validateBCLConfigFH)
 	app.Put("/admin/api/config", server.saveBCLConfigFH)
@@ -30,6 +32,13 @@ func registerAdminRoutes(app *fh.App, server *MultiServer) {
 	app.Post("/admin/api/keys", server.auth.createAPIKey)
 	app.Post("/admin/api/keys/:id/rotate", server.auth.rotateAPIKey)
 	app.Delete("/admin/api/keys/:id", server.auth.revokeAPIKey)
+}
+
+func (s *MultiServer) streamLogsFH(c fh.Ctx) error {
+	if err := s.auth.requireAdmin(c, false); err != nil {
+		return err
+	}
+	return sse.Handler(EnableLogStreaming(), sse.HandlerOptions{})(c)
 }
 
 func (s *MultiServer) getBCLConfigFH(c fh.Ctx) error {

@@ -9,6 +9,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"runtime/debug"
 	"strconv"
@@ -101,6 +102,7 @@ HTTP API:
 }
 
 func serveCmd(args []string) {
+	lookup.EnableLogStreaming()
 	fs := flag.NewFlagSet("serve", flag.ExitOnError)
 	addr := fs.String("addr", getenv("ADDR", "0.0.0.0:8089"), "listen address")
 	maxHeapBytesStr := fs.String("max-heap-bytes", getenv("LOOKUPX_MAX_HEAP_BYTES", "0"), "soft memory limit (GOMEMLIMIT) in bytes; 0 leaves Go's default GC behavior unchanged. Profiling is served natively via fh at /admin/debug/pprof (admin session required)")
@@ -167,6 +169,10 @@ func serveCmd(args []string) {
 		}
 		if *dataDir == "./data/indexes" && cfg.DataDir != "" {
 			*dataDir = cfg.DataDir
+		}
+		configuredIDs := make(map[string]struct{}, len(cfg.Indexes))
+		for _, def := range cfg.Indexes {
+			configuredIDs[strings.ToLower(strings.TrimSpace(def.ID))] = struct{}{}
 		}
 		for _, key := range cfg.APIKeys {
 			if strings.TrimSpace(key) != "" {
@@ -303,108 +309,16 @@ func warmConfiguredIndexes(ctx context.Context, mgr *lookup.MultiIndexManager, c
 		started := time.Now()
 		lookup.LogKV("index_load_started", "index", info.ID, "storage", storage, "background", true)
 		if storage == "disk" {
-			managed, ok := mgr.Managed(info.ID)
-			if !ok || managed.Source == nil {
-				lookup.LogKV("index_load_failed", "index", info.ID, "error", "index has no configured source")
-				continue
-			}
-			schemaConfig := managed.Config
-			schemaConfig.InitialCapacity = 0
-			ix, err := lookup.New(schemaConfig)
-			if err != nil {
-				lookup.LogKV("index_load_failed", "index", info.ID, "error", err)
-				continue
-			}
-			src, err := managed.Source(ix)
-			if err != nil {
-				_ = ix.Close()
-				lookup.LogKV("index_load_failed", "index", info.ID, "error", err)
-				continue
-			}
-			// The datasource now has resolved FieldIDs. Release this temporary
-			// schema index before the builder allocates its first partition.
-			_ = ix.Close()
-			bulk := managed.Bulk
-			if bulk.BatchSize <= 0 {
-				bulk.BatchSize = lookup.LowMemoryBillionBudget().DefaultBatchSize
-			}
-			mgr.SetBuildProgress(info.ID, lookup.BulkProgress{SourceName: info.ID, StartedAt: started}, true, "")
+			// Building partitions stays on the same goroutine as this
+			// sequential loop deliberately: running it in its own goroutine
+			// let it overlap with the next index's SQL streaming and build,
+			// which contended for CPU/GC and showed up as elevated latency
+			// on whichever query landed during that window.
 			stopProgress := startIndexProgress(ctx, mgr, info.ID)
-			catalogPath := filepath.Join(dataDir, managed.ID, "partitions.json")
-			catalog, catalogErr := lookup.LoadPartitionDataset(catalogPath)
-			publishProgress := os.IsNotExist(catalogErr)
-			if catalogErr == nil && !catalog.Complete && catalog.Fingerprint != "" {
-				progress, progressErr := lookup.LoadPartitionDataset(catalogPath + ".progress.json")
-				publishProgress = progressErr == nil && progress.BuildID == catalog.BuildID && progress.Fingerprint == catalog.Fingerprint
-			}
-			_, hasResumeIdentity := src.(lookup.SourceIdentity)
-			_, supportsResume := src.(lookup.ResumableSource)
-			if hasResumeIdentity && supportsResume {
-				if identity, ok := src.(lookup.SourceIdentity); ok && identity.ResumeIdentity() != "" {
-					bulk.Resume = true
-				}
-			}
-			partitionOptions := lookup.PartitionedBuildOptions{
-				IndexID: info.ID, Store: lookup.FileMMapSegmentStore{Root: dataDir},
-				CatalogPath: catalogPath, DatasetRoot: dataDir, PublishProgress: publishProgress,
-				Config: managed.Config, RowsPerPartition: uint64(lookup.LowMemoryBillionBudget().TargetRowsPerPartition),
-				Bulk: bulk, Freeze: true,
-				Progress: func(p lookup.PartitionedBuildProgress) {
-					mgr.SetBuildProgress(info.ID, lookup.BulkProgress{SourceName: info.ID, Seen: p.Seen, Indexed: p.Indexed, Skipped: p.Skipped, LastSeq: p.LastSeq, Partition: p.PartitionNo + 1, Partitions: p.Partitions, CurrentPartitionRows: p.CurrentRows, StartedAt: started, Took: p.Took}, true, "")
-				},
-			}
-			var stats lookup.PartitionedBuildStats
-			for attempt := 1; ; attempt++ {
-				stats, err = lookup.BuildPartitionedPersistent(ctx, src, partitionOptions)
-				if err == nil || !lookup.IsTransientSQLError(err) || attempt >= 5 || ctx.Err() != nil {
-					break
-				}
-				delay := time.Duration(1<<min(attempt-1, 4)) * time.Second
-				lookup.LogKV("index_source_retry", "index", info.ID, "attempt", attempt+1, "max_attempts", 5, "delay", delay, "error", err)
-				timer := time.NewTimer(delay)
-				select {
-				case <-ctx.Done():
-					if !timer.Stop() {
-						select {
-						case <-timer.C:
-						default:
-						}
-					}
-					err = ctx.Err()
-				case <-timer.C:
-				}
-				if ctx.Err() != nil {
-					break
-				}
-			}
+			_, err := lookup.RebuildPartitionedIndex(ctx, mgr, dataDir, info.ID)
 			stopProgress()
-			if removed, cleanupErr := cleanupUnreferencedPartitionBuilds(dataDir, info.ID); cleanupErr != nil {
-				lookup.LogKV("index_partition_cleanup_failed", "index", info.ID, "error", cleanupErr)
-			} else if removed > 0 {
-				lookup.LogKV("index_partition_cleanup", "index", info.ID, "removed_builds", removed)
-			}
-			if err != nil {
-				mgr.SetBuildProgress(info.ID, lookup.BulkProgress{SourceName: info.ID, Seen: stats.Seen, Indexed: stats.Indexed, Skipped: stats.Skipped, LastSeq: stats.LastSeq, Partitions: stats.Partitions, StartedAt: started, Took: time.Since(started)}, false, err.Error())
-				if ctx.Err() == nil {
-					lookup.LogKV("index_load_failed", "index", info.ID, "error", err, "elapsed", time.Since(started))
-				}
-				continue
-			}
-			mgr.SetBuildProgress(info.ID, lookup.BulkProgress{SourceName: info.ID, Seen: stats.Seen, Indexed: stats.Indexed, Skipped: stats.Skipped, LastSeq: stats.LastSeq, Partition: stats.Partitions, Partitions: stats.Partitions, StartedAt: started, Took: time.Since(started)}, false, "")
-			lookup.LogKV("index_ready", "index", info.ID, "state", "partitioned", "storage", "disk", "rows_seen", stats.Seen, "rows_indexed", stats.Indexed, "rows_skipped", stats.Skipped, "partitions", stats.Partitions, "elapsed", time.Since(started))
-			// Open every partition into the shared serving cache before moving
-			// on to the next index, so the first real user query does not pay
-			// the cold mmap-decode cost. This stays on the same goroutine as
-			// the sequential build loop deliberately: running it in its own
-			// goroutine let it overlap with the next index's SQL streaming and
-			// build, which contended for CPU/GC and showed up as elevated
-			// latency on whichever query landed during that window.
-			warmStarted := time.Now()
-			warmed, warmErr := lookup.WarmPartitions(ctx, lookup.FileMMapSegmentStore{Root: dataDir}, stats.Manifests, managed.Config)
-			if warmErr != nil {
-				lookup.LogKV("index_partitions_warm_failed", "index", info.ID, "warmed", warmed, "error", warmErr, "elapsed", time.Since(warmStarted))
-			} else {
-				lookup.LogKV("index_partitions_warmed", "index", info.ID, "partitions", warmed, "elapsed", time.Since(warmStarted))
+			if err != nil && ctx.Err() == nil {
+				lookup.LogKV("index_load_failed", "index", info.ID, "error", err, "elapsed", time.Since(started))
 			}
 			continue
 		}
@@ -426,51 +340,43 @@ func warmConfiguredIndexes(ctx context.Context, mgr *lookup.MultiIndexManager, c
 	}
 }
 
-// cleanupUnreferencedPartitionBuilds removes partition indexes left behind by
-// retries or replaced builds. The published catalog is the source of truth:
-// every partition it references remains available to active queries.
-func cleanupUnreferencedPartitionBuilds(dataDir, indexID string) (int, error) {
-	catalogPath := filepath.Join(dataDir, strings.ToLower(strings.TrimSpace(indexID)), "partitions.json")
-	dataset, err := lookup.LoadPartitionDataset(catalogPath)
-	if err != nil && !os.IsNotExist(err) {
-		return 0, fmt.Errorf("read published partition catalog: %w", err)
-	}
-	keep := make(map[string]struct{}, len(dataset.Generations))
-	for _, manifest := range dataset.Generations {
-		keep[strings.ToLower(strings.TrimSpace(manifest.IndexID))] = struct{}{}
-	}
-	// Keep committed resume partitions as well as the serving generation.
-	// They may belong to a replacement build that failed before publication.
-	progress, progressErr := lookup.LoadPartitionDataset(catalogPath + ".progress.json")
-	if progressErr != nil && !os.IsNotExist(progressErr) {
-		return 0, fmt.Errorf("read partition build checkpoint: %w", progressErr)
-	}
-	if progressErr == nil && progress.Fingerprint != "" {
-		for _, manifest := range progress.Generations {
-			keep[strings.ToLower(strings.TrimSpace(manifest.IndexID))] = struct{}{}
-		}
-	}
+// partitionBuildDirPattern matches the flat partition-build directories
+// BuildPartitionedPersistent writes directly under dataDir, e.g.
+// "cpt-b12979bb625fd33a10777ebb0-p000003". It is index-ID-agnostic so it
+// also catches directories left behind by an index ID that no longer exists
+// in the config (e.g. after a rename).
+var partitionBuildDirPattern = regexp.MustCompile(`-b[0-9a-f]+-p\d+$`)
+
+// clearStaleIndexData wipes all persisted index data (per-index catalog
+// directories and their flat partition-build directories) on every fresh
+// server start, so each start is a guaranteed full rebuild from the
+// configured datasources rather than a reuse of whatever was last on disk.
+// This also catches directories left by an index ID no longer in the config,
+// e.g. after a rename. It never touches non-index directories under dataDir,
+// such as "auth" (admin/session store).
+func clearStaleIndexData(dataDir string, configuredIDs map[string]struct{}) ([]string, error) {
 	entries, err := os.ReadDir(dataDir)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return 0, nil
+			return nil, nil
 		}
-		return 0, err
+		return nil, err
 	}
-	prefix := strings.ToLower(strings.TrimSpace(indexID)) + "-b"
-	removed := 0
+	var removed []string
 	for _, entry := range entries {
-		name := strings.ToLower(entry.Name())
-		if !entry.IsDir() || !strings.HasPrefix(name, prefix) {
+		if !entry.IsDir() {
 			continue
 		}
-		if _, referenced := keep[name]; referenced {
+		name := entry.Name()
+		lower := strings.ToLower(name)
+		_, isConfiguredIndex := configuredIDs[lower]
+		if !isConfiguredIndex && !partitionBuildDirPattern.MatchString(lower) {
 			continue
 		}
-		if err := os.RemoveAll(filepath.Join(dataDir, entry.Name())); err != nil {
-			return removed, fmt.Errorf("remove unreferenced partition %q: %w", entry.Name(), err)
+		if err := os.RemoveAll(filepath.Join(dataDir, name)); err != nil {
+			return removed, fmt.Errorf("remove index data %q: %w", name, err)
 		}
-		removed++
+		removed = append(removed, name)
 	}
 	return removed, nil
 }
