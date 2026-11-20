@@ -149,20 +149,21 @@ func TestMultiServerSearchReturnsBulkDatasourceRecordsByDefault(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	req := httptest.NewRequest(http.MethodPost, "/v1/indexes/records/search", strings.NewReader(`{"type":"term","field":"term","value":"alpha"}`))
+	// verbose:true asks for the structured Hit array (doc_id + doc); the
+	// default compact response is a bare list of stored documents with no
+	// wrapper, used by the web console.
+	req := httptest.NewRequest(http.MethodPost, "/v1/indexes/records/search", strings.NewReader(`{"type":"term","field":"term","value":"alpha","verbose":true}`))
 	res := httptest.NewRecorder()
 	serveFHTest(t, res, &MultiServer{Manager: mgr}, req)
 	if res.Code != http.StatusOK {
 		t.Fatalf("status=%d body=%s", res.Code, res.Body.String())
 	}
-	var body struct {
-		Result Result `json:"result"`
-	}
+	var body Result
 	if err := json.Unmarshal(res.Body.Bytes(), &body); err != nil {
 		t.Fatal(err)
 	}
-	if len(body.Result.Hits) != 1 || body.Result.Hits[0].Doc["term"] != "alpha" {
-		t.Fatalf("expected populated record, got %#v", body.Result.Hits)
+	if len(body.Hits) != 1 || body.Hits[0].Doc["term"] != "alpha" {
+		t.Fatalf("expected populated record, got %#v", body.Hits)
 	}
 }
 
@@ -185,21 +186,23 @@ func TestMultiServerSearchSupportsCursorPagination(t *testing.T) {
 		req := httptest.NewRequest(http.MethodPost, "/v1/indexes/records/search?with_docs=false", strings.NewReader(body))
 		res := httptest.NewRecorder()
 		serveFHTest(t, res, server, req)
-		var response struct {
-			Result Result `json:"result"`
-		}
+		var response Result
 		if res.Code == http.StatusOK {
 			if err := json.Unmarshal(res.Body.Bytes(), &response); err != nil {
 				t.Fatal(err)
 			}
 		}
-		return res.Code, response.Result
+		return res.Code, response
 	}
-	status, first := search(`{"type":"all","limit":2,"skip_total":true}`)
-	if status != http.StatusOK || first.Total != 5 || len(first.Hits) != 2 || first.Hits[0].DocID != 1 || first.Hits[1].DocID != 2 {
+	// with_docs=false routes this through the hotpath fast path (searchBitmapIntoFast),
+	// which honors skip_total unconditionally like every other fast-path function;
+	// only the generic (slow) Search() path special-cases AfterDocID==0 to compute
+	// the total anyway, so Total stays -1 here.
+	status, first := search(`{"type":"all","limit":2,"skip_total":true,"verbose":true}`)
+	if status != http.StatusOK || first.Total != -1 || len(first.Hits) != 2 || first.Hits[0].DocID != 1 || first.Hits[1].DocID != 2 {
 		t.Fatalf("first page status=%d result=%+v", status, first)
 	}
-	status, second := search(`{"type":"all","limit":2,"after_doc_id":2,"skip_total":true}`)
+	status, second := search(`{"type":"all","limit":2,"after_doc_id":2,"skip_total":true,"verbose":true}`)
 	if status != http.StatusOK || second.Total != -1 || len(second.Hits) != 2 || second.Hits[0].DocID != 3 || second.Hits[1].DocID != 4 {
 		t.Fatalf("second page status=%d result=%+v", status, second)
 	}
@@ -276,8 +279,12 @@ func TestLookupFiltersDatasourceTextAndNumericFields(t *testing.T) {
 		t.Fatal(err)
 	}
 	server := &MultiServer{Manager: mgr}
+	// verbose=true requests the structured Hit array; Hit.ID is never
+	// serialized to JSON (responses identify records by doc_id instead), so
+	// identity is checked through the stored "ld" field, which this fixture
+	// deliberately set equal to the external record id.
 	for _, filter := range []string{"ld=943846", "work_item=37", "ld=943846&work_item=37"} {
-		req := httptest.NewRequest(http.MethodGet, "/v1/indexes/cpt/lookup?"+filter, nil)
+		req := httptest.NewRequest(http.MethodGet, "/v1/indexes/cpt/lookup?verbose=true&"+filter, nil)
 		res := httptest.NewRecorder()
 		serveFHTest(t, res, server, req)
 		if res.Code != http.StatusOK {
@@ -289,7 +296,7 @@ func TestLookupFiltersDatasourceTextAndNumericFields(t *testing.T) {
 		if err := json.Unmarshal(res.Body.Bytes(), &body); err != nil {
 			t.Fatal(err)
 		}
-		if len(body.Hits) != 1 || body.Hits[0].ID != "943846" || body.Hits[0].Doc["work_item"] != float64(37) {
+		if len(body.Hits) != 1 || body.Hits[0].Doc["ld"] != "943846" || body.Hits[0].Doc["work_item"] != float64(37) {
 			t.Fatalf("filter %q returned %#v", filter, body.Hits)
 		}
 	}
@@ -609,5 +616,44 @@ func testFirstTerm(id string) string {
 func TestLatencySummary(t *testing.T) {
 	if LatencySummary(100, time.Millisecond) == "" {
 		t.Fatal("empty")
+	}
+}
+
+// TestMultiServerCompactRebuildsVectorIndex locks in that POST
+// /v1/indexes/{id}/compact rebuilds vector ANN graphs (dropping tombstoned
+// nodes from repeated upserts to the same doc id), not just persisted
+// generations on disk. Without this, vector deletes never shrink the graph
+// for the multi-index HTTP server, since VectorANN has no Remove.
+func TestMultiServerCompactRebuildsVectorIndex(t *testing.T) {
+	mgr := NewMultiIndexManager()
+	ix, err := New(Config{Schema: Schema{Fields: map[string]FieldOptions{
+		"vec": {Kind: FieldVector, Dim: 2, VectorMetric: "cosine"},
+	}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 5; i++ {
+		if err := ix.Upsert("same", Document{"vec": []float64{float64(i + 1), 0}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := mgr.AddIndex("vectors", ix); err != nil {
+		t.Fatal(err)
+	}
+	before := ix.Stats()
+	if before.VectorTombstones == 0 {
+		t.Fatalf("expected stale vector nodes before compaction: %#v", before)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/indexes/vectors/compact", strings.NewReader(""))
+	res := httptest.NewRecorder()
+	serveFHTest(t, res, &MultiServer{Manager: mgr, DataDir: t.TempDir()}, req)
+	if res.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", res.Code, res.Body.String())
+	}
+
+	after := ix.Stats()
+	if after.VectorNodes != 1 || after.VectorTombstones != 0 {
+		t.Fatalf("expected compaction to drop stale vector nodes, got %#v", after)
 	}
 }

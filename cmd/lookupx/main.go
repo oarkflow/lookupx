@@ -103,6 +103,7 @@ HTTP API:
 func serveCmd(args []string) {
 	fs := flag.NewFlagSet("serve", flag.ExitOnError)
 	addr := fs.String("addr", getenv("ADDR", "0.0.0.0:8089"), "listen address")
+	maxHeapBytesStr := fs.String("max-heap-bytes", getenv("LOOKUPX_MAX_HEAP_BYTES", "0"), "soft memory limit (GOMEMLIMIT) in bytes; 0 leaves Go's default GC behavior unchanged. Profiling is served natively via fh at /admin/debug/pprof (admin session required)")
 	configPath := fs.String("config", getenv("LOOKUPX_CONFIG", "config/lookupx.bcl"), "BCL configuration file; set empty to start without configured indexes")
 	apiKey := fs.String("api-key", getenv("LOOKUPX_API_KEY", ""), "optional API key")
 	webDir := fs.String("web", getenv("LOOKUPX_WEB_DIR", ""), "serve frontend files from this directory (default: ./web)")
@@ -129,6 +130,14 @@ func serveCmd(args []string) {
 	}
 	if len(sessionSecret) < 32 {
 		log.Fatal("LOOKUPX_SESSION_SECRET must contain at least 32 characters in .env")
+	}
+	maxHeapBytes, err := strconv.ParseInt(strings.TrimSpace(*maxHeapBytesStr), 10, 64)
+	if err != nil {
+		log.Fatalf("-max-heap-bytes/LOOKUPX_MAX_HEAP_BYTES must be an integer byte count: %v", err)
+	}
+	if maxHeapBytes > 0 {
+		debug.SetMemoryLimit(maxHeapBytes)
+		lookup.LogKV("gomemlimit_set", "bytes", maxHeapBytes)
 	}
 
 	cacheBytes, err := strconv.ParseInt(getenv("LOOKUPX_PARTITION_CACHE_BYTES", "268435456"), 10, 64)
@@ -383,6 +392,18 @@ func warmConfiguredIndexes(ctx context.Context, mgr *lookup.MultiIndexManager, c
 			}
 			mgr.SetBuildProgress(info.ID, lookup.BulkProgress{SourceName: info.ID, Seen: stats.Seen, Indexed: stats.Indexed, Skipped: stats.Skipped, LastSeq: stats.LastSeq, Partition: stats.Partitions, Partitions: stats.Partitions, StartedAt: started, Took: time.Since(started)}, false, "")
 			lookup.LogKV("index_ready", "index", info.ID, "state", "partitioned", "storage", "disk", "rows_seen", stats.Seen, "rows_indexed", stats.Indexed, "rows_skipped", stats.Skipped, "partitions", stats.Partitions, "elapsed", time.Since(started))
+			// Open every partition into the shared serving cache now, in the
+			// background, so the first real user query does not pay the cold
+			// mmap-decode cost that would otherwise land on it inline.
+			go func(indexID string, manifests []lookup.PersistentManifest, warmCfg lookup.Config) {
+				warmStarted := time.Now()
+				warmed, warmErr := lookup.WarmPartitions(context.Background(), lookup.FileMMapSegmentStore{Root: dataDir}, manifests, warmCfg)
+				if warmErr != nil {
+					lookup.LogKV("index_partitions_warm_failed", "index", indexID, "warmed", warmed, "error", warmErr, "elapsed", time.Since(warmStarted))
+					return
+				}
+				lookup.LogKV("index_partitions_warmed", "index", indexID, "partitions", warmed, "elapsed", time.Since(warmStarted))
+			}(info.ID, stats.Manifests, managed.Config)
 			continue
 		}
 		stopProgress := startIndexProgress(ctx, mgr, info.ID)

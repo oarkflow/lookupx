@@ -13,6 +13,7 @@ import (
 	"sync"
 	"time"
 
+	fhmetrics "github.com/oarkflow/fh/mw/metrics"
 	"github.com/oarkflow/squealx"
 )
 
@@ -485,6 +486,7 @@ type MultiServer struct {
 	DataDir               string // persistent index root; defaults to LOOKUPX_DATA_DIR or data/indexes
 	Storage               string // "memory" (default) or "disk"; disk persists after reload
 	Requests              uint64
+	metrics               *fhmetrics.Metrics
 }
 
 // wireQueryShape returns query structure without values, which can contain

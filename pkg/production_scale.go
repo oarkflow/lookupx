@@ -225,48 +225,47 @@ func (c *TupleCompositeIndex) BuildFromIndex(ix *Index) error {
 	if termFI == nil || workFI == nil || date_keyFI == nil {
 		return nil
 	}
+	// did -> value is filled with one forward pass per field (each posting
+	// already names the doc ids that hold it), rather than reverse-scanning
+	// every group_id/date_key term for every document. The old approach was
+	// O(docs * distinct group_id/date_key values); this is O(docs + terms).
+	n := int(ix.nextDocID)
+	work := make([]string, n)
+	dateKey := make([]string, n)
+	fillDenseLocked := func(fi *fieldIndex, dst []string) {
+		for v, did := range fi.termOne {
+			if int(did) < len(dst) {
+				dst[did] = v
+			}
+		}
+		for v, bm := range fi.terms {
+			bm.Each(func(did DocID) bool {
+				if int(did) < len(dst) {
+					dst[did] = v
+				}
+				return true
+			})
+		}
+	}
+	fillDenseLocked(workFI, work)
+	fillDenseLocked(date_keyFI, dateKey)
+	addForDoc := func(term string, did DocID) {
+		if int(did) >= len(work) {
+			return
+		}
+		w, dk := work[did], dateKey[did]
+		wi, _ := strconv.ParseUint(w, 10, 32)
+		if wi > 0 && dk != "" {
+			c.Add(term, uint32(wi), dk, "", did)
+		}
+	}
 	for term, did := range termFI.termOne {
-		c.addForDocFromPostingsLocked(ix, did, term, workFI, date_keyFI)
+		addForDoc(term, did)
 	}
 	for term, bm := range termFI.terms {
-		bm.Each(func(did DocID) bool { c.addForDocFromPostingsLocked(ix, did, term, workFI, date_keyFI); return true })
+		bm.Each(func(did DocID) bool { addForDoc(term, did); return true })
 	}
 	return nil
-}
-func (c *TupleCompositeIndex) addForDocFromPostingsLocked(ix *Index, did DocID, term string, workFI, date_keyFI *fieldIndex) {
-	var work, date_key string
-	for v, id := range workFI.termOne {
-		if id == did {
-			work = v
-			break
-		}
-	}
-	if work == "" {
-		for v, bm := range workFI.terms {
-			if bm.Has(did) {
-				work = v
-				break
-			}
-		}
-	}
-	for v, id := range date_keyFI.termOne {
-		if id == did {
-			date_key = v
-			break
-		}
-	}
-	if date_key == "" {
-		for v, bm := range date_keyFI.terms {
-			if bm.Has(did) {
-				date_key = v
-				break
-			}
-		}
-	}
-	wi, _ := strconv.ParseUint(work, 10, 32)
-	if wi > 0 && date_key != "" {
-		c.Add(term, uint32(wi), date_key, "", did)
-	}
 }
 
 func (ix *Index) EnableTupleComposite() {
@@ -493,6 +492,12 @@ func (s FileSegmentStore) ListGenerations(ctx context.Context, indexID string) (
 	base := s.dir(indexID)
 	ents, err := os.ReadDir(base)
 	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			// A never-persisted index has no generation directory yet; that is
+			// not a fault, just zero generations (e.g. an in-memory-only index
+			// being compacted for its vector ANN graph via /compact).
+			return []PersistentManifest{}, nil
+		}
 		return nil, err
 	}
 	out := []PersistentManifest{}

@@ -1597,40 +1597,67 @@ func (ix *Index) existsBitmap(field string) *Bitmap {
 	}
 	return fi.exists
 }
-func (ix *Index) rangeBitmap(field string, gte, gt, lte, lt any) *Bitmap {
+// withSortedNumericRead runs fn with a stable, sorted-by-value snapshot of a
+// numeric column. It takes only the read lock when the per-field cache is
+// already fresh (the common case once an index is warm), and upgrades to the
+// write lock only to rebuild a dirty cache. This keeps concurrent range
+// queries from serializing against the whole index merely to consult a cache
+// that almost never needs rebuilding between queries.
+func (ix *Index) withSortedNumericRead(field string, fn func(pairs []numPair)) bool {
+	ix.mu.RLock()
+	if ix.numericExists[field] == nil {
+		ix.mu.RUnlock()
+		return false
+	}
+	if !ix.numDirty[field] && ix.numSorted[field] != nil {
+		fn(ix.numSorted[field])
+		ix.mu.RUnlock()
+		return true
+	}
+	ix.mu.RUnlock()
 	ix.mu.Lock()
 	defer ix.mu.Unlock()
 	if ix.numericExists[field] == nil {
-		return NewBitmap()
+		return false
 	}
+	fn(ix.sortedNumericLocked(field))
+	return true
+}
+
+func (ix *Index) rangeBitmap(field string, gte, gt, lte, lt any) *Bitmap {
 	min, hasMin, minInc := boundFloat(gte, gt, true)
 	max, hasMax, maxInc := boundFloat(lte, lt, false)
-	pairs := ix.sortedNumericLocked(field)
-	lo, hi := 0, len(pairs)
-	if hasMin {
-		lo = sort.Search(len(pairs), func(i int) bool {
-			if minInc {
-				return pairs[i].v >= min
-			}
-			return pairs[i].v > min
-		})
-	}
-	if hasMax {
-		hi = sort.Search(len(pairs), func(i int) bool {
-			if maxInc {
-				return pairs[i].v > max
-			}
-			return pairs[i].v >= max
-		})
-	}
-	if hi < lo {
-		hi = lo
-	}
-	r := NewBitmapCap(ix.nextDocID)
-	for _, p := range pairs[lo:hi] {
-		if !ix.deleted.Has(p.id) {
-			r.Add(p.id)
+	var r *Bitmap
+	ix.withSortedNumericRead(field, func(pairs []numPair) {
+		lo, hi := 0, len(pairs)
+		if hasMin {
+			lo = sort.Search(len(pairs), func(i int) bool {
+				if minInc {
+					return pairs[i].v >= min
+				}
+				return pairs[i].v > min
+			})
 		}
+		if hasMax {
+			hi = sort.Search(len(pairs), func(i int) bool {
+				if maxInc {
+					return pairs[i].v > max
+				}
+				return pairs[i].v >= max
+			})
+		}
+		if hi < lo {
+			hi = lo
+		}
+		r = NewBitmapCap(ix.nextDocID)
+		for _, p := range pairs[lo:hi] {
+			if !ix.deleted.Has(p.id) {
+				r.Add(p.id)
+			}
+		}
+	})
+	if r == nil {
+		r = NewBitmap()
 	}
 	return r
 }
@@ -1667,6 +1694,21 @@ func (ix *Index) rangeBitmapWithin(field string, gte, gt, lte, lt any, candidate
 		return true
 	})
 	return r
+}
+
+// withSortedIPv4Read mirrors withSortedNumericRead for the IPv4 CIDR fast
+// path: a read lock suffices whenever the sorted cache is already fresh.
+func (ix *Index) withSortedIPv4Read(field string, fn func(pairs []ipPair)) {
+	ix.mu.RLock()
+	if !ix.ip4Dirty[field] && ix.ip4Sorted[field] != nil {
+		fn(ix.ip4Sorted[field])
+		ix.mu.RUnlock()
+		return
+	}
+	ix.mu.RUnlock()
+	ix.mu.Lock()
+	defer ix.mu.Unlock()
+	fn(ix.sortedIPv4Locked(field))
 }
 
 func (ix *Index) sortedIPv4Locked(field string) []ipPair {

@@ -92,6 +92,12 @@ func (s *MultiServer) metricsFH(c fh.Ctx) error {
 		fmt.Fprintf(&b, "lookupx_index_last_reload_ns{index=%q} %d\n", info.ID, info.Latency.LastReloadNS)
 		fmt.Fprintf(&b, "lookupx_index_last_indexed{index=%q} %d\n", info.ID, info.Latency.LastIndexed)
 	}
+	// Request-rate/error/duration metrics come from fh's own RED middleware
+	// (wired in NewFHApp), which already tracks per-route histograms; this
+	// handler only adds lookupx-specific index/cache gauges above.
+	if s.metrics != nil {
+		b.WriteString(s.metrics.Prometheus())
+	}
 	return c.SendString(b.String())
 }
 
@@ -393,19 +399,27 @@ func (s *MultiServer) indexRepairFH(c fh.Ctx) error {
 		return c.JSON(map[string]any{"manifest": manifest, "validation": report})
 	})
 }
+// indexCompactFH both prunes old persisted generations on disk and rebuilds
+// this index's in-memory vector ANN graphs, dropping nodes for deleted or
+// expired documents. Without the latter, vector deletes never shrink the
+// graph (Add has no corresponding Remove), so churn on a long-running vector
+// index leaks memory and keeps biasing neighbor search forever.
 func (s *MultiServer) indexCompactFH(c fh.Ctx) error {
-	return s.withIndexFH(c, func(c fh.Ctx, _ *Index, id string) error {
+	return s.withIndexFH(c, func(c fh.Ctx, ix *Index, id string) error {
 		var policy GenerationPolicy
 		if len(c.Body()) > 0 {
 			if err := c.BodyParser(&policy); err != nil {
 				return fhError(c, 400, err.Error())
 			}
 		}
+		if err := ix.Compact(); err != nil {
+			return fhError(c, 500, err.Error())
+		}
 		removed, err := CompactPersistentGenerations(c.Context(), s.persistentStore(), id, policy)
 		if err != nil {
 			return fhError(c, 500, err.Error())
 		}
-		return c.JSON(map[string]any{"removed": removed})
+		return c.JSON(map[string]any{"removed": removed, "vectors_rebuilt": true})
 	})
 }
 

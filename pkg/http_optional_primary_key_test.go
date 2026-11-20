@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"testing"
 
@@ -13,7 +14,15 @@ import (
 )
 
 func TestSQLIntegrationsCreateIndexesWithoutPrimaryKey(t *testing.T) {
-	dsn := filepath.Join(t.TempDir(), "source.db")
+	// secureSQLiteDSN confines reload-sql/reload-table DSNs to the server's
+	// configured data directory, so the fixture database must live under
+	// <dataDir>/sqlite rather than an arbitrary temp path.
+	dataDir := t.TempDir()
+	sqliteDir := filepath.Join(dataDir, "sqlite")
+	if err := os.MkdirAll(sqliteDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	dsn := filepath.Join(sqliteDir, "source.db")
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		t.Fatal(err)
@@ -65,7 +74,7 @@ func TestSQLIntegrationsCreateIndexesWithoutPrimaryKey(t *testing.T) {
 			request.Header.Set("Content-Type", "application/json")
 			response := httptest.NewRecorder()
 			manager := NewMultiIndexManager()
-			serveFHTest(t, response, &MultiServer{Manager: manager}, request)
+			serveFHTest(t, response, &MultiServer{Manager: manager, DataDir: dataDir}, request)
 			if response.Code != http.StatusOK {
 				t.Fatalf("reload returned %d: %s", response.Code, response.Body.String())
 			}

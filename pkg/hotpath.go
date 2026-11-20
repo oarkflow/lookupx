@@ -352,49 +352,48 @@ func (ix *Index) searchRangeIntoFast(q Range, req SearchRequest, dst []Hit, star
 	if req.SkipTotal {
 		total = -1
 	}
-	ix.mu.Lock()
-	defer ix.mu.Unlock()
-	if ix.numericExists[q.Field] == nil {
-		return Result{Hits: dst, Took: ix.elapsed(start)}, dst
-	}
 	min, hasMin, minInc := boundFloat(q.GTE, q.GT, true)
 	max, hasMax, maxInc := boundFloat(q.LTE, q.LT, false)
-	pairs := ix.sortedNumericLocked(q.Field)
-	lo, hi := 0, len(pairs)
-	if hasMin {
-		lo = sort.Search(len(pairs), func(i int) bool {
-			if minInc {
-				return pairs[i].v >= min
+	ok := ix.withSortedNumericRead(q.Field, func(pairs []numPair) {
+		lo, hi := 0, len(pairs)
+		if hasMin {
+			lo = sort.Search(len(pairs), func(i int) bool {
+				if minInc {
+					return pairs[i].v >= min
+				}
+				return pairs[i].v > min
+			})
+		}
+		if hasMax {
+			hi = sort.Search(len(pairs), func(i int) bool {
+				if maxInc {
+					return pairs[i].v > max
+				}
+				return pairs[i].v >= max
+			})
+		}
+		if hi < lo {
+			hi = lo
+		}
+		for _, p := range pairs[lo:hi] {
+			if ix.isDeletedOrExpiredLocked(p.id) {
+				continue
 			}
-			return pairs[i].v > min
-		})
-	}
-	if hasMax {
-		hi = sort.Search(len(pairs), func(i int) bool {
-			if maxInc {
-				return pairs[i].v > max
+			if !req.SkipTotal {
+				total++
 			}
-			return pairs[i].v >= max
-		})
-	}
-	if hi < lo {
-		hi = lo
-	}
-	for _, p := range pairs[lo:hi] {
-		if ix.isDeletedOrExpiredLocked(p.id) {
-			continue
+			if skipped < req.Offset {
+				skipped++
+				continue
+			}
+			if len(dst) >= req.Limit {
+				break
+			}
+			dst = append(dst, Hit{ID: ix.externalID(p.id), DocID: p.id, Score: 1})
 		}
-		if !req.SkipTotal {
-			total++
-		}
-		if skipped < req.Offset {
-			skipped++
-			continue
-		}
-		if len(dst) >= req.Limit {
-			break
-		}
-		dst = append(dst, Hit{ID: ix.externalID(p.id), DocID: p.id, Score: 1})
+	})
+	if !ok {
+		return Result{Hits: dst, Took: ix.elapsed(start)}, dst
 	}
 	return Result{Total: total, Hits: dst, Took: ix.elapsed(start)}, dst
 }
@@ -626,27 +625,26 @@ func (ix *Index) searchCIDRIntoFast(q CIDR, req SearchRequest, dst []Hit, start 
 	if req.SkipTotal {
 		total = -1
 	}
-	ix.mu.Lock()
-	defer ix.mu.Unlock()
-	pairs := ix.sortedIPv4Locked(q.Field)
-	s := sort.Search(len(pairs), func(i int) bool { return pairs[i].v >= lo })
-	e := sort.Search(len(pairs), func(i int) bool { return pairs[i].v > hi })
-	for _, p := range pairs[s:e] {
-		if ix.isDeletedOrExpiredLocked(p.id) {
-			continue
+	ix.withSortedIPv4Read(q.Field, func(pairs []ipPair) {
+		s := sort.Search(len(pairs), func(i int) bool { return pairs[i].v >= lo })
+		e := sort.Search(len(pairs), func(i int) bool { return pairs[i].v > hi })
+		for _, p := range pairs[s:e] {
+			if ix.isDeletedOrExpiredLocked(p.id) {
+				continue
+			}
+			if !req.SkipTotal {
+				total++
+			}
+			if skipped < req.Offset {
+				skipped++
+				continue
+			}
+			if len(dst) >= req.Limit {
+				break
+			}
+			dst = append(dst, Hit{ID: ix.externalID(p.id), DocID: p.id, Score: 1})
 		}
-		if !req.SkipTotal {
-			total++
-		}
-		if skipped < req.Offset {
-			skipped++
-			continue
-		}
-		if len(dst) >= req.Limit {
-			break
-		}
-		dst = append(dst, Hit{ID: ix.externalID(p.id), DocID: p.id, Score: 1})
-	}
+	})
 	return Result{Total: total, Hits: dst, Took: ix.elapsed(start)}, dst
 }
 

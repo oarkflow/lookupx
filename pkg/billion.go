@@ -352,7 +352,7 @@ func PlanBillionRowDeployment(indexID string, estimatedRows int64, budget Memory
 		"layout":                            "partitioned build with bounded-concurrency cold HTTP search",
 		"production_ready_for_billion_rows": false,
 		"readiness_warnings": []string{
-			"cold HTTP lookup opens and scans every persisted partition; partition pruning is not yet implemented",
+			"cold HTTP lookup prunes partitions using each generation's PartitionSummary before opening them, but a summary only narrows by what it tracks (term/group/date-key membership); queries outside that coverage still open every partition",
 			"RDS sql_query builds need a stable indexed paging key for bounded keyset pages and restart recovery; a computed document ID is not a paging index",
 			"single-index heap requirements depend on indexed fields and analyzers and are not estimated by this row-count plan",
 		},

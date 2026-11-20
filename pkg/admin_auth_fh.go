@@ -42,11 +42,16 @@ type adminAuth struct {
 	keys             map[string]apikey.KeyRecord
 	users            map[string]APIUser
 	mu               sync.RWMutex
+	// disabled marks an intentionally unauthenticated deployment: no session
+	// secret, admin password, or API keys were configured. The public API
+	// (and /health, /metrics) must stay open in that state rather than the
+	// gate denying every request because no credential was ever supplied.
+	disabled bool
 }
 
 func newAdminAuth(server *MultiServer) *adminAuth {
 	if server == nil {
-		return &adminAuth{}
+		return &adminAuth{disabled: true}
 	}
 	a := &adminAuth{}
 	for _, raw := range server.SessionTrustedProxies {
@@ -72,6 +77,7 @@ func newAdminAuth(server *MultiServer) *adminAuth {
 		if server.AdminPassword != "" || len(server.APIKeys) > 0 {
 			panic("LOOKUPX_SESSION_SECRET must contain at least 32 characters when admin auth or API keys are enabled")
 		}
+		a.disabled = true
 		return a
 	}
 	name, secure := "lookupx_admin_session", server.SessionSecure
@@ -301,6 +307,9 @@ func (a *adminAuth) status(c fh.Ctx) error {
 }
 
 func (a *adminAuth) middleware(c fh.Ctx) error {
+	if a != nil && a.disabled {
+		return c.Next()
+	}
 	path := c.Path()
 	if strings.HasPrefix(path, "/admin/api/") || strings.HasPrefix(path, "/auth/") {
 		c.Set("Cache-Control", "no-store")

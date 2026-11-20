@@ -9,6 +9,7 @@ import (
 	"github.com/oarkflow/fh/mw/apikey"
 	"github.com/oarkflow/fh/mw/bodylimit"
 	"github.com/oarkflow/fh/mw/compress"
+	fhmetrics "github.com/oarkflow/fh/mw/metrics"
 	"github.com/oarkflow/fh/mw/ratelimiter"
 	"github.com/oarkflow/fh/mw/realip"
 	"github.com/oarkflow/fh/mw/recover"
@@ -58,6 +59,10 @@ func NewFHApp(handler any) *fh.App {
 	)
 	if h, ok := handler.(*MultiServer); ok {
 		h.auth = newAdminAuth(h)
+		if h.metrics == nil {
+			h.metrics = fhmetrics.New()
+		}
+		app.Use(h.metrics.Middleware())
 		app.Use(func(c fh.Ctx) error {
 			c.Locals(adminPeerIPLocalKey, c.IP())
 			return c.Next()
@@ -111,6 +116,7 @@ func NewFHApp(handler any) *fh.App {
 		app.Post("/auth/logout", h.auth.logout)
 		registerMultiServerRoutes(app, h)
 		registerAdminRoutes(app, h)
+		registerPprofRoutes(app, h)
 		root := h.WebDir
 		if root == "" {
 			root = defaultWebDir()
@@ -158,7 +164,10 @@ func fhAuthMiddlewares(handler any) []fh.HandlerFunc {
 		}
 		gate := h.requestGateFH
 		if len(h.Index.cfg.APIKeys) == 0 {
-			return []fh.HandlerFunc{gate, func(c fh.Ctx) error { return fhError(c, 401, "unauthorized") }}
+			// No API keys configured means this single-index server is
+			// intentionally open, matching the MultiServer "disabled" state in
+			// newAdminAuth; it must not deny every request.
+			return []fh.HandlerFunc{gate}
 		}
 		keys = h.Index.cfg.APIKeys
 		return append([]fh.HandlerFunc{gate}, fhAPIKeyMiddlewares(keys)...)

@@ -92,7 +92,10 @@ func TestFHNativeSingleIndexJSONHandlers(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if resp.StatusCode != http.StatusOK || !bytes.Contains(body, []byte("doc-1")) {
+	// Hit.ID is never serialized (JSON responses identify records by doc_id
+	// instead), so the compact (non-verbose) response here is just the stored
+	// document; assert on its content rather than the external id.
+	if resp.StatusCode != http.StatusOK || !bytes.Contains(body, []byte("Harbor Health")) {
 		t.Fatalf("native fh search status=%d body=%s", resp.StatusCode, body)
 	}
 }
