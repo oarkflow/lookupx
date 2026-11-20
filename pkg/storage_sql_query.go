@@ -3,9 +3,11 @@ package pkg
 import (
 	"context"
 	"database/sql"
+	"database/sql/driver"
 	"errors"
 	"fmt"
 	"net"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -115,6 +117,98 @@ func (s SQLQuerySource) Open(ctx context.Context) (Cursor, error) {
 // database-specific syntax.
 type SQLPageFunc func(lastSeq uint64, limit int) (query string, args []any)
 
+const (
+	sqlPageAfterToken = "{{lookupx_after}}"
+	sqlPageLimitToken = "{{lookupx_limit}}"
+)
+
+func hasSQLPageTokens(query string) bool {
+	return strings.Contains(query, sqlPageAfterToken) || strings.Contains(query, sqlPageLimitToken)
+}
+
+func validateSQLPageTemplate(query, seqColumn string) error {
+	afterCount := strings.Count(query, sqlPageAfterToken)
+	limitCount := strings.Count(query, sqlPageLimitToken)
+	if afterCount != 1 || limitCount != 1 {
+		return fmt.Errorf("paged SQL template must contain %s and %s exactly once", sqlPageAfterToken, sqlPageLimitToken)
+	}
+	afterAt := strings.Index(query, sqlPageAfterToken)
+	predicate := strings.TrimRight(strings.TrimSpace(query[:afterAt]), "`\" ]")
+	if !strings.HasSuffix(predicate, ">") {
+		return fmt.Errorf("paged SQL template must compare seq_column %q with > %s", seqColumn, sqlPageAfterToken)
+	}
+	predicate = strings.TrimSpace(strings.TrimSuffix(predicate, ">"))
+	predicate = strings.NewReplacer("`", "", "\"", "", "[", "", "]", "").Replace(predicate)
+	wordStart := len(predicate)
+	for wordStart > 0 {
+		c := predicate[wordStart-1]
+		if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_' {
+			wordStart--
+			continue
+		}
+		break
+	}
+	if wordStart == len(predicate) || !strings.EqualFold(predicate[wordStart:], seqColumn) {
+		return fmt.Errorf("paged SQL template must apply %s to seq_column %q", sqlPageAfterToken, seqColumn)
+	}
+	limitAt := strings.Index(query, sqlPageLimitToken)
+	limitPrefix := strings.TrimSpace(query[:limitAt])
+	limitFields := strings.Fields(limitPrefix)
+	if len(limitFields) == 0 || !strings.EqualFold(limitFields[len(limitFields)-1], "LIMIT") {
+		return fmt.Errorf("paged SQL template must place %s after LIMIT", sqlPageLimitToken)
+	}
+	upper := strings.ToUpper(query)
+	orderAt := strings.LastIndex(upper, "ORDER BY")
+	if orderAt < 0 {
+		return errors.New("paged SQL template must order rows by seq_column ascending")
+	}
+	order := strings.TrimSpace(query[orderAt+len("ORDER BY"):])
+	order = strings.TrimLeft(order, " \t\r\n`\"[")
+	end := 0
+	for end < len(order) {
+		c := order[end]
+		if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_' {
+			end++
+			continue
+		}
+		break
+	}
+	if end == 0 || !strings.EqualFold(order[:end], seqColumn) {
+		return fmt.Errorf("paged SQL template must order first by seq_column %q", seqColumn)
+	}
+	order = strings.TrimSpace(order[end:])
+	order = strings.TrimLeft(order, "`\"]")
+	if len(order) > 0 {
+		direction := strings.Fields(order)[0]
+		if strings.EqualFold(direction, "DESC") {
+			return errors.New("paged SQL template must order seq_column ascending")
+		}
+		if strings.EqualFold(direction, "ASC") {
+			order = strings.TrimSpace(order[len(direction):])
+		}
+		if len(order) > 0 && order[0] != ',' && order[0] != ';' {
+			next := strings.ToUpper(strings.Fields(order)[0])
+			if next != "LIMIT" && next != "OFFSET" && next != "FETCH" && next != "FOR" {
+				return errors.New("paged SQL template has invalid ORDER BY clause after seq_column")
+			}
+		}
+	}
+	return nil
+}
+
+func buildSQLQueryPageForSource(base string, baseArgs []any, seqColumn, driver string, lastSeq uint64, limit int) (string, []any) {
+	if !hasSQLPageTokens(base) {
+		return buildSQLQueryPage(base, baseArgs, seqColumn, driver, lastSeq, limit)
+	}
+	// Both values are internally generated integers (the last parsed uint64 key
+	// and configured positive page size), so decimal substitution avoids
+	// positional-parameter ordering ambiguity with arguments in arbitrary SQL.
+	query := strings.Replace(base, sqlPageAfterToken, strconv.FormatUint(lastSeq, 10), 1)
+	query = strings.Replace(query, sqlPageLimitToken, strconv.Itoa(limit), 1)
+	args := append([]any(nil), baseArgs...)
+	return query, args
+}
+
 // PagedSQLQuerySource streams arbitrary SQL queries with keyset pagination.
 // Use this when the source rows come from joins/CTEs or when the pagination
 // predicate cannot be expressed by PagedSQLSource's Table/Where fields.
@@ -148,6 +242,13 @@ func (s PagedSQLQuerySource) Open(ctx context.Context) (Cursor, error) {
 	return &pagedSQLQueryCursor{src: s, last: s.StartAfter}, nil
 }
 
+// OpenAfter resumes keyset ingestion directly after seq, avoiding a scan over
+// rows that were already committed to the index before a process restart.
+func (s PagedSQLQuerySource) OpenAfter(ctx context.Context, seq uint64) (Cursor, error) {
+	s.StartAfter = seq
+	return s.Open(ctx)
+}
+
 type pagedSQLQueryCursor struct {
 	src  PagedSQLQuerySource
 	last uint64
@@ -159,6 +260,9 @@ type pagedSQLQueryCursor struct {
 func transientSQLError(err error) bool {
 	if err == nil {
 		return false
+	}
+	if errors.Is(err, sql.ErrConnDone) || errors.Is(err, driver.ErrBadConn) {
+		return true
 	}
 	var ne net.Error
 	if errors.As(err, &ne) {
@@ -172,13 +276,18 @@ func transientSQLError(err error) bool {
 		}
 	}
 	message := strings.ToLower(err.Error())
-	for _, marker := range []string{"connection reset", "broken pipe", "server has gone away", "lost connection", "i/o timeout", "unexpected eof", "bad connection", "connection refused"} {
+	for _, marker := range []string{"connection reset", "broken pipe", "server has gone away", "lost connection", "i/o timeout", "unexpected eof", "bad connection", "invalid connection", "connection is already closed", "connection refused", "error 2006", "error 2013", "error 2055"} {
 		if strings.Contains(message, marker) {
 			return true
 		}
 	}
 	return false
 }
+
+// IsTransientSQLError reports whether a failed SQL operation is likely to
+// succeed after reconnecting, using SQLState, network errors, and common driver
+// connection-failure messages.
+func IsTransientSQLError(err error) bool { return transientSQLError(err) }
 
 func retryPause(ctx context.Context, attempt int) error {
 	delay := time.Duration(1<<min(attempt, 5)) * 100 * time.Millisecond

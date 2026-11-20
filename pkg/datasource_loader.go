@@ -120,14 +120,20 @@ func BuildFromBCLConfig(ctx context.Context, cfg *LookupXConfig, registry *Datas
 	mgr := NewMultiIndexManager()
 	for _, idx := range cfg.Indexes {
 		ixCfg := idx.ToConfig()
+		// Registration creates an empty routing/schema index. Reserving the
+		// source's full capacity here permanently retains large unused columns
+		// even when disk partitions do all the actual serving.
+		seedConfig := ixCfg
+		seedConfig.InitialCapacity = 0
 		mi, err := mgr.Register(IndexDefinition{
 			ID:          idx.ID,
-			Config:      ixCfg,
+			Config:      seedConfig,
 			BulkOptions: idx.Bulk.ToBulkOptions(),
 		})
 		if err != nil {
 			return nil, fmt.Errorf("register index %q: %w", idx.ID, err)
 		}
+		mi.Config = ixCfg
 
 		if idx.DatasourceID != "" {
 			dsDef, ok := dsMap[idx.DatasourceID]

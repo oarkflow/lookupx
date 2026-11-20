@@ -284,17 +284,17 @@ func (ix *Index) SearchTermFast(fid FieldID, normalizedValue string, limit int, 
 	}
 	fi := sf.fi
 	if did, ok := fi.unique[normalizedValue]; ok && !ix.isDeletedOrExpiredLocked(did) {
-		return append(dst, Hit{ID: ix.docToExt[did], DocID: did, Score: 1})
+		return append(dst, Hit{ID: ix.externalID(did), DocID: did, Score: 1})
 	}
 	if did := fi.termOne[normalizedValue]; did != 0 && !ix.isDeletedOrExpiredLocked(did) {
-		return append(dst, Hit{ID: ix.docToExt[did], DocID: did, Score: 1})
+		return append(dst, Hit{ID: ix.externalID(did), DocID: did, Score: 1})
 	}
 	if b := fi.terms[normalizedValue]; b != nil {
 		b.Each(func(id DocID) bool {
 			if ix.isDeletedOrExpiredLocked(id) {
 				return true
 			}
-			dst = append(dst, Hit{ID: ix.docToExt[id], DocID: id, Score: 1})
+			dst = append(dst, Hit{ID: ix.externalID(id), DocID: id, Score: 1})
 			return limit <= 0 || len(dst) < limit
 		})
 	}

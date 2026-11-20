@@ -120,15 +120,65 @@ result must also include the configured `id_column`, which can differ from the
 numeric paging key. Use a source key backed by an RDS index; a computed ID such
 as `CONCAT(...)` is not a scalable paging key merely because it is unique.
 Paged reads retry transient connection failures from the last successfully
-read key. The paging key must be unique and strictly increasing; the database
-must support the `>` predicate and `ORDER BY` with an index, or every page may
-rescan the source. Without `seq_column`, LookupX streams one long-lived query;
-a connection loss fails that build because there is no safe position from
-which to resume. Table reloads without a key use offset pagination, which is
+read key. Disk-mode partition builds also retry transient SQL failures up to
+four times after the initial attempt, with bounded backoff. Paged sources resume
+from the last committed partition; unpaged sources restart their scan from the
+beginning on retry, so a long unpaged query may need to run again after a
+connection drop. When the source and index implement durable resume, restart can open
+the next keyset page directly after the checkpoint instead of rereading the
+source prefix. A checkpoint alone is not a complete backup: it must match the
+same committed index contents and source query. The paging key must be unique
+and strictly increasing; the database must support the `>` predicate and
+`ORDER BY` with an index, or every page may rescan the source. Without
+`seq_column`, LookupX streams one long-lived query; after transient retries are
+exhausted, a connection loss fails that build because there is no safe position
+from which to resume. Table reloads without a key use offset pagination, which is
 only appropriate for small, stable sources and becomes increasingly expensive
-as the offset grows. For billion-row imports, inspect the view's underlying
-tables and query plan, then expose an indexed stable key before enabling the
-build.
+as the offset grows. For billion-row imports, include an indexed, stable paging
+key in the provided SELECT and check its query plan. LookupX executes that SQL
+directly; it does not require view DDL or a particular view structure. A view
+can be queried like any other SELECT source. For joins, make sure the selected
+key remains unique after the join. Do not use a generated `ROW_NUMBER()` or
+computed hash as a substitute for an indexed source key.
+At startup, one `sql_indexing_notice` summarizes affected indexes. It is
+informational: indexing proceeds with the configured query, while the hint
+explains how to enable resumable keyset pages.
+
+When the query needs database-specific paging, put the keyset predicate in
+that same SQL query so the database can use the key's index directly:
+
+```bcl
+datasource "catalog" {
+  kind "sql_query"
+  driver "mysql"
+  dsn env("MYSQL_DSN")
+  id_column "record_id"
+  seq_column "source_id"
+  page_size 10000
+  query {
+    string "SELECT source_id, record_id, code, description FROM catalog_view WHERE source_id > {{lookupx_after}} ORDER BY source_id ASC LIMIT {{lookupx_limit}}"
+  }
+}
+```
+
+The query must return a unique, positive numeric `source_id`, keep both tokens
+exactly once, and order by the same key. Check the RDS `EXPLAIN` plan to confirm
+the filter and order use an index; batching cannot compensate for a full scan
+on every page.
+
+Disk-mode partition builds checkpoint only after a whole partition is saved.
+When a paged SQL source is configured, a restart validates the saved source and
+index fingerprint and requests rows strictly after that partition's last key;
+an incomplete partition is rebuilt. Use an immutable source snapshot or a fixed
+high-water mark for the duration of a build so inserts or updates behind the
+last key cannot be silently missed. The current Clear datasource configuration
+does not define `seq_column`, so it does not yet get this restart recovery.
+Build batches also flush at an estimated 16 MiB and partitions save at an
+estimated 128 MiB of source payload, in addition to their row-count limits.
+Tune these per-index in `bulk_settings` with `max_batch_bytes` and
+`max_partition_bytes` (plain byte counts). These thresholds help with unusually
+long descriptions but estimate input payload, not Go heap usage or token/posting
+expansion.
 
 ## Clear fulltext indexes from BCL
 
@@ -138,12 +188,12 @@ queries: `cpt`, `hcpcs`, `cpt-hm`, `dx-fac1`, `dx-fac3`, `dx-icd10`,
 local Clear database used by the Scala fulltext service. For another
 environment, set `MYSQL_DSN` to a MySQL DSN with read access to the Clear
 lookup views and charge-master tables. The server starts accepting requests
-before it scans the configured sources. With disk storage, it restores all
-available completed generations first, then rebuilds indexes in the
-background. During a first build, each indexed batch is immediately searchable
-while the index reports `reloading=true`; when rebuilding an existing populated
-index, searches continue against the prior generation until the replacement is
-complete. The database needs the Clear views, including the
+before it scans the configured sources. In disk mode, it serves the last
+published partition catalog and builds a replacement in the background. On a
+first build, completed partitions become searchable as they are saved. In
+memory mode, it restores a complete generation when available and then rebuilds
+in the background; batch visibility and memory use follow the in-memory index
+path. The database needs the Clear views, including the
 `vw_cpt_master.is_cpt` column exposed by the latest lookup-view migration.
 
 ```bash
@@ -264,7 +314,9 @@ the same date rule. The filters are combined before the lookup runs. By
 default, lookup and search responses contain only document records in `hits`,
 without a `doc` wrapper, score, or document ID. Add `verbose=true` to a GET
 lookup URL or set `"verbose": true` in a POST search body to include hit
-metadata, `total`, and `latency_ns`.
+metadata, `total`, and `latency_ns`. Non-verbose requests skip total-hit
+counting; add `skip_total: true` to a verbose POST request to omit the exact
+count as well.
 
 ```bash
 curl -H "X-API-Key: $LOOKUPX_API_KEY" 'localhost:8089/v1/indexes/cpt/lookup?term=10060&verbose=true'
@@ -1140,15 +1192,28 @@ _ = hits
 
 ## Large-index building: 100M / 1B row planning
 
-The partition builder bounds ingestion memory by partition size, but the current
-HTTP search service is not a billion-row-ready partitioned engine: persistent
-generations decode into Go memory, the HTTP routes do not search partition
-manifests, and per-partition BM25 scores are not globally calibrated. Treat the
-planner's partition count as an ingestion estimate, not a production-readiness
-guarantee. A production deployment at this scale needs indexed RDS keyset
-pagination and a query-serving design that can route/prune partitions or merge
-globally scored postings.
+With the default `LOOKUPX_STORAGE=disk`, configured indexes build as persisted
+partitions. Queries use the published catalog while a replacement builds in the
+background. New snapshots keep postings, numeric columns, and string payloads
+in a memory mapped file; query results copy only the returned records. A shared
+cache retains partition dictionaries and compact column offsets, with a default 256 MiB
+metadata budget (`LOOKUPX_PARTITION_CACHE_BYTES`, an integer byte count). At most
+two partition searches execute concurrently across all requests. Bloom summaries
+skip partitions that cannot satisfy supported exact terms and boolean filters;
+missing summaries conservatively search the partition. Catalogs are cached and
+atomic replacements are detected on the next request.
 
+The cache budget estimates retained Go metadata, not total RSS: mapped file pages,
+query workspaces, and one active build partition use additional memory. Closed
+indexes release their global metadata registration. Empty routing indexes reserve
+no source rows, and active build reservations are capped to the partition size. After all startup disk builds,
+a single collection returns unused build heap pages to the OS. There is no forced
+collection on the lookup path. `FH_MAX_HEAP_BYTES` is an HTTP admission guard;
+it does not cap RSS or background ingestion. A working set larger than the cache
+can still incur cold opens. Broad term queries must visit all possible partitions,
+and partition-local BM25 scores are not globally calibrated. Billion-row latency
+depends on data distribution and selectivity; it is not guaranteed by row count
+or a memory setting.
 The intended operating model for very large lookup indexes is:
 
 1. Stream rows from SQL with keyset pagination or CDC-style incremental queries.
@@ -1416,9 +1481,9 @@ budget := lookup.LowMemoryBillionBudget()
 src := lookup.StreamingDatasetSource{Rows: rows, Term: term, Group: work, DateKey: date_key, Partition: partition}
 stats, err := lookup.BuildPartitionedPersistent(ctx, src, lookup.PartitionedBuildOptions{
     IndexID: "dataset_a",
-    Store: lookup.FileMMapSegmentStore{Root: "./data"},
-    CatalogPath: "./data/dataset_a/partitions.json",
-    DatasetRoot: "./data",
+    Store: lookup.FileMMapSegmentStore{Root: "./data/indexes"},
+    CatalogPath: "./data/indexes/dataset_a/partitions.json",
+    DatasetRoot: "./data/indexes",
     Config: lookup.Config{Schema: lookup.TupleLookupSchema(), DisableSource: true},
     RowsPerPartition: uint64(budget.TargetRowsPerPartition),
     Bulk: budget.BulkOptions("dataset_a", nil, false),
@@ -1428,21 +1493,53 @@ stats, err := lookup.BuildPartitionedPersistent(ctx, src, lookup.PartitionedBuil
 ```
 
 When `CatalogPath` is set, each build writes partitions under a unique build ID
-and atomically replaces the catalog only after every partition is saved. A
-failed build leaves the previous catalog intact; its unreferenced new files can
-be removed later. The catalog is a consistent partition list for a serving
-layer, but LookupX's normal HTTP lookup route does not yet read this catalog.
+and atomically replaces the catalog after every partition is saved. On a first
+build, disk-mode startup publishes each completed partition so it can be queried
+while later partitions are still indexing. On replacement builds, the previous
+catalog stays active until the new build finishes. A failed build leaves the
+last published catalog usable; after the build/retry loop ends, LookupX removes
+partition directories that the published catalog does not reference. Put
+the catalog at `<LOOKUPX_DATA_DIR>/<index>/partitions.json`
+and set `DatasetRoot` to `LOOKUPX_DATA_DIR`. The regular search, lookup, and
+count routes use this catalog when no complete in-memory index is available.
+The serving path uses immutable generation leases: active searches pin their
+partition, idle cache entries can be evicted, and result strings are copied before
+unmapping. Latest-per-group date rules compare maxima across all candidate
+partitions before applying pagination. Exact-term summaries may prune files;
+fuzzy and other unsupported pruning shapes conservatively visit candidates.
+Field sorting, facets, and `after_doc_id` pagination remain unsupported by the
+partition serving route and return an explicit error.
 
-### Cold vs warm partition query latency
+New mapped snapshots deduplicate repeated string payloads within a partition.
+The uncompressed arrays are directly readable, so these files can be larger than
+the old gzip snapshots. Existing raw/gzip files remain readable through the legacy
+loader; rebuilding creates mapped snapshots. No external SQL changes are required
+for this format migration. Cold opens still allocate dictionary metadata and can
+be substantially slower than a warm lookup; the cache is bounded and does not
+preload every partition in a large dataset.
 
-`SearchPartitionedPersistent` is a low-memory cold path. It loads one persisted partition, searches it, closes it, then moves to the next partition. This avoids loading all partitions into RAM but includes disk decode/open cost.
+Immutable serving keeps four-byte offsets for stored strings and external IDs
+instead of a Go string header for every row. Existing mapped snapshots use this
+reader without a format conversion. This reduces retained heap and allows more
+partition dictionaries to remain in the same cache budget.
 
-For online low-latency serving, keep only the hot partition set loaded in `MultiIndexManager` or load the pruned partition selected by `group_id` / `date_key` / source. Warm loaded partition queries stay in the normal nanosecond/microsecond lookup path.
+An unfiltered lookup (no term or field filters) reads only the partitions needed
+for its page, in catalog order followed by live document order. New builds save
+an optional first-page preview (up to 128 records and 256 KiB per partition),
+so the default page can load without opening search dictionaries. Previews use a
+separate bounded 8 MiB cache. Deeper pages and older snapshots fall back to the
+required partitions. TTL-enabled indexes count currently visible records and
+do not use previews. Both GET lookup and POST search accept `offset`.
 
-The billion example now prints both:
+Measure synthetic partition serving with:
 
-- `cold_partitioned_query_partitions`: includes partition open/decode cost.
-- `warm_loaded_partition_query`: measures the actual lookup latency after a partition is loaded.
+```bash
+go test ./pkg -run '^$' -bench '^BenchmarkPartitionServing$' -benchmem
+```
+
+`/v1/metrics` reports Go heap usage and partition cache bytes, budget, entries,
+hits, and misses. Compare server query logs (execution latency) with curl's
+`time_total` (HTTP time); cold requests and ingestion should be measured separately.
 
 ## Generic core and apples-to-apples Lucene benchmark
 

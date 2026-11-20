@@ -498,8 +498,9 @@ func (ix *Index) domainWildcardBitmap(field, pattern string) *Bitmap {
 	r := NewBitmap()
 	ix.mu.RLock()
 	defer ix.mu.RUnlock()
-	for i, s := range ix.strings[field] {
+	for i := 0; i < ix.stringColumnLen(field); i++ {
 		id := DocID(i)
+		s, _ := ix.stringValue(field, id)
 		if id == 0 || s == "" {
 			continue
 		}

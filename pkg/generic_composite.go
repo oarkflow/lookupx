@@ -168,7 +168,7 @@ func (c *CompositeIndex) Search(ix *Index, values []string, limit int, dst []Hit
 		if ix.isDeletedOrExpiredLocked(id) {
 			return true
 		}
-		dst = append(dst, Hit{ID: ix.docToExt[id], DocID: id, Score: 1})
+		dst = append(dst, Hit{ID: ix.externalID(id), DocID: id, Score: 1})
 		return limit <= 0 || len(dst) < limit
 	})
 	return dst

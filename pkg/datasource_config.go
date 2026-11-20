@@ -116,11 +116,13 @@ type SchemaFieldDef struct {
 
 // BulkDef holds bulk ingestion parameters for an index.
 type BulkDef struct {
-	BatchSize       int    `bcl:"batch_size"        json:"batch_size,omitempty"`
-	CheckpointEvery int    `bcl:"checkpoint_every"  json:"checkpoint_every,omitempty"`
-	CheckpointPath  string `bcl:"checkpoint_path"   json:"checkpoint_path,omitempty"`
-	Resume          bool   `bcl:"resume"            json:"resume,omitempty"`
-	SkipBadRecords  bool   `bcl:"skip_bad_records"  json:"skip_bad_records,omitempty"`
+	BatchSize         int    `bcl:"batch_size"        json:"batch_size,omitempty"`
+	MaxBatchBytes     int64  `bcl:"max_batch_bytes"   json:"max_batch_bytes,omitempty"`
+	MaxPartitionBytes int64  `bcl:"max_partition_bytes" json:"max_partition_bytes,omitempty"`
+	CheckpointEvery   int    `bcl:"checkpoint_every"  json:"checkpoint_every,omitempty"`
+	CheckpointPath    string `bcl:"checkpoint_path"   json:"checkpoint_path,omitempty"`
+	Resume            bool   `bcl:"resume"            json:"resume,omitempty"`
+	SkipBadRecords    bool   `bcl:"skip_bad_records"  json:"skip_bad_records,omitempty"`
 }
 
 // ColumnDef maps a source column/field to an index field.
@@ -137,10 +139,12 @@ type ColumnDef struct {
 // ToBulkOptions converts BulkDef to the internal BulkOptions.
 func (b BulkDef) ToBulkOptions() BulkOptions {
 	opt := BulkOptions{
-		BatchSize:       b.BatchSize,
-		CheckpointEvery: b.CheckpointEvery,
-		Resume:          b.Resume,
-		SkipBadRecords:  b.SkipBadRecords,
+		BatchSize:         b.BatchSize,
+		MaxBatchBytes:     b.MaxBatchBytes,
+		MaxPartitionBytes: b.MaxPartitionBytes,
+		CheckpointEvery:   b.CheckpointEvery,
+		Resume:            b.Resume,
+		SkipBadRecords:    b.SkipBadRecords,
 	}
 	if opt.BatchSize <= 0 {
 		opt.BatchSize = 65536

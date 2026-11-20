@@ -5,16 +5,17 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
 	"time"
 )
 
-// FileMMapSegmentStore is a production-oriented file layout that separates
-// metadata from the binary payload and records checksums. The payload is still
-// decoded into the current in-memory engine on open, but the directory/manifest
-// structure is compatible with later mmap readers and object-store replication.
+// FileMMapSegmentStore writes mapped snapshots for partition serving. LoadIndex
+// returns a mutable heap copy for callers that need updates; the partition query
+// path maps posting and column arrays directly from immutable generation files.
+// Legacy gob/gzip snapshots remain readable.
 type FileMMapSegmentStore struct{ Root string }
 
 func (s FileMMapSegmentStore) dir(indexID string) string {
@@ -43,7 +44,7 @@ func (s FileMMapSegmentStore) SaveIndex(ctx context.Context, indexID string, ix 
 	if err != nil {
 		return PersistentManifest{}, err
 	}
-	if err = ix.encodePersistent(f); err == nil {
+	if err = ix.encodeMapped(f); err == nil {
 		err = f.Sync()
 		if err == nil {
 			err = f.Close()
@@ -57,19 +58,78 @@ func (s FileMMapSegmentStore) SaveIndex(ctx context.Context, indexID string, ix 
 	if err = os.Rename(payload+".tmp", payload); err != nil {
 		return PersistentManifest{}, err
 	}
+	if err := ix.writePartitionPreview(filepath.Join(genDir, "browse.gob"), gen); err != nil {
+		return PersistentManifest{}, err
+	}
 	checksum, _ := ChecksumFile(payload)
 	stats := ix.Stats()
 	genMan := IndexGeneration{IndexID: cleanIndexID(indexID), Generation: gen, CreatedAt: time.Now().UTC(), Docs: uint64(stats.Docs), LiveDocs: uint64(stats.LiveDocs), DeletedDocs: uint64(stats.DeletedDocs), Layout: LayoutMMapParts, Path: genDir, Checksum: checksum, Frozen: ix.IsFrozen()}
 	gb, _ := json.MarshalIndent(genMan, "", "  ")
-	if err := os.WriteFile(filepath.Join(genDir, "generation.json"), gb, 0644); err != nil {
+	if err := writeSyncedFile(filepath.Join(genDir, "generation.json"), gb, 0644); err != nil {
 		return PersistentManifest{}, err
 	}
 	man := PersistentManifest{IndexID: cleanIndexID(indexID), Generation: gen, CreatedAt: genMan.CreatedAt, Docs: uint64(stats.LiveDocs), Path: genDir, Frozen: genMan.Frozen, Format: string(LayoutMMapParts)}
+	man.Summary = ix.partitionSummary()
 	mb, _ := json.MarshalIndent(man, "", "  ")
-	if err := os.WriteFile(filepath.Join(genDir, "manifest.json"), mb, 0644); err != nil {
+	if err := writeSyncedFile(filepath.Join(genDir, "manifest.json"), mb, 0644); err != nil {
 		return PersistentManifest{}, err
 	}
-	return man, os.WriteFile(filepath.Join(base, "CURRENT"), []byte(genName), 0644)
+	// Persist the completed generation directory before publishing its pointer.
+	// A crash must leave the previous CURRENT usable, never a half-written one.
+	if err := syncDir(genDir); err != nil {
+		return PersistentManifest{}, err
+	}
+	if err := syncDir(base); err != nil {
+		return PersistentManifest{}, err
+	}
+	if err := replaceCurrentPointer(base, genName); err != nil {
+		return PersistentManifest{}, err
+	}
+	return man, syncDir(base)
+}
+
+func writeSyncedFile(path string, data []byte, mode os.FileMode) error {
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, mode)
+	if err != nil {
+		return err
+	}
+	if _, err := f.Write(data); err != nil {
+		_ = f.Close()
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		_ = f.Close()
+		return err
+	}
+	return f.Close()
+}
+
+func replaceCurrentPointer(base, generation string) error {
+	tmp, err := os.CreateTemp(base, ".CURRENT-*.tmp")
+	if err != nil {
+		return err
+	}
+	tmpPath := tmp.Name()
+	defer os.Remove(tmpPath)
+	if err := tmp.Chmod(0644); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if _, err := tmp.WriteString(generation); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(tmpPath, filepath.Join(base, "CURRENT")); err != nil {
+		return err
+	}
+	return nil
 }
 
 func (s FileMMapSegmentStore) LoadIndex(ctx context.Context, indexID string, cfg Config) (*Index, PersistentManifest, error) {
@@ -93,12 +153,24 @@ func (s FileMMapSegmentStore) LoadIndex(ctx context.Context, indexID string, cfg
 	}
 	defer f.Close()
 	var dump persistentDump
-	if err = decodePersistent(f, &dump); err != nil {
+	magic := make([]byte, len(mappedMagic))
+	_, _ = f.ReadAt(magic, 0)
+	if isMappedMagic(string(magic)) {
+		var data []byte
+		data, err = io.ReadAll(f)
+		if err == nil {
+			err = decodeMapped(data, &dump, false)
+		}
+	} else {
+		err = decodePersistent(f, &dump)
+	}
+	if err != nil {
 		return nil, man, err
 	}
 	if cfg.Schema.Fields != nil {
 		dump.Config.Schema = cfg.Schema
 	}
+	dump.Config.InitialCapacity = 0
 	ix, err := New(dump.Config)
 	if err != nil {
 		return nil, man, err

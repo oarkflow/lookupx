@@ -41,7 +41,7 @@ func (ix *Index) Each(q Query, fn func(id string, docID DocID) bool) {
 		if ix.isDeletedOrExpiredLocked(id) {
 			return true
 		}
-		return fn(ix.docToExt[id], id)
+		return fn(ix.externalID(id), id)
 	})
 }
 func (ix *Index) Collect(q Query, dst []string) []string {
@@ -119,7 +119,7 @@ func (ix *Index) searchIntoFast(req SearchRequest, dst []Hit) (Result, []Hit) {
 			if ix.isDeletedOrExpiredLocked(id) {
 				return true
 			}
-			dst = append(dst, Hit{ID: ix.docToExt[id], DocID: id, Score: 1})
+			dst = append(dst, Hit{ID: ix.externalID(id), DocID: id, Score: 1})
 			return len(dst) < req.Limit
 		})
 		ix.mu.RUnlock()
@@ -168,7 +168,7 @@ func (ix *Index) searchBitmapIntoFast(bm *Bitmap, req SearchRequest, dst []Hit, 
 	ix.mu.RLock()
 	defer ix.mu.RUnlock()
 	total := -1
-	if !req.SkipTotal || req.AfterDocID == 0 {
+	if !req.SkipTotal {
 		total = ix.countLiveLocked(bm)
 	}
 	bm.Each(func(id DocID) bool {
@@ -182,7 +182,7 @@ func (ix *Index) searchBitmapIntoFast(bm *Bitmap, req SearchRequest, dst []Hit, 
 		if len(dst) >= req.Limit {
 			return false
 		}
-		dst = append(dst, Hit{ID: ix.docToExt[id], DocID: id, Score: 1})
+		dst = append(dst, Hit{ID: ix.externalID(id), DocID: id, Score: 1})
 		return len(dst) < req.Limit
 	})
 	return Result{Total: total, Hits: dst, Took: ix.elapsed(start)}, dst
@@ -191,6 +191,9 @@ func (ix *Index) searchBitmapIntoFast(bm *Bitmap, req SearchRequest, dst []Hit, 
 func (ix *Index) searchTermIntoFast(q Term, req SearchRequest, dst []Hit, start int64) (Result, []Hit) {
 	dst = dst[:0]
 	total, skipped := 0, 0
+	if req.SkipTotal {
+		total = -1
+	}
 	ix.mu.RLock()
 	defer ix.mu.RUnlock()
 	opt := ix.cfg.Schema.Fields[q.Field]
@@ -200,16 +203,20 @@ func (ix *Index) searchTermIntoFast(q Term, req SearchRequest, dst []Hit, start 
 	}
 	val := normalizeSpecialString(q.Field, q.Value, opt.Lowercase)
 	if did, ok := fi.unique[val]; ok && (!ix.hasTTL && !ix.hasDeletes || !ix.isDeletedOrExpiredLocked(did)) {
-		total = 1
+		if !req.SkipTotal {
+			total = 1
+		}
 		if req.Offset == 0 && req.Limit > 0 {
-			dst = append(dst, Hit{ID: ix.docToExt[did], DocID: did, Score: 1})
+			dst = append(dst, Hit{ID: ix.externalID(did), DocID: did, Score: 1})
 		}
 		return Result{Total: total, Hits: dst, Took: ix.elapsed(start)}, dst
 	}
 	if did := fi.termOne[val]; did != 0 && (!ix.hasTTL && !ix.hasDeletes || !ix.isDeletedOrExpiredLocked(did)) {
-		total = 1
+		if !req.SkipTotal {
+			total = 1
+		}
 		if skipped >= req.Offset && len(dst) < req.Limit {
-			dst = append(dst, Hit{ID: ix.docToExt[did], DocID: did, Score: 1})
+			dst = append(dst, Hit{ID: ix.externalID(did), DocID: did, Score: 1})
 		}
 		return Result{Total: total, Hits: dst, Took: ix.elapsed(start)}, dst
 	}
@@ -218,7 +225,9 @@ func (ix *Index) searchTermIntoFast(q Term, req SearchRequest, dst []Hit, start 
 			if ix.isDeletedOrExpiredLocked(id) {
 				return true
 			}
-			total++
+			if !req.SkipTotal {
+				total++
+			}
 			if skipped < req.Offset {
 				skipped++
 				return true
@@ -226,7 +235,7 @@ func (ix *Index) searchTermIntoFast(q Term, req SearchRequest, dst []Hit, start 
 			if len(dst) >= req.Limit {
 				return false
 			}
-			dst = append(dst, Hit{ID: ix.docToExt[id], DocID: id, Score: 1})
+			dst = append(dst, Hit{ID: ix.externalID(id), DocID: id, Score: 1})
 			return true
 		})
 	}
@@ -274,6 +283,9 @@ func (ix *Index) CountTerm(field, value string) int {
 func (ix *Index) searchTermsIntoFast(q Terms, req SearchRequest, dst []Hit, start int64) (Result, []Hit) {
 	dst = dst[:0]
 	total, skipped := 0, 0
+	if req.SkipTotal {
+		total = -1
+	}
 	ix.mu.RLock()
 	defer ix.mu.RUnlock()
 	sf, ok := ix.fieldByNameLocked(q.Field)
@@ -283,24 +295,28 @@ func (ix *Index) searchTermsIntoFast(q Terms, req SearchRequest, dst []Hit, star
 	for _, raw := range q.Values {
 		val := normalizeStringByKind(sf.special, raw, sf.opt.Lowercase)
 		if did, ok := sf.fi.unique[val]; ok && !ix.isDeletedOrExpiredLocked(did) {
-			total++
+			if !req.SkipTotal {
+				total++
+			}
 			if skipped < req.Offset {
 				skipped++
 				continue
 			}
 			if len(dst) < req.Limit {
-				dst = append(dst, Hit{ID: ix.docToExt[did], DocID: did, Score: 1})
+				dst = append(dst, Hit{ID: ix.externalID(did), DocID: did, Score: 1})
 			}
 			continue
 		}
 		if did := sf.fi.termOne[val]; did != 0 && !ix.isDeletedOrExpiredLocked(did) {
-			total++
+			if !req.SkipTotal {
+				total++
+			}
 			if skipped < req.Offset {
 				skipped++
 				continue
 			}
 			if len(dst) < req.Limit {
-				dst = append(dst, Hit{ID: ix.docToExt[did], DocID: did, Score: 1})
+				dst = append(dst, Hit{ID: ix.externalID(did), DocID: did, Score: 1})
 			}
 			continue
 		}
@@ -309,7 +325,9 @@ func (ix *Index) searchTermsIntoFast(q Terms, req SearchRequest, dst []Hit, star
 				if ix.isDeletedOrExpiredLocked(id) {
 					return true
 				}
-				total++
+				if !req.SkipTotal {
+					total++
+				}
 				if skipped < req.Offset {
 					skipped++
 					return true
@@ -317,7 +335,7 @@ func (ix *Index) searchTermsIntoFast(q Terms, req SearchRequest, dst []Hit, star
 				if len(dst) >= req.Limit {
 					return false
 				}
-				dst = append(dst, Hit{ID: ix.docToExt[id], DocID: id, Score: 1})
+				dst = append(dst, Hit{ID: ix.externalID(id), DocID: id, Score: 1})
 				return true
 			})
 		}
@@ -331,6 +349,9 @@ func (ix *Index) searchTermsIntoFast(q Terms, req SearchRequest, dst []Hit, star
 func (ix *Index) searchRangeIntoFast(q Range, req SearchRequest, dst []Hit, start int64) (Result, []Hit) {
 	dst = dst[:0]
 	total, skipped := 0, 0
+	if req.SkipTotal {
+		total = -1
+	}
 	ix.mu.Lock()
 	defer ix.mu.Unlock()
 	if ix.numericExists[q.Field] == nil {
@@ -363,7 +384,9 @@ func (ix *Index) searchRangeIntoFast(q Range, req SearchRequest, dst []Hit, star
 		if ix.isDeletedOrExpiredLocked(p.id) {
 			continue
 		}
-		total++
+		if !req.SkipTotal {
+			total++
+		}
 		if skipped < req.Offset {
 			skipped++
 			continue
@@ -371,7 +394,7 @@ func (ix *Index) searchRangeIntoFast(q Range, req SearchRequest, dst []Hit, star
 		if len(dst) >= req.Limit {
 			break
 		}
-		dst = append(dst, Hit{ID: ix.docToExt[p.id], DocID: p.id, Score: 1})
+		dst = append(dst, Hit{ID: ix.externalID(p.id), DocID: p.id, Score: 1})
 	}
 	return Result{Total: total, Hits: dst, Took: ix.elapsed(start)}, dst
 }
@@ -418,6 +441,9 @@ func (ix *Index) searchBoolIntoFast(q Bool, req SearchRequest, dst []Hit, start 
 	}
 	dst = dst[:0]
 	total, skipped := 0, 0
+	if req.SkipTotal {
+		total = -1
+	}
 	ix.mu.RLock()
 	defer ix.mu.RUnlock()
 	msf, ok := ix.fieldByNameLocked(mt.Field)
@@ -470,7 +496,9 @@ func (ix *Index) searchBoolIntoFast(q Bool, req SearchRequest, dst []Hit, start 
 		if nsf != nil && ix.termHasLocked(nsf.fi, nval, id) {
 			return true
 		}
-		total++
+		if !req.SkipTotal {
+			total++
+		}
 		if skipped < req.Offset {
 			skipped++
 			return true
@@ -478,7 +506,7 @@ func (ix *Index) searchBoolIntoFast(q Bool, req SearchRequest, dst []Hit, start 
 		if len(dst) >= req.Limit {
 			return false
 		}
-		dst = append(dst, Hit{ID: ix.docToExt[id], DocID: id, Score: 1})
+		dst = append(dst, Hit{ID: ix.externalID(id), DocID: id, Score: 1})
 		return true
 	}
 	if did, ok := msf.fi.unique[mval]; ok {
@@ -526,6 +554,9 @@ func (ix *Index) searchContainsIntoFast(q Contains, req SearchRequest, dst []Hit
 func (ix *Index) searchFuzzyIntoFast(q Fuzzy, req SearchRequest, dst []Hit, start int64) (Result, []Hit) {
 	dst = dst[:0]
 	total, skipped := 0, 0
+	if req.SkipTotal {
+		total = -1
+	}
 	ix.mu.RLock()
 	defer ix.mu.RUnlock()
 	sf, ok := ix.fieldByNameLocked(q.Field)
@@ -553,7 +584,9 @@ func (ix *Index) searchFuzzyIntoFast(q Fuzzy, req SearchRequest, dst []Hit, star
 			if ix.isDeletedOrExpiredLocked(id) {
 				return true
 			}
-			total++
+			if !req.SkipTotal {
+				total++
+			}
 			if skipped < req.Offset {
 				skipped++
 				return true
@@ -561,7 +594,7 @@ func (ix *Index) searchFuzzyIntoFast(q Fuzzy, req SearchRequest, dst []Hit, star
 			if len(dst) >= req.Limit {
 				return false
 			}
-			dst = append(dst, Hit{ID: ix.docToExt[id], DocID: id, Score: 1})
+			dst = append(dst, Hit{ID: ix.externalID(id), DocID: id, Score: 1})
 			return true
 		}
 		if did := sf.fi.termOne[term]; did != 0 {
@@ -590,6 +623,9 @@ func (ix *Index) searchCIDRIntoFast(q CIDR, req SearchRequest, dst []Hit, start 
 	lo := base & mask
 	hi := lo | ^mask
 	total, skipped := 0, 0
+	if req.SkipTotal {
+		total = -1
+	}
 	ix.mu.Lock()
 	defer ix.mu.Unlock()
 	pairs := ix.sortedIPv4Locked(q.Field)
@@ -599,7 +635,9 @@ func (ix *Index) searchCIDRIntoFast(q CIDR, req SearchRequest, dst []Hit, start 
 		if ix.isDeletedOrExpiredLocked(p.id) {
 			continue
 		}
-		total++
+		if !req.SkipTotal {
+			total++
+		}
 		if skipped < req.Offset {
 			skipped++
 			continue
@@ -607,17 +645,22 @@ func (ix *Index) searchCIDRIntoFast(q CIDR, req SearchRequest, dst []Hit, start 
 		if len(dst) >= req.Limit {
 			break
 		}
-		dst = append(dst, Hit{ID: ix.docToExt[p.id], DocID: p.id, Score: 1})
+		dst = append(dst, Hit{ID: ix.externalID(p.id), DocID: p.id, Score: 1})
 	}
 	return Result{Total: total, Hits: dst, Took: ix.elapsed(start)}, dst
 }
 
 func (ix *Index) collectPostingLocked(m map[string]*Bitmap, one map[string]DocID, term string, req SearchRequest, dst []Hit, start int64) (Result, []Hit) {
 	total, skipped := 0, 0
+	if req.SkipTotal {
+		total = -1
+	}
 	if did := one[term]; did != 0 && !ix.isDeletedOrExpiredLocked(did) {
-		total = 1
+		if !req.SkipTotal {
+			total = 1
+		}
 		if req.Offset == 0 && req.Limit > 0 {
-			dst = append(dst, Hit{ID: ix.docToExt[did], DocID: did, Score: 1})
+			dst = append(dst, Hit{ID: ix.externalID(did), DocID: did, Score: 1})
 		}
 		return Result{Total: total, Hits: dst, Took: ix.elapsed(start)}, dst
 	}
@@ -626,7 +669,9 @@ func (ix *Index) collectPostingLocked(m map[string]*Bitmap, one map[string]DocID
 			if ix.isDeletedOrExpiredLocked(id) {
 				return true
 			}
-			total++
+			if !req.SkipTotal {
+				total++
+			}
 			if skipped < req.Offset {
 				skipped++
 				return true
@@ -634,7 +679,7 @@ func (ix *Index) collectPostingLocked(m map[string]*Bitmap, one map[string]DocID
 			if len(dst) >= req.Limit {
 				return false
 			}
-			dst = append(dst, Hit{ID: ix.docToExt[id], DocID: id, Score: 1})
+			dst = append(dst, Hit{ID: ix.externalID(id), DocID: id, Score: 1})
 			return true
 		})
 	}
@@ -786,7 +831,7 @@ func (ix *Index) searchVectorIntoFast(q VectorQuery, req SearchRequest, dst []Hi
 		to = len(top)
 	}
 	for _, p := range top[from:to] {
-		dst = append(dst, Hit{ID: ix.docToExt[p.id], DocID: p.id, Score: p.score})
+		dst = append(dst, Hit{ID: ix.externalID(p.id), DocID: p.id, Score: p.score})
 	}
 	return Result{Total: len(top), Hits: dst, Took: ix.elapsed(start)}, dst
 }

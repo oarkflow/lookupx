@@ -2,7 +2,10 @@ package pkg
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -97,13 +100,46 @@ func (d *SQLTableDatasource) Validate() error {
 }
 
 func (d *SQLTableDatasource) Open(ctx context.Context) (Cursor, error) {
+	return d.open(ctx, 0)
+}
+
+// OpenAfter resumes a table source after its separate numeric order/sequence
+// key. A document ID used directly as the order key may be textual, so it is
+// not accepted as a durable numeric resume cursor.
+func (d *SQLTableDatasource) OpenAfter(ctx context.Context, seq uint64) (Cursor, error) {
+	if d.src.OrderColumn == "" || d.src.OrderColumn == d.src.IDColumn || d.src.SeqColumn != d.src.OrderColumn {
+		return nil, errors.New("sql_table: restart resume requires a separate numeric order_column matching seq_column")
+	}
+	return d.open(ctx, seq)
+}
+
+func (d *SQLTableDatasource) ResumeIdentity() string {
+	if d.src.OrderColumn == "" || d.src.OrderColumn == d.src.IDColumn || d.src.SeqColumn != d.src.OrderColumn {
+		return ""
+	}
+	identity, err := json.Marshal(struct {
+		ID, Driver, DSN, Table, Where, OrderColumn, IDColumn, SeqColumn string
+		PageSize                                                        int
+		Columns                                                         []string
+		Bindings                                                        []SQLColumn
+	}{d.id, d.driver, d.dsn, d.src.Table, d.src.Where, d.src.OrderColumn, d.src.IDColumn, d.src.SeqColumn, d.src.PageSize, d.src.Columns, d.src.ColumnBindings})
+	if err != nil {
+		return ""
+	}
+	sum := sha256.Sum256(identity)
+	return hex.EncodeToString(sum[:])
+}
+
+func (d *SQLTableDatasource) open(ctx context.Context, startAfter uint64) (Cursor, error) {
 	db, err := squealx.Connect(squealxDriver(d.driver), d.dsn, "")
 	if err != nil {
 		return nil, fmt.Errorf("sql_table %s: open: %w", d.id, err)
 	}
 	configureBulkSQLPool(db.DB())
-	d.src.DB = db.DB()
-	cur, err := d.src.Open(ctx)
+	source := d.src
+	source.DB = db.DB()
+	source.StartAfter = startAfter
+	cur, err := source.Open(ctx)
 	if err != nil {
 		db.Close()
 		return nil, fmt.Errorf("sql_table %s: open cursor: %w", d.id, err)
@@ -439,25 +475,66 @@ func (d *SQLQueryDatasource) Validate() error {
 	if d.pageSize > 0 && !validSQLIdentifier(d.src.SeqColumn) {
 		return fmt.Errorf("sql_query: seq_column %q must be a simple SELECT output identifier for keyset paging", d.src.SeqColumn)
 	}
+	if d.pageSize > 0 && hasSQLPageTokens(d.src.Query) {
+		if err := validateSQLPageTemplate(d.src.Query, d.src.SeqColumn); err != nil {
+			return fmt.Errorf("sql_query: %w", err)
+		}
+	}
 	return nil
 }
 
 func (d *SQLQueryDatasource) Open(ctx context.Context) (Cursor, error) {
+	return d.open(ctx, 0)
+}
+
+// OpenAfter resumes a configured keyset-paged query after the last committed
+// sequence. Unpaged SQL queries cannot safely resume after a process restart.
+func (d *SQLQueryDatasource) OpenAfter(ctx context.Context, seq uint64) (Cursor, error) {
+	if d.pageSize <= 0 {
+		return nil, errors.New("sql_query: restart resume requires seq_column and page_size")
+	}
+	return d.open(ctx, seq)
+}
+
+// ResumeIdentity fingerprints the paged SQL source without persisting its DSN
+// or query arguments in the checkpoint file.
+func (d *SQLQueryDatasource) ResumeIdentity() string {
+	if d.pageSize <= 0 || strings.TrimSpace(d.src.SeqColumn) == "" {
+		return ""
+	}
+	identity, err := json.Marshal(struct {
+		ID, Driver, DSN, Query, IDColumn, SeqColumn string
+		PageSize                                    int
+		Args                                        []any
+	}{d.id, d.driver, d.dsn, d.src.Query, d.src.IDColumn, d.src.SeqColumn, d.pageSize, d.src.Args})
+	if err != nil {
+		return ""
+	}
+	sum := sha256.Sum256(identity)
+	return hex.EncodeToString(sum[:])
+}
+
+func (d *SQLQueryDatasource) open(ctx context.Context, startAfter uint64) (Cursor, error) {
 	db, err := squealx.Connect(squealxDriver(d.driver), d.dsn, "")
 	if err != nil {
 		return nil, fmt.Errorf("sql_query %s: open: %w", d.id, err)
 	}
-	d.src.DB = db.DB()
-	configureBulkSQLPool(d.src.DB)
+	source := d.src
+	source.DB = db.DB()
+	configureBulkSQLPool(source.DB)
 	var cur Cursor
 	if d.pageSize > 0 {
-		baseQuery := strings.TrimSpace(strings.TrimSuffix(strings.TrimSpace(d.src.Query), ";"))
+		baseQuery := strings.TrimSpace(strings.TrimSuffix(strings.TrimSpace(source.Query), ";"))
 		page := func(lastSeq uint64, limit int) (string, []any) {
-			return buildSQLQueryPage(baseQuery, d.src.Args, d.src.SeqColumn, d.driver, lastSeq, limit)
+			return buildSQLQueryPageForSource(baseQuery, source.Args, source.SeqColumn, d.driver, lastSeq, limit)
 		}
-		cur, err = (PagedSQLQuerySource{DB: d.src.DB, Page: page, IDColumn: d.src.IDColumn, SeqColumn: d.src.SeqColumn, Columns: d.src.Columns, PageSize: d.pageSize}).Open(ctx)
+		cur, err = (PagedSQLQuerySource{DB: source.DB, Page: page, IDColumn: source.IDColumn, SeqColumn: source.SeqColumn, Columns: source.Columns, PageSize: d.pageSize, StartAfter: startAfter}).Open(ctx)
 	} else {
-		cur, err = d.src.Open(ctx)
+		if startAfter > 0 {
+			db.Close()
+			return nil, errors.New("sql_query: restart resume requires seq_column and page_size")
+		}
+		cur, err = source.Open(ctx)
 	}
 	if err != nil {
 		db.Close()

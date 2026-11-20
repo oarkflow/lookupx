@@ -8,6 +8,9 @@ import (
 	"log"
 	"net"
 	"os"
+	"path/filepath"
+	"runtime"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"time"
@@ -104,7 +107,7 @@ func serveCmd(args []string) {
 	apiKey := fs.String("api-key", getenv("LOOKUPX_API_KEY", ""), "optional API key")
 	webDir := fs.String("web", getenv("LOOKUPX_WEB_DIR", ""), "serve frontend files from this directory (default: ./web)")
 	dataDir := fs.String("data", getenv("LOOKUPX_DATA_DIR", "./data/indexes"), "persistent index directory")
-	storage := fs.String("storage", getenv("LOOKUPX_STORAGE", "memory"), "index storage: memory or disk")
+	storage := fs.String("storage", getenv("LOOKUPX_STORAGE", "disk"), "index storage: disk (partitioned low-memory) or memory")
 	adminUser := getenv("LOOKUPX_ADMIN_USERNAME", "")
 	adminPassword := getenv("LOOKUPX_ADMIN_PASSWORD", "")
 	adminUser = strings.TrimSpace(adminUser)
@@ -126,6 +129,14 @@ func serveCmd(args []string) {
 	}
 	if len(sessionSecret) < 32 {
 		log.Fatal("LOOKUPX_SESSION_SECRET must contain at least 32 characters in .env")
+	}
+
+	cacheBytes, err := strconv.ParseInt(getenv("LOOKUPX_PARTITION_CACHE_BYTES", "268435456"), 10, 64)
+	if err != nil {
+		log.Fatalf("LOOKUPX_PARTITION_CACHE_BYTES must be a nonnegative integer byte count: %v", err)
+	}
+	if err := lookup.ConfigurePartitionCache(cacheBytes); err != nil {
+		log.Fatal(err)
 	}
 
 	ctx, cancelStartup := context.WithCancel(context.Background())
@@ -219,7 +230,16 @@ func waitForListener(addr string, listenResult <-chan error, timeout time.Durati
 }
 
 func warmConfiguredIndexes(ctx context.Context, mgr *lookup.MultiIndexManager, cfg *lookup.LookupXConfig, storage, dataDir string) {
-	store := lookup.FileSegmentStore{Root: dataDir}
+	if storage == "disk" {
+		defer func() {
+			// Once ingestion is idle, return its temporary heap pages to the OS.
+			// This runs once after startup builds, never per partition or request.
+			debug.FreeOSMemory()
+			var memory runtime.MemStats
+			runtime.ReadMemStats(&memory)
+			lookup.LogKV("index_startup_complete", "indexes", len(cfg.Indexes), "heap_bytes", memory.HeapAlloc, "heap_released_bytes", memory.HeapReleased)
+		}()
+	}
 	indexes := mgr.List()
 	indexConfigs := make(map[string]lookup.Config, len(cfg.Indexes))
 	datasources := make(map[string]lookup.DatasourceDef, len(cfg.Datasources))
@@ -229,17 +249,25 @@ func warmConfiguredIndexes(ctx context.Context, mgr *lookup.MultiIndexManager, c
 	for _, ds := range cfg.Datasources {
 		datasources[ds.ID] = ds
 	}
+	unpagedSQLIndexes := make([]string, 0)
 	for _, index := range cfg.Indexes {
 		ds, ok := datasources[index.DatasourceID]
 		if ok && strings.EqualFold(ds.Kind, "sql_query") && strings.TrimSpace(ds.SeqColumn) == "" {
-			lookup.LogKV("index_load_mode_warning", "index", index.ID, "datasource", ds.ID, "reason", "SQL query source is unpaged and streams one long-lived query; a connection drop fails this build. Configure seq_column and page_size with a stable, unique, indexed numeric query output to enable resumable keyset pages")
+			unpagedSQLIndexes = append(unpagedSQLIndexes, index.ID)
 		}
 	}
+	if len(unpagedSQLIndexes) > 0 {
+		lookup.LogKV("sql_indexing_notice",
+			"status", "indexing continues",
+			"indexes", strings.Join(unpagedSQLIndexes, ","),
+			"reason", "these SQL datasources do not configure seq_column",
+			"behavior", "LookupX streams each SELECT as written. If RDS disconnects, it retries from row 1; after four retries, that index build stops.",
+			"hint", "Return a unique, increasing numeric key in the SELECT, then set seq_column and page_size in that datasource.",
+			"custom_sql_hint", "For expensive SQL, page the SELECT with key > {{lookupx_after}} ORDER BY key ASC LIMIT {{lookupx_limit}}.")
+	}
 
-	// Restore all completed generations before starting any source scan. This
-	// lets every previously-built index serve while potentially long RDS scans
-	// run in the background.
-	if storage == "disk" {
+	if storage == "memory" {
+		store := lookup.FileSegmentStore{Root: dataDir}
 		for _, info := range indexes {
 			if ctx.Err() != nil {
 				return
@@ -248,7 +276,7 @@ func warmConfiguredIndexes(ctx context.Context, mgr *lookup.MultiIndexManager, c
 			if err := mgr.RestorePersistentIndex(ctx, store, info.ID, indexConfigs[info.ID]); err == nil {
 				ready, _ := mgr.Managed(info.ID)
 				if ready != nil {
-					lookup.LogKV("index_ready", "index", info.ID, "state", "restored", "storage", "disk", "generation", ready.Generation, "docs", ready.Index.Stats().Docs, "elapsed", time.Since(started))
+					lookup.LogKV("index_ready", "index", info.ID, "state", "restored", "storage", "memory", "generation", ready.Generation, "docs", ready.Index.Stats().Docs, "elapsed", time.Since(started))
 				}
 			} else if !os.IsNotExist(err) && ctx.Err() == nil {
 				lookup.LogKV("index_restore_failed", "index", info.ID, "error", err)
@@ -256,12 +284,107 @@ func warmConfiguredIndexes(ctx context.Context, mgr *lookup.MultiIndexManager, c
 		}
 	}
 
+	// Disk mode uses partition catalogs so a large source is not accumulated in
+	// one in-memory Index. Keep the regular persistent restore path for memory
+	// mode, where a complete in-memory index is intentional.
 	for _, info := range indexes {
 		if ctx.Err() != nil {
 			return
 		}
 		started := time.Now()
 		lookup.LogKV("index_load_started", "index", info.ID, "storage", storage, "background", true)
+		if storage == "disk" {
+			managed, ok := mgr.Managed(info.ID)
+			if !ok || managed.Source == nil {
+				lookup.LogKV("index_load_failed", "index", info.ID, "error", "index has no configured source")
+				continue
+			}
+			schemaConfig := managed.Config
+			schemaConfig.InitialCapacity = 0
+			ix, err := lookup.New(schemaConfig)
+			if err != nil {
+				lookup.LogKV("index_load_failed", "index", info.ID, "error", err)
+				continue
+			}
+			src, err := managed.Source(ix)
+			if err != nil {
+				_ = ix.Close()
+				lookup.LogKV("index_load_failed", "index", info.ID, "error", err)
+				continue
+			}
+			// The datasource now has resolved FieldIDs. Release this temporary
+			// schema index before the builder allocates its first partition.
+			_ = ix.Close()
+			bulk := managed.Bulk
+			if bulk.BatchSize <= 0 {
+				bulk.BatchSize = lookup.LowMemoryBillionBudget().DefaultBatchSize
+			}
+			mgr.SetBuildProgress(info.ID, lookup.BulkProgress{SourceName: info.ID, StartedAt: started}, true, "")
+			stopProgress := startIndexProgress(ctx, mgr, info.ID)
+			catalogPath := filepath.Join(dataDir, managed.ID, "partitions.json")
+			catalog, catalogErr := lookup.LoadPartitionDataset(catalogPath)
+			publishProgress := os.IsNotExist(catalogErr)
+			if catalogErr == nil && !catalog.Complete && catalog.Fingerprint != "" {
+				progress, progressErr := lookup.LoadPartitionDataset(catalogPath + ".progress.json")
+				publishProgress = progressErr == nil && progress.BuildID == catalog.BuildID && progress.Fingerprint == catalog.Fingerprint
+			}
+			_, hasResumeIdentity := src.(lookup.SourceIdentity)
+			_, supportsResume := src.(lookup.ResumableSource)
+			if hasResumeIdentity && supportsResume {
+				if identity, ok := src.(lookup.SourceIdentity); ok && identity.ResumeIdentity() != "" {
+					bulk.Resume = true
+				}
+			}
+			partitionOptions := lookup.PartitionedBuildOptions{
+				IndexID: info.ID, Store: lookup.FileMMapSegmentStore{Root: dataDir},
+				CatalogPath: catalogPath, DatasetRoot: dataDir, PublishProgress: publishProgress,
+				Config: managed.Config, RowsPerPartition: uint64(lookup.LowMemoryBillionBudget().TargetRowsPerPartition),
+				Bulk: bulk, Freeze: true,
+				Progress: func(p lookup.PartitionedBuildProgress) {
+					mgr.SetBuildProgress(info.ID, lookup.BulkProgress{SourceName: info.ID, Seen: p.Seen, Indexed: p.Indexed, Skipped: p.Skipped, LastSeq: p.LastSeq, Partition: p.PartitionNo + 1, Partitions: p.Partitions, CurrentPartitionRows: p.CurrentRows, StartedAt: started, Took: p.Took}, true, "")
+				},
+			}
+			var stats lookup.PartitionedBuildStats
+			for attempt := 1; ; attempt++ {
+				stats, err = lookup.BuildPartitionedPersistent(ctx, src, partitionOptions)
+				if err == nil || !lookup.IsTransientSQLError(err) || attempt >= 5 || ctx.Err() != nil {
+					break
+				}
+				delay := time.Duration(1<<min(attempt-1, 4)) * time.Second
+				lookup.LogKV("index_source_retry", "index", info.ID, "attempt", attempt+1, "max_attempts", 5, "delay", delay, "error", err)
+				timer := time.NewTimer(delay)
+				select {
+				case <-ctx.Done():
+					if !timer.Stop() {
+						select {
+						case <-timer.C:
+						default:
+						}
+					}
+					err = ctx.Err()
+				case <-timer.C:
+				}
+				if ctx.Err() != nil {
+					break
+				}
+			}
+			stopProgress()
+			if removed, cleanupErr := cleanupUnreferencedPartitionBuilds(dataDir, info.ID); cleanupErr != nil {
+				lookup.LogKV("index_partition_cleanup_failed", "index", info.ID, "error", cleanupErr)
+			} else if removed > 0 {
+				lookup.LogKV("index_partition_cleanup", "index", info.ID, "removed_builds", removed)
+			}
+			if err != nil {
+				mgr.SetBuildProgress(info.ID, lookup.BulkProgress{SourceName: info.ID, Seen: stats.Seen, Indexed: stats.Indexed, Skipped: stats.Skipped, LastSeq: stats.LastSeq, Partitions: stats.Partitions, StartedAt: started, Took: time.Since(started)}, false, err.Error())
+				if ctx.Err() == nil {
+					lookup.LogKV("index_load_failed", "index", info.ID, "error", err, "elapsed", time.Since(started))
+				}
+				continue
+			}
+			mgr.SetBuildProgress(info.ID, lookup.BulkProgress{SourceName: info.ID, Seen: stats.Seen, Indexed: stats.Indexed, Skipped: stats.Skipped, LastSeq: stats.LastSeq, Partition: stats.Partitions, Partitions: stats.Partitions, StartedAt: started, Took: time.Since(started)}, false, "")
+			lookup.LogKV("index_ready", "index", info.ID, "state", "partitioned", "storage", "disk", "rows_seen", stats.Seen, "rows_indexed", stats.Indexed, "rows_skipped", stats.Skipped, "partitions", stats.Partitions, "elapsed", time.Since(started))
+			continue
+		}
 		stopProgress := startIndexProgress(ctx, mgr, info.ID)
 		stats, err := mgr.Reload(ctx, info.ID)
 		stopProgress()
@@ -271,20 +394,6 @@ func warmConfiguredIndexes(ctx context.Context, mgr *lookup.MultiIndexManager, c
 			}
 			continue
 		}
-		if storage == "disk" {
-			mi, ok := mgr.Get(info.ID)
-			if !ok {
-				lookup.LogKV("index_persist_failed", "index", info.ID, "error", "index disappeared after reload")
-				continue
-			}
-			persistStarted := time.Now()
-			manifest, persistErr := mi.SavePersistent(ctx, store, info.ID)
-			if persistErr != nil {
-				lookup.LogKV("index_persist_failed", "index", info.ID, "error", persistErr)
-			} else {
-				lookup.LogKV("index_persisted", "index", info.ID, "generation", manifest.Generation, "docs", manifest.Docs, "format", manifest.Format, "path", manifest.Path, "elapsed", time.Since(persistStarted))
-			}
-		}
 		ready, _ := mgr.Managed(info.ID)
 		if ready == nil {
 			continue
@@ -292,6 +401,55 @@ func warmConfiguredIndexes(ctx context.Context, mgr *lookup.MultiIndexManager, c
 		indexFields := []any{"index", info.ID, "state", "indexed", "storage", storage, "rows_seen", stats.Seen, "rows_indexed", stats.Indexed, "rows_skipped", stats.Skipped, "docs", ready.Index.Stats().Docs, "rows_per_second", fmt.Sprintf("%.1f", stats.RowsPerSecond), "elapsed", time.Since(started)}
 		lookup.LogKV("index_ready", indexFields...)
 	}
+}
+
+// cleanupUnreferencedPartitionBuilds removes partition indexes left behind by
+// retries or replaced builds. The published catalog is the source of truth:
+// every partition it references remains available to active queries.
+func cleanupUnreferencedPartitionBuilds(dataDir, indexID string) (int, error) {
+	catalogPath := filepath.Join(dataDir, strings.ToLower(strings.TrimSpace(indexID)), "partitions.json")
+	dataset, err := lookup.LoadPartitionDataset(catalogPath)
+	if err != nil && !os.IsNotExist(err) {
+		return 0, fmt.Errorf("read published partition catalog: %w", err)
+	}
+	keep := make(map[string]struct{}, len(dataset.Generations))
+	for _, manifest := range dataset.Generations {
+		keep[strings.ToLower(strings.TrimSpace(manifest.IndexID))] = struct{}{}
+	}
+	// Keep committed resume partitions as well as the serving generation.
+	// They may belong to a replacement build that failed before publication.
+	progress, progressErr := lookup.LoadPartitionDataset(catalogPath + ".progress.json")
+	if progressErr != nil && !os.IsNotExist(progressErr) {
+		return 0, fmt.Errorf("read partition build checkpoint: %w", progressErr)
+	}
+	if progressErr == nil && progress.Fingerprint != "" {
+		for _, manifest := range progress.Generations {
+			keep[strings.ToLower(strings.TrimSpace(manifest.IndexID))] = struct{}{}
+		}
+	}
+	entries, err := os.ReadDir(dataDir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return 0, nil
+		}
+		return 0, err
+	}
+	prefix := strings.ToLower(strings.TrimSpace(indexID)) + "-b"
+	removed := 0
+	for _, entry := range entries {
+		name := strings.ToLower(entry.Name())
+		if !entry.IsDir() || !strings.HasPrefix(name, prefix) {
+			continue
+		}
+		if _, referenced := keep[name]; referenced {
+			continue
+		}
+		if err := os.RemoveAll(filepath.Join(dataDir, entry.Name())); err != nil {
+			return removed, fmt.Errorf("remove unreferenced partition %q: %w", entry.Name(), err)
+		}
+		removed++
+	}
+	return removed, nil
 }
 
 // startIndexProgress renders a single updating terminal line. When output is
@@ -342,12 +500,16 @@ func startIndexProgress(ctx context.Context, mgr *lookup.MultiIndexManager, id s
 				if elapsed > 0 {
 					rate = float64(progress.Seen) / elapsed.Seconds()
 				}
+				partition := ""
+				if progress.Partition > 0 {
+					partition = fmt.Sprintf("  partition %s (%s rows)", formatProgressNumber(uint64(progress.Partition)), formatProgressNumber(progress.CurrentPartitionRows))
+				}
 				if terminal {
-					fmt.Fprintf(os.Stderr, "\r\033[36m%s\033[0m  %-18s  %s rows seen  %s indexed  %s skipped  %s rows/s  %s elapsed\033[K",
-						spin[int(now.Unix())%len(spin)], id, formatProgressNumber(progress.Seen), formatProgressNumber(progress.Indexed), formatProgressNumber(progress.Skipped), formatProgressNumber(uint64(rate)), formatProgressDuration(elapsed))
+					fmt.Fprintf(os.Stderr, "\r\033[36m%s\033[0m  %-18s  %s rows seen  %s indexed  %s skipped  %s rows/s%s  %s elapsed\033[K",
+						spin[int(now.Unix())%len(spin)], id, formatProgressNumber(progress.Seen), formatProgressNumber(progress.Indexed), formatProgressNumber(progress.Skipped), formatProgressNumber(uint64(rate)), partition, formatProgressDuration(elapsed))
 					drawn = true
 				} else if now.Sub(lastLog) >= 5*time.Second {
-					lookup.LogKV("index_load_progress", "index", id, "rows_seen", progress.Seen, "rows_indexed", progress.Indexed, "rows_skipped", progress.Skipped, "rows_per_second", fmt.Sprintf("%.1f", rate), "elapsed", elapsed.Round(time.Second))
+					lookup.LogKV("index_load_progress", "index", id, "rows_seen", progress.Seen, "rows_indexed", progress.Indexed, "rows_skipped", progress.Skipped, "partition", progress.Partition, "completed_partitions", progress.Partitions, "current_partition_rows", progress.CurrentPartitionRows, "rows_per_second", fmt.Sprintf("%.1f", rate), "elapsed", elapsed.Round(time.Second))
 					lastLog = now
 				}
 				if current.Reloading {

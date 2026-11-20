@@ -115,10 +115,14 @@ lookup_rule_set "dos_from_date" {
 
 bulk_settings "standard" {
   batch_size 32768
+  max_batch_bytes 16777216
+  max_partition_bytes 134217728
 }
 
 bulk_settings "special" {
   batch_size 16384
+  max_batch_bytes 16777216
+  max_partition_bytes 134217728
 }
 
 datasource "cpt" {

@@ -204,7 +204,7 @@ func (c *TupleCompositeIndex) Search(ix *Index, term string, groupID uint32, dat
 		if ix.isDeletedOrExpiredLocked(id) {
 			return true
 		}
-		dst = append(dst, Hit{ID: ix.docToExt[id], DocID: id, Score: 1})
+		dst = append(dst, Hit{ID: ix.externalID(id), DocID: id, Score: 1})
 		return limit <= 0 || len(dst) < limit
 	})
 	return dst
@@ -388,13 +388,14 @@ type PersistentStore interface {
 type FileSegmentStore struct{ Root string }
 
 type PersistentManifest struct {
-	IndexID    string    `json:"index_id"`
-	Generation uint64    `json:"generation"`
-	CreatedAt  time.Time `json:"created_at"`
-	Docs       uint64    `json:"docs"`
-	Path       string    `json:"path"`
-	Frozen     bool      `json:"frozen"`
-	Format     string    `json:"format"`
+	IndexID    string            `json:"index_id"`
+	Generation uint64            `json:"generation"`
+	CreatedAt  time.Time         `json:"created_at"`
+	Docs       uint64            `json:"docs"`
+	Path       string            `json:"path"`
+	Frozen     bool              `json:"frozen"`
+	Format     string            `json:"format"`
+	Summary    *PartitionSummary `json:"summary,omitempty"`
 }
 
 func (s FileSegmentStore) dir(indexID string) string {
@@ -633,6 +634,20 @@ func (ix *Index) persistentDump() (*persistentDump, error) {
 // the multi-gigabyte duplicate snapshot that a deep copy would create. Writers
 // pause until encoding finishes so the on-disk generation remains consistent.
 func (ix *Index) encodePersistent(w io.Writer) error {
+	return ix.writePersistentView(func(d *persistentDump) error {
+		compressed, err := gzip.NewWriterLevel(w, gzip.BestSpeed)
+		if err != nil {
+			return err
+		}
+		if err = gob.NewEncoder(compressed).Encode(d); err != nil {
+			_ = compressed.Close()
+			return err
+		}
+		return compressed.Close()
+	})
+}
+
+func (ix *Index) writePersistentView(write func(*persistentDump) error) error {
 	ix.mu.RLock()
 	defer ix.mu.RUnlock()
 	cfg := ix.cfg
@@ -678,15 +693,7 @@ func (ix *Index) encodePersistent(w io.Writer) error {
 		d.Composite = dumpComposite(ex.composite)
 	}
 	ex.mu.RUnlock()
-	compressed, err := gzip.NewWriterLevel(w, gzip.BestSpeed)
-	if err != nil {
-		return err
-	}
-	if err = gob.NewEncoder(compressed).Encode(d); err != nil {
-		_ = compressed.Close()
-		return err
-	}
-	return compressed.Close()
+	return write(d)
 }
 
 // decodePersistent accepts both the original raw gob generation and the
@@ -741,7 +748,7 @@ func (ix *Index) restorePersistentDump(d *persistentDump) error {
 	ix.hasTTL = d.HasTTL
 	ix.hasDeletes = d.HasDeletes
 	if ix.extToDoc == nil && !ix.cfg.AppendOnly {
-		ix.extToDoc = make(map[string]DocID, len(ix.docToExt))
+		ix.extToDoc = make(map[string]DocID, ix.externalIDCount())
 		for i, externalID := range ix.docToExt {
 			if externalID == "" || ix.isDeletedOrExpiredLocked(DocID(i)) {
 				continue

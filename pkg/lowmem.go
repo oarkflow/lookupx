@@ -3,13 +3,19 @@ package pkg
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"math"
+	"os"
+	"path/filepath"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -86,20 +92,25 @@ func (c *streamingDatasetCursor) Err() error   { return c.err }
 func (c *streamingDatasetCursor) Close() error { return nil }
 
 // PartitionedBuildOptions streams a source into many small persistent indexes.
-// It is the low-memory path for 100M/1B row loads: memory is bounded by
-// RowsPerPartition plus BatchSize rather than total source size.
+// RowsPerPartition, MaxPartitionBytes, BatchSize, and MaxBatchBytes bound index
+// size and pending input independently of total source size. Byte limits are
+// estimates of source payload size, not an exact Go heap limit.
 type PartitionedBuildOptions struct {
-	IndexID          string
-	Store            PersistentStore
-	CatalogPath      string
-	DatasetRoot      string
-	Config           Config
-	RowsPerPartition uint64
-	Bulk             BulkOptions
-	EnableComposite  bool
-	Freeze           bool
-	MaxRows          uint64
-	Progress         func(PartitionedBuildProgress)
+	IndexID           string
+	Store             PersistentStore
+	CatalogPath       string
+	ProgressPath      string
+	DatasetRoot       string
+	PublishProgress   bool
+	Config            Config
+	RowsPerPartition  uint64
+	MaxBatchBytes     uint64
+	MaxPartitionBytes uint64
+	Bulk              BulkOptions
+	EnableComposite   bool
+	Freeze            bool
+	MaxRows           uint64
+	Progress          func(PartitionedBuildProgress)
 }
 
 type PartitionedBuildProgress struct {
@@ -127,6 +138,38 @@ type PartitionedBuildStats struct {
 	Manifests  []PersistentManifest `json:"manifests,omitempty"`
 }
 
+func estimateSourceRecordBytes(record *SourceRecord) uint64 {
+	if record == nil {
+		return 0
+	}
+	// Include fixed per-record/value overhead plus payload lengths. This is an
+	// input-size estimate, not an exact prediction of the index's heap use.
+	bytes := uint64(128 + len(record.ID))
+	for i := range record.Values {
+		value := &record.Values[i]
+		bytes = saturatingAdd(bytes, 48)
+		bytes = saturatingAdd(bytes, uint64(len(value.String)))
+		if n := uint64(len(value.Vector)); n > 0 {
+			bytes = saturatingAdd(bytes, n*8)
+		}
+		if text, ok := value.Source.(string); ok {
+			bytes = saturatingAdd(bytes, uint64(len(text)))
+		}
+	}
+	return bytes
+}
+
+func saturatingAdd(a, b uint64) uint64 {
+	if ^uint64(0)-a < b {
+		return ^uint64(0)
+	}
+	return a + b
+}
+
+func estimatedLimitExceeded(limit, current, add uint64) bool {
+	return add > limit || current > limit-add
+}
+
 // BuildPartitionedPersistent indexes a stream into independent persistent
 // partitions. It never loads all source rows and never keeps old partitions in
 // memory after they are saved.
@@ -137,19 +180,6 @@ func BuildPartitionedPersistent(ctx context.Context, src Source, opt Partitioned
 	if opt.Store == nil {
 		return PartitionedBuildStats{}, errors.New("persistent store required")
 	}
-	if opt.Bulk.Resume && opt.Bulk.Checkpoint != nil {
-		name := opt.Bulk.Name
-		if name == "" {
-			name = opt.IndexID
-		}
-		seq, err := opt.Bulk.Checkpoint.Load(ctx, name)
-		if err != nil {
-			return PartitionedBuildStats{}, fmt.Errorf("load partition build checkpoint: %w", err)
-		}
-		if seq > 0 {
-			return PartitionedBuildStats{}, fmt.Errorf("cannot resume partition build from source checkpoint %d without restoring the matching completed partitions", seq)
-		}
-	}
 	if opt.IndexID == "" {
 		opt.IndexID = "index"
 	}
@@ -159,22 +189,31 @@ func BuildPartitionedPersistent(ctx context.Context, src Source, opt Partitioned
 	if opt.Bulk.BatchSize <= 0 {
 		opt.Bulk.BatchSize = 16_384
 	}
+	if opt.MaxBatchBytes == 0 {
+		if opt.Bulk.MaxBatchBytes > 0 {
+			opt.MaxBatchBytes = uint64(opt.Bulk.MaxBatchBytes)
+		} else {
+			opt.MaxBatchBytes = 16 << 20
+		}
+	}
+	if opt.MaxPartitionBytes == 0 {
+		if opt.Bulk.MaxPartitionBytes > 0 {
+			opt.MaxPartitionBytes = uint64(opt.Bulk.MaxPartitionBytes)
+		} else {
+			opt.MaxPartitionBytes = 128 << 20
+		}
+	}
 	if opt.Bulk.BatchSize > int(opt.RowsPerPartition) && opt.RowsPerPartition < uint64(^uint(0)>>1) {
 		opt.Bulk.BatchSize = int(opt.RowsPerPartition)
 	}
 	started := time.Now()
-	cur, err := src.Open(ctx)
-	if err != nil {
-		return PartitionedBuildStats{}, err
-	}
-	defer cur.Close()
 
 	mkIndex := func() (*Index, error) {
 		cfg := opt.Config
 		if cfg.Schema.Fields == nil {
 			cfg.Schema = TupleLookupSchema()
 		}
-		if cfg.InitialCapacity <= 0 {
+		if cfg.InitialCapacity <= 0 || uint64(cfg.InitialCapacity) > opt.RowsPerPartition {
 			capHint := opt.RowsPerPartition
 			if capHint > 1_000_000 {
 				capHint = 1_000_000
@@ -200,20 +239,77 @@ func BuildPartitionedPersistent(ctx context.Context, src Source, opt Partitioned
 	defer closeIndex()
 
 	batch := make([]SourceRecord, 0, opt.Bulk.BatchSize)
+	batchBytes := uint64(0)
 	for i := 0; i < opt.Bulk.BatchSize; i++ {
 		batch = append(batch, SourceRecord{Values: make([]SourceValue, 0, len(ix.fieldList))})
 	}
 	batch = batch[:0]
 	rec := SourceRecord{Values: make([]SourceValue, 0, len(ix.fieldList))}
-	var stats PartitionedBuildStats
-	stats.IndexID = cleanIndexID(opt.IndexID)
-	var buildID [12]byte
-	if _, err := rand.Read(buildID[:]); err != nil {
-		return stats, fmt.Errorf("create partition build ID: %w", err)
+	stats := PartitionedBuildStats{IndexID: cleanIndexID(opt.IndexID)}
+	progressPath := opt.ProgressPath
+	if progressPath == "" && opt.CatalogPath != "" {
+		progressPath = opt.CatalogPath + ".progress.json"
 	}
-	stats.BuildID = hex.EncodeToString(buildID[:])
+	fingerprint, canResume := partitionBuildFingerprint(src, opt)
 	partitionNo := 0
+	resumeAfter := uint64(0)
+	if opt.Bulk.Resume && progressPath != "" {
+		checkpoint, loadErr := LoadPartitionDataset(progressPath)
+		if loadErr == nil && !checkpoint.Complete && checkpoint.BuildID != "" && len(checkpoint.Generations) > 0 {
+			if !canResume {
+				return stats, errors.New("cannot resume partition build: source does not provide a stable resume identity")
+			}
+			if _, err := hex.DecodeString(checkpoint.BuildID); err != nil {
+				return stats, errors.New("cannot resume partition build: invalid saved build ID")
+			}
+			partitionPrefix := fmt.Sprintf("%s-b%s-p", stats.IndexID, checkpoint.BuildID)
+			for _, manifest := range checkpoint.Generations {
+				if !strings.HasPrefix(cleanIndexID(manifest.IndexID), partitionPrefix) {
+					return stats, errors.New("cannot resume partition build: saved partition does not belong to this build")
+				}
+				if err := validateSavedPartition(manifest); err != nil {
+					return stats, fmt.Errorf("cannot resume partition build: %w", err)
+				}
+			}
+			if checkpoint.Fingerprint != fingerprint {
+				return stats, errors.New("cannot resume partition build: source or index configuration differs from the saved build")
+			}
+			_, ok := src.(ResumableSource)
+			if !ok || checkpoint.LastSeq == 0 {
+				return stats, errors.New("cannot resume partition build: saved build has no resumable source sequence")
+			}
+			stats.BuildID = checkpoint.BuildID
+			stats.Seen = checkpoint.Seen
+			stats.Indexed = checkpoint.Indexed
+			stats.Skipped = checkpoint.Skipped
+			stats.LastSeq = checkpoint.LastSeq
+			stats.Manifests = append([]PersistentManifest(nil), checkpoint.Generations...)
+			stats.Partitions = len(stats.Manifests)
+			partitionNo = stats.Partitions
+			resumeAfter = stats.LastSeq
+		} else if loadErr != nil && !errors.Is(loadErr, os.ErrNotExist) {
+			return stats, fmt.Errorf("load partition build progress: %w", loadErr)
+		}
+	}
+	if stats.BuildID == "" {
+		var buildID [12]byte
+		if _, err := rand.Read(buildID[:]); err != nil {
+			return stats, fmt.Errorf("create partition build ID: %w", err)
+		}
+		stats.BuildID = hex.EncodeToString(buildID[:])
+	}
+	var cur Cursor
+	if resumeAfter > 0 {
+		cur, err = src.(ResumableSource).OpenAfter(ctx, resumeAfter)
+	} else {
+		cur, err = src.Open(ctx)
+	}
+	if err != nil {
+		return stats, err
+	}
+	defer cur.Close()
 	partitionRows := uint64(0)
+	partitionBytes := uint64(0)
 	currentPartitionID := func() string { return fmt.Sprintf("%s-b%s-p%06d", stats.IndexID, stats.BuildID, partitionNo) }
 
 	flush := func() error {
@@ -221,6 +317,9 @@ func BuildPartitionedPersistent(ctx context.Context, src Source, opt Partitioned
 			return nil
 		}
 		indexed, skipped, lastSeq, err := ix.indexSourceBatch(batch, opt.Bulk.SkipBadRecords)
+		for i := range batch {
+			partitionBytes = saturatingAdd(partitionBytes, estimateSourceRecordBytes(&batch[i]))
+		}
 		stats.Indexed += indexed
 		stats.Skipped += skipped
 		partitionRows += indexed
@@ -234,13 +333,9 @@ func BuildPartitionedPersistent(ctx context.Context, src Source, opt Partitioned
 			batch[i].Seq = 0
 		}
 		batch = batch[:0]
+		batchBytes = 0
 		if err != nil {
 			return err
-		}
-		if opt.Bulk.Checkpoint != nil && stats.LastSeq > 0 && opt.Bulk.CheckpointEvery > 0 && stats.Indexed%uint64(opt.Bulk.CheckpointEvery) == 0 {
-			if err := opt.Bulk.Checkpoint.Save(ctx, opt.Bulk.Name, stats.LastSeq); err != nil {
-				return err
-			}
 		}
 		if opt.Progress != nil {
 			opt.Progress(PartitionedBuildProgress{IndexID: stats.IndexID, PartitionID: currentPartitionID(), PartitionNo: partitionNo, Seen: stats.Seen, Indexed: stats.Indexed, Skipped: stats.Skipped, CurrentRows: partitionRows, Partitions: stats.Partitions, LastSeq: stats.LastSeq, Took: time.Since(started)})
@@ -268,16 +363,55 @@ func BuildPartitionedPersistent(ctx context.Context, src Source, opt Partitioned
 		}
 		stats.Manifests = append(stats.Manifests, man)
 		stats.Partitions++
+		checkpoint := PartitionDataset{Root: opt.DatasetRoot, BuildID: stats.BuildID, Fingerprint: fingerprint, LastSeq: stats.LastSeq, Seen: stats.Seen, Indexed: stats.Indexed, Skipped: stats.Skipped, Generations: append([]PersistentManifest(nil), stats.Manifests...)}
+		if progressPath != "" {
+			if err := checkpoint.Save(progressPath); err != nil {
+				return fmt.Errorf("save completed partition checkpoint: %w", err)
+			}
+		}
+		if opt.Bulk.Checkpoint != nil && stats.LastSeq > 0 {
+			name := opt.Bulk.Name
+			if name == "" {
+				name = stats.IndexID
+			}
+			if err := opt.Bulk.Checkpoint.Save(ctx, name, stats.LastSeq); err != nil {
+				return err
+			}
+		}
+		if opt.CatalogPath != "" && opt.PublishProgress {
+			if err := checkpoint.Save(opt.CatalogPath); err != nil {
+				return fmt.Errorf("publish completed partition catalog: %w", err)
+			}
+		}
 		_ = ix.Close()
 		partitionNo++
 		partitionRows = 0
+		partitionBytes = 0
 		ix, err = mkIndex()
 		return err
 	}
-
 	for cur.Next(ctx, &rec) {
 		if opt.MaxRows > 0 && stats.Seen >= opt.MaxRows {
 			break
+		}
+		recordBytes := estimateSourceRecordBytes(&rec)
+		if len(batch) > 0 && estimatedLimitExceeded(opt.MaxBatchBytes, batchBytes, recordBytes) {
+			if err := flush(); err != nil {
+				return stats, err
+			}
+		}
+		currentPartitionBytes := saturatingAdd(partitionBytes, batchBytes)
+		if partitionRows+uint64(len(batch)) > 0 && estimatedLimitExceeded(opt.MaxPartitionBytes, currentPartitionBytes, recordBytes) {
+			if len(batch) > 0 {
+				if err := flush(); err != nil {
+					return stats, err
+				}
+			}
+			if partitionRows > 0 {
+				if err := persistPartition(true); err != nil {
+					return stats, err
+				}
+			}
 		}
 		stats.Seen++
 		n := len(batch)
@@ -290,6 +424,7 @@ func BuildPartitionedPersistent(ctx context.Context, src Source, opt Partitioned
 		slot.ID = rec.ID
 		slot.Seq = rec.Seq
 		slot.Values = append(slot.Values[:0], rec.Values...)
+		batchBytes += recordBytes
 		if len(batch) >= opt.Bulk.BatchSize {
 			if err := flush(); err != nil {
 				return stats, err
@@ -311,19 +446,88 @@ func BuildPartitionedPersistent(ctx context.Context, src Source, opt Partitioned
 	if err := persistPartition(true); err != nil {
 		return stats, err
 	}
-	if opt.Bulk.Checkpoint != nil && stats.LastSeq > 0 {
-		if err := opt.Bulk.Checkpoint.Save(ctx, opt.Bulk.Name, stats.LastSeq); err != nil {
-			return stats, err
-		}
-	}
 	stats.Took = time.Since(started)
 	if opt.CatalogPath != "" {
-		dataset := PartitionDataset{Root: opt.DatasetRoot, BuildID: stats.BuildID, Generations: append([]PersistentManifest(nil), stats.Manifests...)}
+		dataset := PartitionDataset{Root: opt.DatasetRoot, BuildID: stats.BuildID, Complete: true, Fingerprint: fingerprint, LastSeq: stats.LastSeq, Seen: stats.Seen, Indexed: stats.Indexed, Skipped: stats.Skipped, Generations: append([]PersistentManifest(nil), stats.Manifests...)}
 		if err := dataset.Save(opt.CatalogPath); err != nil {
 			return stats, fmt.Errorf("publish partition catalog: %w", err)
 		}
 	}
+	if progressPath != "" {
+		if err := os.Remove(progressPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return stats, fmt.Errorf("remove completed partition checkpoint: %w", err)
+		}
+	}
 	return stats, nil
+}
+
+// validateSavedPartition performs a metadata-only check before resuming. It
+// verifies that the catalog still points at the saved generation and that the
+// generation's payload is present, without decoding the full partition.
+func validateSavedPartition(man PersistentManifest) error {
+	if man.IndexID == "" || man.Generation == 0 || man.Path == "" {
+		return errors.New("saved partition manifest is incomplete")
+	}
+	base := filepath.Dir(man.Path)
+	if filepath.Base(base) != cleanIndexID(man.IndexID) || filepath.Base(man.Path) != fmt.Sprintf("generation-%020d", man.Generation) {
+		return fmt.Errorf("saved partition %q has an unexpected generation path", man.IndexID)
+	}
+	current, err := os.ReadFile(filepath.Join(base, "CURRENT"))
+	if err != nil {
+		return fmt.Errorf("read saved partition %q CURRENT: %w", man.IndexID, err)
+	}
+	if strings.TrimSpace(string(current)) != filepath.Base(man.Path) {
+		return fmt.Errorf("saved partition %q no longer points to generation %d", man.IndexID, man.Generation)
+	}
+	manifestPath := filepath.Join(man.Path, "manifest.json")
+	manifestBytes, err := os.ReadFile(manifestPath)
+	if err != nil {
+		return fmt.Errorf("saved partition %q manifest is unavailable: %w", man.IndexID, err)
+	}
+	var persisted PersistentManifest
+	if err := json.Unmarshal(manifestBytes, &persisted); err != nil {
+		return fmt.Errorf("decode saved partition %q manifest: %w", man.IndexID, err)
+	}
+	if persisted.IndexID != man.IndexID || persisted.Generation != man.Generation || persisted.Docs != man.Docs {
+		return fmt.Errorf("saved partition %q manifest does not match its checkpoint", man.IndexID)
+	}
+	dataPath := "index.gob"
+	if strings.EqualFold(man.Format, string(LayoutMMapParts)) {
+		dataPath = "segment.dat"
+	}
+	if _, err := os.Stat(filepath.Join(man.Path, dataPath)); err != nil {
+		return fmt.Errorf("saved partition %q data is unavailable: %w", man.IndexID, err)
+	}
+	return nil
+}
+
+func partitionBuildFingerprint(src Source, opt PartitionedBuildOptions) (string, bool) {
+	identity, ok := src.(SourceIdentity)
+	if !ok {
+		return "", false
+	}
+	sourceID := identity.ResumeIdentity()
+	if sourceID == "" {
+		return "", false
+	}
+	value := struct {
+		IndexID         string `json:"index_id"`
+		Source          string `json:"source"`
+		Config          Config `json:"config"`
+		RowsPerPart     uint64 `json:"rows_per_partition"`
+		MaxBatchBytes   uint64 `json:"max_batch_bytes"`
+		MaxPartBytes    uint64 `json:"max_partition_bytes"`
+		MaxRows         uint64 `json:"max_rows"`
+		SkipBadRecords  bool   `json:"skip_bad_records"`
+		EnableComposite bool   `json:"enable_composite"`
+		Freeze          bool   `json:"freeze"`
+	}{cleanIndexID(opt.IndexID), sourceID, opt.Config, opt.RowsPerPartition, opt.MaxBatchBytes, opt.MaxPartitionBytes, opt.MaxRows, opt.Bulk.SkipBadRecords, opt.EnableComposite, opt.Freeze}
+	data, err := json.Marshal(value)
+	if err != nil {
+		return "", false
+	}
+	sum := sha256.Sum256(data)
+	return hex.EncodeToString(sum[:]), true
 }
 
 // LowMemoryBillionBudget is a laptop-safe profile. It favors more partitions so
@@ -332,34 +536,39 @@ func LowMemoryBillionBudget() MemoryBudget {
 	return MemoryBudget{MaxHeapBytes: 2 << 30, MaxActiveSegmentBytes: 128 << 20, TargetRowsPerPartition: 250_000, DefaultBatchSize: 16_384}
 }
 
-// SearchPartitionedPersistent searches persisted partitions one at a time. It is
-// intentionally low-memory: at most one partition index is decoded/resident while
-// scanning. For production, pair this with partition pruning so only relevant
-// manifests are passed for a given query.
+// SearchPartitionedPersistent searches persisted partitions with bounded
+// parallelism. The worker limit keeps memory proportional to active partitions
+// instead of the total dataset.
+var ErrPartitionedSearchUnsupported = errors.New("partitioned persistent search does not support requested feature")
+
+// Partition decoding materializes an Index in heap memory. Share a process-wide
+// cap across requests so concurrent HTTP searches cannot multiply the per-call
+// worker count into an unbounded number of decoded indexes.
+var partitionSearchSlots = make(chan struct{}, 2)
+
 func SearchPartitionedPersistent(ctx context.Context, store PersistentStore, manifests []PersistentManifest, cfg Config, req SearchRequest, dst []Hit) ([]Hit, error) {
 	result, err := SearchPartitionedPersistentResult(ctx, store, manifests, cfg, req, dst)
 	return result.Hits, err
 }
 
-// SearchPartitionedPersistentResult searches every supplied partition and
-// merges local candidates by their returned scores. BM25 scores calculated
-// against separate partition corpora are not globally calibrated, so this is
-// suitable only where per-partition score ordering is acceptable. Partitions
-// must be pruned by the caller when query fields allow it; this function does
-// not return early when an early partition fills the requested page.
+// SearchPartitionedPersistentResult prunes impossible partitions, leases mapped
+// or legacy indexes through a bounded cache, and merges local candidates by score. BM25 scores
+// calculated against separate partition corpora are not globally calibrated.
+// Broad queries still visit every possible partition; the function never returns
+// early merely because one partition fills the requested page.
 func SearchPartitionedPersistentResult(ctx context.Context, store PersistentStore, manifests []PersistentManifest, cfg Config, req SearchRequest, dst []Hit) (Result, error) {
 	started := time.Now()
 	if store == nil {
 		return Result{}, errors.New("persistent store required")
 	}
 	if len(req.Sort) > 0 {
-		return Result{}, errors.New("partitioned persistent search does not support field sorting")
+		return Result{}, fmt.Errorf("%w: field sorting", ErrPartitionedSearchUnsupported)
 	}
 	if len(req.Facets) > 0 {
-		return Result{}, errors.New("partitioned persistent search does not support facets")
+		return Result{}, fmt.Errorf("%w: facets", ErrPartitionedSearchUnsupported)
 	}
 	if req.AfterDocID > 0 {
-		return Result{}, errors.New("partitioned persistent search does not support after_doc_id pagination")
+		return Result{}, fmt.Errorf("%w: after_doc_id pagination", ErrPartitionedSearchUnsupported)
 	}
 	limit := req.Limit
 	if limit <= 0 {
@@ -368,36 +577,114 @@ func SearchPartitionedPersistentResult(ctx context.Context, store PersistentStor
 	if req.Offset < 0 || limit > math.MaxInt-req.Offset {
 		return Result{}, errors.New("invalid partitioned search limit or offset")
 	}
+	req.Limit = limit
+	signature := partitionConfigSignature(cfg)
+	if unfilteredPartitionQuery(req.Query) {
+		return browsePartitionedPersistent(ctx, store, manifests, cfg, req, dst, signature)
+	}
+	schema := summarySchema(cfg)
+	candidates := make([]PersistentManifest, 0, len(manifests))
+	for _, man := range manifests {
+		if man.Summary == nil || man.Summary.Schema != schema || man.Summary.match(req.Query, cfg) {
+			candidates = append(candidates, man)
+		}
+	}
+	manifests = candidates
+	if rule, ok := req.Query.(latestPerGroupQuery); ok {
+		query, err := preparePartitionLatest(ctx, store, manifests, cfg, rule, signature)
+		if err != nil {
+			return Result{}, err
+		}
+		req.Query = query
+	}
 	pageSize := limit + req.Offset
 	dst = dst[:0]
 	total := 0
-	for _, man := range manifests {
-		select {
-		case <-ctx.Done():
-			return Result{Hits: dst, Total: total, Took: time.Since(started).Nanoseconds()}, ctx.Err()
-		default:
+	workers := runtime.GOMAXPROCS(0)
+	if workers < 1 {
+		workers = 1
+	}
+	if workers > cap(partitionSearchSlots) {
+		workers = cap(partitionSearchSlots)
+	}
+	if workers > len(manifests) {
+		workers = len(manifests)
+	}
+	if workers == 0 {
+		workers = 1
+	}
+	type partitionResult struct {
+		hits  []Hit
+		total int
+		err   error
+	}
+	workCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	jobs := make(chan PersistentManifest)
+	results := make(chan partitionResult, workers)
+	var wg sync.WaitGroup
+	localReq := req
+	localReq.Limit = pageSize
+	localReq.Offset = 0
+	localReq.AfterDocID = 0
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for man := range jobs {
+				select {
+				case partitionSearchSlots <- struct{}{}:
+				case <-workCtx.Done():
+					return
+				}
+				ix, release, err := servingPartitions.acquire(workCtx, store, man, cfg, signature)
+				if err != nil {
+					<-partitionSearchSlots
+					results <- partitionResult{err: err}
+					cancel()
+					continue
+				}
+				local := make([]Hit, 0, pageSize)
+				localResult, local := ix.SearchInto(localReq, local)
+				detachPartitionHits(local)
+				release()
+				<-partitionSearchSlots
+
+				results <- partitionResult{hits: local, total: localResult.Total}
+			}
+		}()
+	}
+	go func() {
+		defer close(jobs)
+		for _, man := range manifests {
+			select {
+			case jobs <- man:
+			case <-workCtx.Done():
+				return
+			}
 		}
-		ix, _, err := store.LoadIndex(ctx, man.IndexID, cfg)
-		if err != nil {
-			return Result{Hits: dst, Total: total, Took: time.Since(started).Nanoseconds()}, err
-		}
-		localReq := req
-		localReq.Limit = pageSize
-		localReq.Offset = 0
-		localReq.AfterDocID = 0
-		local := make([]Hit, 0, pageSize)
-		localResult, local := ix.SearchInto(localReq, local)
-		closeErr := ix.Close()
-		if closeErr != nil {
-			return Result{Hits: dst, Total: total, Took: time.Since(started).Nanoseconds()}, closeErr
+	}()
+	go func() {
+		wg.Wait()
+		close(results)
+	}()
+	var searchErr error
+	for part := range results {
+		if part.err != nil {
+			if searchErr == nil {
+				searchErr = part.err
+			}
+			continue
 		}
 		if !req.SkipTotal {
-			if localResult.Total > math.MaxInt-total {
-				return Result{Hits: dst, Total: total, Took: time.Since(started).Nanoseconds()}, errors.New("partitioned search total exceeds platform integer range")
+			if part.total > math.MaxInt-total {
+				searchErr = errors.New("partitioned search total exceeds platform integer range")
+				cancel()
+				continue
 			}
-			total += localResult.Total
+			total += part.total
 		}
-		dst = append(dst, local...)
+		dst = append(dst, part.hits...)
 		sort.SliceStable(dst, func(i, j int) bool {
 			if dst[i].Score != dst[j].Score {
 				return dst[i].Score > dst[j].Score
@@ -410,6 +697,12 @@ func SearchPartitionedPersistentResult(ctx context.Context, store PersistentStor
 		if len(dst) > pageSize {
 			dst = dst[:pageSize]
 		}
+	}
+	if searchErr != nil {
+		return Result{Hits: dst, Total: total, Took: time.Since(started).Nanoseconds()}, searchErr
+	}
+	if err := ctx.Err(); err != nil {
+		return Result{Hits: dst, Total: total, Took: time.Since(started).Nanoseconds()}, err
 	}
 	if req.Offset >= len(dst) {
 		dst = dst[:0]

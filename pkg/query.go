@@ -32,19 +32,20 @@ func (q latestPerGroupQuery) eval(ix *Index) *Bitmap {
 	if dates == nil || exists == nil {
 		return NewBitmap()
 	}
-	groupColumns := make([][]string, len(q.GroupBy))
+	groupColumns := make([]string, len(q.GroupBy))
 	groupOptions := make([]FieldOptions, len(q.GroupBy))
 	for i, field := range q.GroupBy {
-		groupColumns[i] = ix.strings[field]
+		groupColumns[i] = field
 		groupOptions[i] = ix.cfg.Schema.Fields[field]
-		if groupColumns[i] == nil {
+		if !ix.hasStringColumn(field) {
 			return NewBitmap()
 		}
 	}
 	groupKey := func(id DocID) string {
 		var b strings.Builder
 		for i, column := range groupColumns {
-			value := normalize(column[id], groupOptions[i].Lowercase)
+			raw, _ := ix.stringValue(column, id)
+			value := normalize(raw, groupOptions[i].Lowercase)
 			fmt.Fprintf(&b, "%d:", len(value))
 			b.WriteString(value)
 		}
@@ -193,8 +194,9 @@ func (q sourceStringFilter) eval(ix *Index) *Bitmap {
 	}
 	// Stored string columns remain available when source documents are disabled
 	// and preserve the complete value (unlike analyzed text postings).
-	if col := ix.strings[q.Field]; col != nil {
-		for i, raw := range col {
+	if ix.hasStringColumn(q.Field) {
+		for i := 0; i < ix.stringColumnLen(q.Field); i++ {
+			raw, _ := ix.stringValue(q.Field, DocID(i))
 			id := DocID(i)
 			if id > 0 && raw != "" && !ix.isDeletedOrExpiredLocked(id) && match(normalize(raw, opt.Lowercase)) {
 				out.Add(id)

@@ -100,19 +100,19 @@ func ValidatePersistentIndex(ctx context.Context, store PersistentStore, indexID
 	if ix.nextDocID == 0 {
 		rep.add("error", "bad_next_doc_id", "nextDocID is zero")
 	}
-	if len(ix.docToExt) == 0 {
+	if ix.externalIDCount() == 0 {
 		rep.add("error", "missing_doc_to_ext", "docToExt is empty")
 	}
-	if len(ix.docToExt) > 0 && ix.docToExt[0] != "" {
+	if ix.externalIDCount() > 0 && ix.externalID(0) != "" {
 		rep.add("warning", "doc_zero_reserved", "docToExt[0] should be reserved")
 	}
 	for ext, did := range ix.extToDoc {
-		if did == 0 || int(did) >= len(ix.docToExt) {
+		if did == 0 || int(did) >= ix.externalIDCount() {
 			rep.add("error", "ext_to_doc_out_of_range", fmt.Sprintf("%s -> %d out of range", ext, did))
 			continue
 		}
-		if ix.docToExt[did] != ext {
-			rep.add("error", "ext_doc_mismatch", fmt.Sprintf("%s -> %d but docToExt=%q", ext, did, ix.docToExt[did]))
+		if ix.externalID(did) != ext {
+			rep.add("error", "ext_doc_mismatch", fmt.Sprintf("%s -> %d but docToExt=%q", ext, did, ix.externalID(did)))
 		}
 	}
 	for name, fi := range ix.fields {
@@ -280,6 +280,12 @@ func (s PartitionScheme) TuplePartition(term string, groupID uint32, date_key st
 type PartitionDataset struct {
 	Root        string               `json:"root"`
 	BuildID     string               `json:"build_id,omitempty"`
+	Complete    bool                 `json:"complete,omitempty"`
+	Fingerprint string               `json:"fingerprint,omitempty"`
+	LastSeq     uint64               `json:"last_seq,omitempty"`
+	Seen        uint64               `json:"seen,omitempty"`
+	Indexed     uint64               `json:"indexed,omitempty"`
+	Skipped     uint64               `json:"skipped,omitempty"`
 	Partitions  []PartitionManifest  `json:"partitions,omitempty"`
 	Generations []PersistentManifest `json:"generations,omitempty"`
 }
@@ -343,12 +349,11 @@ func PlanBillionRowDeployment(indexID string, estimatedRows int64, budget Memory
 		"recommended_partitions":            parts,
 		"estimated_rows_per_partition":      rowsPer,
 		"recommended_batch_size":            budget.BulkOptions(indexID, nil, false).BatchSize,
-		"layout":                            "partitioned build helper; search integration required",
+		"layout":                            "partitioned build with bounded-concurrency cold HTTP search",
 		"production_ready_for_billion_rows": false,
 		"readiness_warnings": []string{
-			"persistent generations are decoded into process memory; the current store is not an mmap query engine",
-			"partition search is a library helper and is not wired into the HTTP lookup/search routes",
-			"RDS sql_query builds need a stable indexed paging key; a computed document ID is not a paging index",
+			"cold HTTP lookup opens and scans every persisted partition; partition pruning is not yet implemented",
+			"RDS sql_query builds need a stable indexed paging key for bounded keyset pages and restart recovery; a computed document ID is not a paging index",
 			"single-index heap requirements depend on indexed fields and analyzers and are not estimated by this row-count plan",
 		},
 	}

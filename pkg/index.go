@@ -157,6 +157,8 @@ type Index struct {
 	numSorted          map[string][]numPair
 	numDirty           map[string]bool
 	strings            map[string][]string
+	mappedStrings      map[string]mappedStringColumn
+	mappedIDs          mappedStringColumn
 	vectors            map[string]map[DocID][]float64
 	anns               map[string]*VectorANN
 	ip4                map[string]map[DocID]uint32
@@ -164,6 +166,7 @@ type Index struct {
 	ip4Dirty           map[string]bool
 	wal                *os.File
 	walSeq             uint64
+	mappedRelease      func() error
 	tokens             []string
 	scratch            []string
 	valScratch         []string
@@ -326,10 +329,21 @@ func Open(cfg Config) (*Index, error) {
 func (ix *Index) Close() error {
 	ix.mu.Lock()
 	defer ix.mu.Unlock()
+	// The global extras registry otherwise roots every closed partition and all
+	// of its postings forever, including partitions opened by a single query.
+	extraIndexes.Delete(ix)
+	var err error
 	if ix.wal != nil {
-		return ix.wal.Close()
+		err = ix.wal.Close()
+		ix.wal = nil
 	}
-	return nil
+	if ix.mappedRelease != nil {
+		if releaseErr := ix.mappedRelease(); err == nil {
+			err = releaseErr
+		}
+		ix.mappedRelease = nil
+	}
+	return err
 }
 
 func (ix *Index) Upsert(id string, doc Document) error {
@@ -386,7 +400,7 @@ func (ix *Index) upsertLocked(id string, doc Document, log bool) error {
 			ix.valScratch = valuesInto(v, ix.valScratch)
 			for _, raw := range ix.valScratch {
 				val := normalizeStringByKind(sf.special, raw, sf.opt.Lowercase)
-				if did, exists := sf.fi.unique[val]; exists && !ix.deleted.Has(did) && ix.docToExt[did] != id {
+				if did, exists := sf.fi.unique[val]; exists && !ix.deleted.Has(did) && ix.externalID(did) != id {
 					return fmt.Errorf("unique constraint violation on %s=%s", sf.name, val)
 				}
 			}
@@ -479,8 +493,8 @@ func (ix *Index) documentLocked(id DocID) Document {
 	for _, field := range ix.fieldList {
 		doc[field.name] = nil
 	}
-	for field, column := range ix.strings {
-		if value, ok := stringColumnValue(column, id); ok {
+	for field := range ix.strings {
+		if value, ok := ix.stringValue(field, id); ok {
 			doc[field] = value
 		}
 	}
@@ -632,7 +646,7 @@ func (ix *Index) Search(req SearchRequest) Result {
 			if ix.isDeletedOrExpiredLocked(id) {
 				return true
 			}
-			h := Hit{ID: ix.docToExt[id], DocID: id, Score: 1}
+			h := Hit{ID: ix.externalID(id), DocID: id, Score: 1}
 			if req.WithDocs {
 				h.Doc = ix.documentLocked(id)
 			}
@@ -685,7 +699,7 @@ func (ix *Index) Search(req SearchRequest) Result {
 		hits := make([]Hit, 0, to-from)
 		for _, rankedDoc := range ranked[from:to] {
 			id := rankedDoc.id
-			h := Hit{ID: ix.docToExt[id], DocID: id, Score: rankedDoc.score}
+			h := Hit{ID: ix.externalID(id), DocID: id, Score: rankedDoc.score}
 			if req.WithDocs {
 				h.Doc = ix.documentLocked(id)
 			}
@@ -715,7 +729,7 @@ func (ix *Index) Search(req SearchRequest) Result {
 			if len(hits) >= req.Limit {
 				return false
 			}
-			h := Hit{ID: ix.docToExt[id], DocID: id, Score: 1}
+			h := Hit{ID: ix.externalID(id), DocID: id, Score: 1}
 			if req.WithDocs {
 				h.Doc = ix.documentLocked(id)
 			}
@@ -748,7 +762,7 @@ func (ix *Index) Search(req SearchRequest) Result {
 	}
 	hits := make([]Hit, 0, to-from)
 	for _, id := range ids[from:to] {
-		h := Hit{ID: ix.docToExt[id], DocID: id, Score: 1}
+		h := Hit{ID: ix.externalID(id), DocID: id, Score: 1}
 		if req.WithDocs {
 			h.Doc = ix.documentLocked(id)
 		}
@@ -763,6 +777,8 @@ func globalTermFromQuery(q Query) (GlobalTerm, bool) {
 		return x, true
 	case latestPerGroupQuery:
 		return globalTermFromQuery(x.Candidate)
+	case partitionLatestQuery:
+		return globalTermFromQuery(x.rule.Candidate)
 	case Bool:
 		for _, list := range [][]Query{x.Must, x.Filter, x.Should} {
 			for _, child := range list {
@@ -925,8 +941,8 @@ func (ix *Index) sortIDsLocked(ids []DocID, fields []SortField) {
 				}
 				return av < bv
 			}
-			av, aok := stringColumnValue(ix.strings[sf.Field], a)
-			bv, bok := stringColumnValue(ix.strings[sf.Field], b)
+			av, aok := ix.stringValue(sf.Field, a)
+			bv, bok := ix.stringValue(sf.Field, b)
 			if !aok || !bok {
 				if aok == bok {
 					continue
@@ -966,7 +982,7 @@ func (ix *Index) facetsLocked(bm *Bitmap, names []string) map[string][]FacetBuck
 			if ix.isDeletedOrExpiredLocked(id) {
 				return true
 			}
-			if v, ok := stringColumnValue(ix.strings[field], id); ok {
+			if v, ok := ix.stringValue(field, id); ok {
 				counts[v]++
 			} else if n, ok := ix.numeric[field][id]; ok {
 				counts[strconv.FormatFloat(n, 'f', -1, 64)]++
@@ -2101,8 +2117,8 @@ func (ix *Index) LoadSnapshot(path string) error {
 		}
 		if len(snap.Docs) > 0 {
 			ix.mu.Lock()
-			if len(ix.docs) < len(ix.docToExt) {
-				ix.docs = make([]Document, len(ix.docToExt))
+			if len(ix.docs) < ix.externalIDCount() {
+				ix.docs = make([]Document, ix.externalIDCount())
 			}
 			for id, doc := range snap.Docs {
 				if did, ok := ix.extToDoc[id]; ok && int(did) < len(ix.docs) {
@@ -2121,6 +2137,42 @@ func (ix *Index) LoadSnapshot(path string) error {
 
 func (ix *Index) estimateCardinality(q Query) int {
 	switch v := q.(type) {
+	case GlobalTerm:
+		ix.mu.RLock()
+		defer ix.mu.RUnlock()
+		fields := ix.globalTermFields(v)
+		if v.Fuzzy {
+			for _, field := range fields {
+				if ix.cfg.Schema.Fields[field].Fuzzy {
+					return 1 << 30
+				}
+			}
+		}
+		// Each word must match at least one field. The smallest per-word
+		// sum is a conservative estimate, allowing selective search terms to
+		// run before broad tenant/date filters instead of scanning their rows.
+		best := int(ix.nextDocID)
+		for _, word := range v.Words {
+			total := 0
+			for _, field := range fields {
+				fi := ix.fields[field]
+				if fi == nil {
+					continue
+				}
+				value := normalizeSpecialString(field, word, ix.cfg.Schema.Fields[field].Lowercase)
+				if fi.termOne[value] != 0 || fi.unique[value] != 0 {
+					total++
+				}
+				if bm := fi.terms[value]; bm != nil {
+					total += bm.Count()
+				}
+			}
+			if total < best {
+				best = total
+			}
+		}
+		return best
+
 	case Term:
 		ix.mu.RLock()
 		defer ix.mu.RUnlock()
@@ -2128,7 +2180,11 @@ func (ix *Index) estimateCardinality(q Query) int {
 		if fi == nil {
 			return 0
 		}
-		if b := fi.terms[normalize(v.Value, ix.cfg.Schema.Fields[v.Field].Lowercase)]; b != nil {
+		value := normalizeSpecialString(v.Field, v.Value, ix.cfg.Schema.Fields[v.Field].Lowercase)
+		if fi.termOne[value] != 0 || fi.unique[value] != 0 {
+			return 1
+		}
+		if b := fi.terms[value]; b != nil {
 			return b.Count()
 		}
 		return 0
@@ -2177,13 +2233,13 @@ func (ix *Index) EachTerm(field, value string, fn func(id string, docID DocID) b
 	val := normalize(value, opt.Lowercase)
 	if did, ok := fi.unique[val]; ok {
 		if !ix.isDeletedOrExpiredLocked(did) {
-			fn(ix.docToExt[did], did)
+			fn(ix.externalID(did), did)
 		}
 		return
 	}
 	if did := fi.termOne[val]; did != 0 {
 		if !ix.isDeletedOrExpiredLocked(did) {
-			fn(ix.docToExt[did], did)
+			fn(ix.externalID(did), did)
 		}
 		return
 	}
@@ -2193,7 +2249,7 @@ func (ix *Index) EachTerm(field, value string, fn func(id string, docID DocID) b
 	}
 	b.Each(func(id DocID) bool {
 		if !ix.isDeletedOrExpiredLocked(id) {
-			return fn(ix.docToExt[id], id)
+			return fn(ix.externalID(id), id)
 		}
 		return true
 	})
@@ -2211,13 +2267,13 @@ func (ix *Index) CollectTerm(field, value string, dst []string) []string {
 	val := normalize(value, opt.Lowercase)
 	if did, ok := fi.unique[val]; ok {
 		if !ix.isDeletedOrExpiredLocked(did) {
-			dst = append(dst, ix.docToExt[did])
+			dst = append(dst, ix.externalID(did))
 		}
 		return dst
 	}
 	if did := fi.termOne[val]; did != 0 {
 		if !ix.isDeletedOrExpiredLocked(did) {
-			dst = append(dst, ix.docToExt[did])
+			dst = append(dst, ix.externalID(did))
 		}
 		return dst
 	}
@@ -2227,7 +2283,7 @@ func (ix *Index) CollectTerm(field, value string, dst []string) []string {
 	}
 	b.Each(func(id DocID) bool {
 		if !ix.isDeletedOrExpiredLocked(id) {
-			dst = append(dst, ix.docToExt[id])
+			dst = append(dst, ix.externalID(id))
 		}
 		return true
 	})

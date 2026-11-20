@@ -160,14 +160,14 @@ func (s *Server) searchFH(c fh.Ctx) error {
 	if q.AfterDocID > 0 && q.Offset > 0 {
 		return fhError(c, 400, "after_doc_id pagination cannot be combined with offset")
 	}
-	started := time.Now()
-	res, hits := s.Index.SearchInto(SearchRequest{Query: q.ToQuery(), Limit: s.sanitizeLimit(q.Limit), Offset: q.Offset, AfterDocID: q.AfterDocID, SkipTotal: q.SkipTotal, WithDocs: true, Sort: q.Sort, Facets: q.Facets}, nil)
 	verbose := q.Verbose
 	if raw := c.Query("verbose"); raw != "" {
 		if parsed, err := strconv.ParseBool(raw); err == nil {
 			verbose = verbose || parsed
 		}
 	}
+	started := time.Now()
+	res, hits := s.Index.SearchInto(SearchRequest{Query: q.ToQuery(), Limit: s.sanitizeLimit(q.Limit), Offset: q.Offset, AfterDocID: q.AfterDocID, SkipTotal: q.SkipTotal || !verbose, WithDocs: true, Sort: q.Sort, Facets: q.Facets}, nil)
 	response := hitResponse(hits, res.Total, time.Since(started), verbose)
 	if len(res.Facets) > 0 {
 		response["facets"] = res.Facets

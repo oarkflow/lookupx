@@ -233,6 +233,18 @@ func (m *MultiIndexManager) Managed(id string) (*ManagedIndex, bool) {
 	return mi, mi != nil
 }
 
+// SetBuildProgress updates a background builder's progress without replacing
+// the currently registered query index.
+func (m *MultiIndexManager) SetBuildProgress(id string, progress BulkProgress, reloading bool, lastError string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if mi := m.indexes[cleanIndexID(id)]; mi != nil {
+		mi.Progress = progress
+		mi.Reloading = reloading
+		mi.Latency.LastError = lastError
+	}
+}
+
 func (m *MultiIndexManager) List() []ManagedIndexInfo {
 	m.mu.RLock()
 	out := make([]ManagedIndexInfo, 0, len(m.indexes))
@@ -252,6 +264,7 @@ type ManagedIndexInfo struct {
 	Generation uint64       `json:"generation"`
 	Reloading  bool         `json:"reloading"`
 	Stats      Stats        `json:"stats"`
+	TermsKnown bool         `json:"terms_known"`
 	Latency    IndexLatency `json:"latency"`
 	Progress   BulkProgress `json:"progress,omitempty"`
 }
@@ -593,6 +606,12 @@ func (s *MultiServer) reloadSQLRequest(ctx context.Context, id string, req SQLRe
 	if req.PageSize > 0 && !validSQLIdentifier(req.SeqColumn) {
 		return BulkStats{}, errors.New("seq_column must be a simple SELECT output identifier for keyset paging")
 	}
+	baseQuery := strings.TrimSpace(strings.TrimSuffix(strings.TrimSpace(req.Query), ";"))
+	if req.PageSize > 0 && hasSQLPageTokens(baseQuery) {
+		if err := validateSQLPageTemplate(baseQuery, req.SeqColumn); err != nil {
+			return BulkStats{}, fmt.Errorf("invalid paged SQL template: %w", err)
+		}
+	}
 	mi, ok := s.Manager.Managed(id)
 	dsn, err := secureSQLiteDSN(req.Driver, req.DSN, s.DataDir)
 	if err != nil {
@@ -622,9 +641,8 @@ func (s *MultiServer) reloadSQLRequest(ctx context.Context, id string, req SQLRe
 	return s.Manager.ReloadWithConfig(ctx, id, cfg, func(ix *Index) (Source, error) {
 		cols := BindSQLColumns(ix, inferred)
 		if req.PageSize > 0 {
-			base := strings.TrimSpace(strings.TrimSuffix(strings.TrimSpace(req.Query), ";"))
 			page := func(last uint64, limit int) (string, []any) {
-				return buildSQLQueryPage(base, req.Args, req.SeqColumn, req.Driver, last, limit)
+				return buildSQLQueryPageForSource(baseQuery, req.Args, req.SeqColumn, req.Driver, last, limit)
 			}
 			return PagedSQLQuerySource{DB: db.DB(), Page: page, IDColumn: req.IDColumn, SeqColumn: req.SeqColumn, Columns: cols, PageSize: req.PageSize}, nil
 		}

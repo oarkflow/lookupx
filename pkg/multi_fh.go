@@ -2,6 +2,7 @@ package pkg
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/url"
@@ -78,7 +79,14 @@ func (s *MultiServer) metricsFH(c fh.Ctx) error {
 	}
 	c.Type("text/plain; version=0.0.4")
 	var b strings.Builder
-	for _, info := range s.Manager.List() {
+	usage := readResourceUsage()
+	fmt.Fprintf(&b, "lookupx_heap_bytes %d\nlookupx_heap_in_use_bytes %d\nlookupx_runtime_system_bytes %d\nlookupx_goroutines %d\n", usage.HeapBytes, usage.HeapInUseBytes, usage.SystemBytes, usage.Goroutines)
+	cache := &servingPartitions
+	cache.mu.Lock()
+	fmt.Fprintf(&b, "lookupx_partition_cache_bytes %d\nlookupx_partition_cache_budget_bytes %d\nlookupx_partition_cache_entries %d\n", cache.bytes, cache.maxBytes, len(cache.entries))
+	cache.mu.Unlock()
+	fmt.Fprintf(&b, "lookupx_partition_cache_hits_total %d\nlookupx_partition_cache_misses_total %d\n", cache.hits.Load(), cache.misses.Load())
+	for _, info := range s.indexListWithCatalogStats() {
 		fmt.Fprintf(&b, "lookupx_index_live_docs{index=%q} %d\n", info.ID, info.Stats.LiveDocs)
 		fmt.Fprintf(&b, "lookupx_index_terms{index=%q} %d\n", info.ID, info.Stats.Terms)
 		fmt.Fprintf(&b, "lookupx_index_last_reload_ns{index=%q} %d\n", info.ID, info.Latency.LastReloadNS)
@@ -87,7 +95,59 @@ func (s *MultiServer) metricsFH(c fh.Ctx) error {
 	return c.SendString(b.String())
 }
 
-func (s *MultiServer) listIndexesFH(c fh.Ctx) error { return c.JSON(s.Manager.List()) }
+func (s *MultiServer) listIndexesFH(c fh.Ctx) error { return c.JSON(s.indexListWithCatalogStats()) }
+
+// Disk-backed indexing keeps only an empty schema/router Index in memory. Its
+// counts come from the published catalog; reading them must not open partitions.
+func (s *MultiServer) indexListWithCatalogStats() []ManagedIndexInfo {
+	infos := s.Manager.List()
+	if !s.diskStorageEnabled() {
+		for i := range infos {
+			infos[i].TermsKnown = true
+		}
+		return infos
+	}
+	for i := range infos {
+		mi, ok := s.Manager.Managed(infos[i].ID)
+		if !ok || mi.Index == nil {
+			continue
+		}
+		stats, termsKnown, ok := s.partitionCatalogStats(infos[i].ID, mi.Config)
+		if !ok {
+			infos[i].TermsKnown = true
+			continue
+		}
+		infos[i].Stats.Docs = stats.Docs
+		infos[i].Stats.LiveDocs = stats.LiveDocs
+		infos[i].Stats.DeletedDocs = stats.DeletedDocs
+		infos[i].Stats.Terms = stats.Terms
+		infos[i].TermsKnown = termsKnown
+	}
+	return infos
+}
+
+func (s *MultiServer) partitionCatalogStats(id string, cfg Config) (Stats, bool, bool) {
+	path := filepath.Join(s.persistentStore().Root, cleanIndexID(id), "partitions.json")
+	dataset, err := loadServingCatalog(path)
+	if err != nil || len(dataset.Generations) == 0 {
+		return Stats{}, false, false
+	}
+	stats := Stats{Fields: len(cfg.Schema.Fields), Segments: len(dataset.Generations), Shards: len(dataset.Generations)}
+	termsKnown := true
+	for _, man := range dataset.Generations {
+		if man.Docs > uint64(^uint(0)>>1)-uint64(stats.Docs) {
+			return Stats{}, false, false
+		}
+		stats.Docs += int(man.Docs)
+		if man.Summary == nil || !man.Summary.TermsKnown {
+			termsKnown = false
+		} else {
+			stats.Terms += man.Summary.Terms
+		}
+	}
+	stats.LiveDocs = stats.Docs
+	return stats, termsKnown, true
+}
 
 func (s *MultiServer) createIndexFH(c fh.Ctx) error {
 	var req CreateIndexRequest
@@ -183,7 +243,14 @@ func (s *MultiServer) withIndexFH(c fh.Ctx, handler indexFHHandler) error {
 func (s *MultiServer) indexStatsFH(c fh.Ctx) error {
 	return s.withIndexFH(c, func(c fh.Ctx, ix *Index, id string) error {
 		mi, _ := s.Manager.Managed(id)
-		return c.JSON(map[string]any{"id": id, "stats": ix.Stats(), "latency": mi.Latency, "resources": readResourceUsage(), "generation": mi.Generation, "reloading": mi.Reloading})
+		stats := ix.Stats()
+		termsKnown := true
+		if s.diskStorageEnabled() {
+			if catalogStats, known, ok := s.partitionCatalogStats(id, mi.Config); ok {
+				stats, termsKnown = catalogStats, known
+			}
+		}
+		return c.JSON(map[string]any{"id": id, "stats": stats, "terms_known": termsKnown, "latency": mi.Latency, "progress": mi.Progress, "resources": readResourceUsage(), "generation": mi.Generation, "reloading": mi.Reloading})
 	})
 }
 func (s *MultiServer) indexSchemaFH(c fh.Ctx) error {
@@ -294,7 +361,7 @@ func (s *MultiServer) indexPersistFH(c fh.Ctx) error {
 func (s *MultiServer) indexCompositeLookupFH(c fh.Ctx) error {
 	return s.withIndexFH(c, func(c fh.Ctx, ix *Index, _ string) error {
 		groupID, _ := strconv.ParseUint(c.Query("group_id"), 10, 32)
-		limit := ParseIntDefault(c.Query("limit"), 20)
+		limit := (&Server{Index: ix}).sanitizeLimit(ParseIntDefault(c.Query("limit"), 20))
 		_, hits := ix.SearchInto(SearchRequest{Query: TupleCompositeQuery{Term: c.Query("term"), GroupID: uint32(groupID), DateKey: c.Query("date_key")}, Limit: limit}, nil)
 		return c.JSON(map[string]any{"hits": hits, "total": len(hits)})
 	})
@@ -347,29 +414,36 @@ func (s *MultiServer) searchIndexFH(c fh.Ctx, ix *Index, id string) error {
 	if err := c.BodyParser(&q); err != nil {
 		return fhError(c, 400, err.Error())
 	}
-	limit := q.Limit
-	if limit <= 0 {
-		limit = 20
-	}
+	limit := (&Server{Index: ix}).sanitizeLimit(q.Limit)
 	if q.AfterDocID > 0 && len(q.Sort) > 0 {
 		return fhError(c, 400, "after_doc_id pagination cannot be combined with sort")
 	}
 	if q.AfterDocID > 0 && q.Offset > 0 {
 		return fhError(c, 400, "after_doc_id pagination cannot be combined with offset")
 	}
-	withDocs := true
-	if raw := c.Query("with_docs"); raw != "" {
-		withDocs, _ = strconv.ParseBool(raw)
-	}
-	started := time.Now()
-	res, hits := ix.SearchInto(SearchRequest{Query: q.ToQuery(), Limit: limit, Offset: q.Offset, AfterDocID: q.AfterDocID, SkipTotal: q.SkipTotal, WithDocs: withDocs, Sort: q.Sort, Facets: q.Facets}, nil)
-	latency := time.Since(started)
 	verbose := q.Verbose
 	if raw := c.Query("verbose"); raw != "" {
 		if parsed, err := strconv.ParseBool(raw); err == nil {
 			verbose = verbose || parsed
 		}
 	}
+	withDocs := true
+	if raw := c.Query("with_docs"); raw != "" {
+		withDocs, _ = strconv.ParseBool(raw)
+	}
+	started := time.Now()
+	searchReq := SearchRequest{Query: q.ToQuery(), Limit: limit, Offset: q.Offset, AfterDocID: q.AfterDocID, SkipTotal: q.SkipTotal || !verbose, WithDocs: withDocs, Sort: q.Sort, Facets: q.Facets}
+	res, partitioned, err := s.searchPartitionCatalog(c.Context(), ix, id, searchReq)
+	if err != nil {
+		return partitionSearchError(c, err)
+	}
+	var hits []Hit
+	if partitioned {
+		hits = res.Hits
+	} else {
+		res, hits = ix.SearchInto(searchReq, nil)
+	}
+	latency := time.Since(started)
 	LogKV("query_search", "index", id, "query", wireQueryShape(q), "limit", limit, "offset", q.Offset, "hits", len(hits), "total", res.Total, "latency", latency)
 	response := hitResponse(hits, res.Total, latency, verbose)
 	if len(res.Facets) > 0 {
@@ -383,7 +457,16 @@ func (s *MultiServer) countIndexFH(c fh.Ctx, ix *Index, id string) error {
 		return fhError(c, 400, err.Error())
 	}
 	started := time.Now()
-	count := ix.Count(q.ToQuery())
+	partitionResult, partitioned, err := s.searchPartitionCatalog(c.Context(), ix, id, SearchRequest{Query: q.ToQuery(), Limit: 1})
+	if err != nil {
+		return partitionSearchError(c, err)
+	}
+	count := 0
+	if partitioned {
+		count = partitionResult.Total
+	} else {
+		count = ix.Count(q.ToQuery())
+	}
 	LogKV("query_count", "index", id, "query", wireQueryShape(q), "count", count, "latency", time.Since(started))
 	return c.JSON(map[string]any{"count": count, "latency_ns": time.Since(started).Nanoseconds()})
 }
@@ -392,6 +475,7 @@ func (s *MultiServer) lookupIndexFH(c fh.Ctx, ix *Index, id string) error {
 }
 
 func (s *MultiServer) lookupFH(c fh.Ctx, ix *Index, id string) error {
+	verbose, _ := strconv.ParseBool(c.Query("verbose"))
 	profile, _ := strconv.ParseBool(c.Query("profile"))
 	var before ResourceUsage
 	if profile {
@@ -407,7 +491,17 @@ func (s *MultiServer) lookupFH(c fh.Ctx, ix *Index, id string) error {
 	}
 	limit := ParseIntDefault(c.Query("limit"), 20)
 	started := time.Now()
-	result, hits := ix.SearchInto(SearchRequest{Query: query, Limit: limit, WithDocs: true}, nil)
+	searchReq := SearchRequest{Query: query, Limit: limit, Offset: ParseIntDefault(c.Query("offset"), 0), WithDocs: true, SkipTotal: !verbose}
+	result, partitioned, err := s.searchPartitionCatalog(c.Context(), ix, id, searchReq)
+	if err != nil {
+		return partitionSearchError(c, err)
+	}
+	var hits []Hit
+	if partitioned {
+		hits = result.Hits
+	} else {
+		result, hits = ix.SearchInto(searchReq, nil)
+	}
 	latency := time.Since(started)
 	fields := make([]string, 0, len(rawURL.Query()))
 	for key := range rawURL.Query() {
@@ -415,12 +509,75 @@ func (s *MultiServer) lookupFH(c fh.Ctx, ix *Index, id string) error {
 	}
 	sort.Strings(fields)
 	LogKV("query_lookup", "index", id, "filters", strings.Join(fields, ","), "limit", limit, "hits", len(hits), "total", result.Total, "latency", time.Since(started))
-	verbose, _ := strconv.ParseBool(c.Query("verbose"))
 	response := hitResponse(hits, result.Total, latency, verbose)
 	if profile {
 		response["resources"] = usageDelta(before, readResourceUsage())
 	}
 	return c.JSON(response)
+}
+
+// searchPartitionCatalog serves a completed low-memory partition build when
+// the manager has no complete in-memory generation.
+// The cold path bounds decoded partitions to the process-wide search worker cap.
+func (s *MultiServer) searchPartitionCatalog(ctx context.Context, ix *Index, id string, req SearchRequest) (Result, bool, error) {
+	if s == nil || ix == nil {
+		return Result{}, false, nil
+	}
+	managed, hasManaged := s.Manager.Managed(id)
+	if hasManaged {
+		stats := ix.Stats()
+		if stats.LiveDocs > 0 && (!managed.Reloading || managed.Generation > 1) {
+			return Result{}, false, nil
+		}
+	}
+	catalogPath := filepath.Join(s.persistentStore().Root, cleanIndexID(id), "partitions.json")
+	dataset, err := loadServingCatalog(catalogPath)
+	if errors.Is(err, os.ErrNotExist) {
+		return Result{}, false, nil
+	}
+	if err != nil {
+		return Result{}, true, fmt.Errorf("load partition catalog: %w", err)
+	}
+	if len(dataset.Generations) == 0 {
+		return Result{Hits: []Hit{}}, true, nil
+	}
+	root := strings.TrimSpace(dataset.Root)
+	if root == "" {
+		root = s.persistentStore().Root
+	}
+	var store PersistentStore = FileSegmentStore{Root: root}
+	if strings.EqualFold(dataset.Generations[0].Format, string(LayoutMMapParts)) {
+		store = FileMMapSegmentStore{Root: root}
+	}
+	result, err := SearchPartitionedPersistentResult(ctx, store, dataset.Generations, ix.cfg, req, nil)
+	if errors.Is(err, os.ErrNotExist) && ctx.Err() == nil {
+		// A replacement may be published and its old directories cleaned after
+		// this request read the previous catalog but before a cold open. Retry
+		// once against the new complete catalog; already-mapped leases stay valid.
+		if fresh, loadErr := loadServingCatalog(catalogPath); loadErr == nil && fresh.BuildID != dataset.BuildID {
+			freshRoot := strings.TrimSpace(fresh.Root)
+			if freshRoot == "" {
+				freshRoot = s.persistentStore().Root
+			}
+			var freshStore PersistentStore = FileSegmentStore{Root: freshRoot}
+			if len(fresh.Generations) > 0 && strings.EqualFold(fresh.Generations[0].Format, string(LayoutMMapParts)) {
+				freshStore = FileMMapSegmentStore{Root: freshRoot}
+			}
+			result, err = SearchPartitionedPersistentResult(ctx, freshStore, fresh.Generations, ix.cfg, req, nil)
+		}
+	}
+	if err != nil {
+		return Result{}, true, err
+	}
+	return result, true, nil
+}
+
+func partitionSearchError(c fh.Ctx, err error) error {
+	status := 500
+	if errors.Is(err, ErrPartitionedSearchUnsupported) {
+		status = 400
+	}
+	return fhError(c, status, err.Error())
 }
 
 // hitResponse keeps the common lookup payload compact: hits are document

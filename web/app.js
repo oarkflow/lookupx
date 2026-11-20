@@ -594,7 +594,7 @@ const App = (() => {
             <div class="index-stats">
               <div class="index-stat">DOCUMENTS<strong>${fmtNum(st.docs)}</strong></div>
               <div class="index-stat">FIELDS<strong>${fmtNum(st.fields)}</strong></div>
-              <div class="index-stat">TERMS<strong>${fmtNum(st.terms)}</strong></div>
+              <div class="index-stat">TERMS<strong>${mi.terms_known === false ? '—' : fmtNum(st.terms)}</strong></div>
               <div class="index-stat">LAST INGEST RATE<strong>${lat.last_rows_per_second ? `${fmtNum(Math.round(lat.last_rows_per_second))} rows/s` : '—'}</strong></div>
             </div>
             <div data-index-progress="${escHtml(mi.id)}" class="index-progress-line${mi.reloading ? '' : ' hidden'}">${indexProgressText(mi, progress)}</div>
@@ -1007,7 +1007,8 @@ const App = (() => {
     const rate = elapsedSeconds > 0 ? Math.round((progress.seen || 0) / elapsedSeconds) : 0;
     const elapsed = Math.floor(elapsedSeconds);
     const clock = `${String(Math.floor(elapsed / 3600)).padStart(2, '0')}:${String(Math.floor((elapsed % 3600) / 60)).padStart(2, '0')}:${String(elapsed % 60).padStart(2, '0')}`;
-    return `INDEXING · ${fmtNum(progress.seen || 0)} rows seen · ${fmtNum(progress.indexed || 0)} indexed · ${fmtNum(progress.skipped || 0)} skipped · ${fmtNum(rate)} rows/s · ${clock} elapsed`;
+    const partition = progress.partition ? ` · partition ${fmtNum(progress.partition)} (${fmtNum(progress.current_partition_rows || 0)} rows)` : '';
+    return `INDEXING · ${fmtNum(progress.seen || 0)} rows seen · ${fmtNum(progress.indexed || 0)} indexed · ${fmtNum(progress.skipped || 0)} skipped · ${fmtNum(rate)} rows/s${partition} · ${clock} elapsed`;
   }
 
   async function refreshIndexProgress() {

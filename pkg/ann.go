@@ -338,8 +338,8 @@ func appendHits(ix *Index, xs []annCandidate, dst []Hit, limit int) []Hit {
 	for i := 0; i < limit; i++ {
 		c := xs[i]
 		id := ""
-		if ix != nil && int(c.doc) < len(ix.docToExt) {
-			id = ix.docToExt[c.doc]
+		if ix != nil && c.doc < ix.nextDocID {
+			id = ix.externalID(c.doc)
 		}
 		dst = append(dst, Hit{ID: id, DocID: c.doc, Score: float64(c.score)})
 	}

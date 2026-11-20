@@ -82,6 +82,20 @@ type Source interface {
 	Open(ctx context.Context) (Cursor, error)
 }
 
+// ResumableSource can begin a new cursor immediately after a durable sequence
+// checkpoint. Sources that do not implement it remain correct through the
+// IndexFrom fallback scan, but may need to reread the source prefix.
+type ResumableSource interface {
+	Source
+	OpenAfter(ctx context.Context, seq uint64) (Cursor, error)
+}
+
+// SourceIdentity returns a stable, non-secret fingerprint of the source query
+// and connection target. It is used to reject a checkpoint from another source.
+type SourceIdentity interface {
+	ResumeIdentity() string
+}
+
 type Cursor interface {
 	Next(ctx context.Context, dst *SourceRecord) bool
 	Err() error
@@ -269,23 +283,28 @@ func (f FileCheckpoint) Reset(ctx context.Context, name string) error {
 }
 
 type BulkOptions struct {
-	Name            string
-	BatchSize       int
-	CheckpointEvery int
-	Checkpoint      CheckpointStore
-	Resume          bool
-	SkipBadRecords  bool
-	Progress        func(BulkProgress)
+	Name              string
+	BatchSize         int
+	MaxBatchBytes     int64
+	MaxPartitionBytes int64
+	CheckpointEvery   int
+	Checkpoint        CheckpointStore
+	Resume            bool
+	SkipBadRecords    bool
+	Progress          func(BulkProgress)
 }
 
 type BulkProgress struct {
-	SourceName string        `json:"source_name"`
-	Seen       uint64        `json:"seen"`
-	Indexed    uint64        `json:"indexed"`
-	Skipped    uint64        `json:"skipped"`
-	LastSeq    uint64        `json:"last_seq"`
-	StartedAt  time.Time     `json:"started_at"`
-	Took       time.Duration `json:"took"`
+	SourceName           string        `json:"source_name"`
+	Seen                 uint64        `json:"seen"`
+	Indexed              uint64        `json:"indexed"`
+	Skipped              uint64        `json:"skipped"`
+	LastSeq              uint64        `json:"last_seq"`
+	Partition            int           `json:"partition,omitempty"`
+	Partitions           int           `json:"partitions,omitempty"`
+	CurrentPartitionRows uint64        `json:"current_partition_rows,omitempty"`
+	StartedAt            time.Time     `json:"started_at"`
+	Took                 time.Duration `json:"took"`
 }
 
 type BulkStats struct {
@@ -329,7 +348,17 @@ func (ix *Index) IndexFrom(ctx context.Context, src Source, opt BulkOptions) (Bu
 			}
 		}
 	}
-	cur, err := src.Open(ctx)
+	var cur Cursor
+	var err error
+	if resumeAfter > 0 {
+		if resumable, ok := src.(ResumableSource); ok {
+			cur, err = resumable.OpenAfter(ctx, resumeAfter)
+		} else {
+			cur, err = src.Open(ctx)
+		}
+	} else {
+		cur, err = src.Open(ctx)
+	}
 	if err != nil {
 		return BulkStats{}, err
 	}
@@ -1191,7 +1220,7 @@ func (ix *Index) CompileDatasourceLookup(raw string) (Query, error) {
 			for _, groupField := range strings.Split(matchedRule.GroupBy, ",") {
 				groupField = strings.TrimSpace(groupField)
 				groupOpt, exists := ix.cfg.Schema.Fields[groupField]
-				if !exists || ix.strings[groupField] == nil || (groupOpt.Kind != FieldKeyword && groupOpt.Kind != FieldText && groupOpt.Kind != FieldBool) {
+				if !exists || !ix.hasStringColumn(groupField) || (groupOpt.Kind != FieldKeyword && groupOpt.Kind != FieldText && groupOpt.Kind != FieldBool) {
 					return nil, fmt.Errorf("lookup rule %q group_by field %q must be a stored string field", field, groupField)
 				}
 				latestGroupBy = append(latestGroupBy, groupField)
