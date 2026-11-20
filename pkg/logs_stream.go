@@ -4,11 +4,18 @@ import (
 	"io"
 	"log"
 	"os"
+	"regexp"
 	"strings"
 	"sync"
 
 	"github.com/oarkflow/sse"
 )
+
+// ansiEscape matches ANSI color/control sequences (e.g. "\x1b[36m") that
+// LogKV emits when writing to a real terminal. Those are meaningless, and
+// render as garbage, on the admin console's log view, so broadcast lines
+// have them stripped.
+var ansiEscape = regexp.MustCompile("\x1b\\[[0-9;]*[a-zA-Z]")
 
 var (
 	logHub     *sse.Hub
@@ -29,11 +36,17 @@ func EnableLogStreaming() *sse.Hub {
 	return logHub
 }
 
+// LogBroadcastWriter returns an io.Writer that broadcasts each written line
+// over the log-streaming SSE hub, for wiring into other log sinks (such as
+// the HTTP access-log middleware) in addition to the standard logger.
+func LogBroadcastWriter() io.Writer { return logBroadcastWriter{} }
+
 type logBroadcastWriter struct{}
 
 func (logBroadcastWriter) Write(p []byte) (int, error) {
 	if logHub != nil {
 		for _, line := range strings.Split(strings.TrimRight(string(p), "\n"), "\n") {
+			line = strings.TrimSpace(ansiEscape.ReplaceAllString(line, ""))
 			if line == "" {
 				continue
 			}

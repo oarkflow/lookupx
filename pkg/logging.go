@@ -5,6 +5,7 @@ import (
 	"log"
 	"os"
 	"strings"
+	"sync"
 )
 
 const (
@@ -14,10 +15,41 @@ const (
 	logBold  = "\x1b[1m"
 )
 
+var terminalProgressMu sync.Mutex
+var terminalProgressLine string
+
+// SetTerminalProgressLine draws an updating status line on stderr. LogKV
+// temporarily clears and redraws it around log messages so the two outputs
+// remain readable when they share a terminal.
+func SetTerminalProgressLine(line string) {
+	terminalProgressMu.Lock()
+	defer terminalProgressMu.Unlock()
+	terminalProgressLine = line
+	fmt.Fprintf(os.Stderr, "\r\033[K%s", line)
+}
+
+// ClearTerminalProgressLine ends the updating status line and leaves the
+// terminal cursor at the start of the next line.
+func ClearTerminalProgressLine() {
+	terminalProgressMu.Lock()
+	defer terminalProgressMu.Unlock()
+	if terminalProgressLine == "" {
+		return
+	}
+	fmt.Fprintln(os.Stderr, "\r\033[K")
+	terminalProgressLine = ""
+}
+
 // LogKV writes an event as readable key=value fields. Values may be omitted
 // from call sites when they contain sensitive query text. Color is automatic
 // for terminal output; LOOKUPX_LOG_COLOR=always|never overrides that choice.
 func LogKV(event string, fields ...any) {
+	terminalProgressMu.Lock()
+	defer terminalProgressMu.Unlock()
+	progressLine := terminalProgressLine
+	if progressLine != "" {
+		fmt.Fprint(os.Stderr, "\r\033[K")
+	}
 	color := logColorEnabled()
 	if color {
 		event = logBold + logCyan + event + logReset
@@ -41,6 +73,9 @@ func LogKV(event string, fields ...any) {
 		}
 	}
 	log.Printf("%s %s", event, strings.Join(parts, " "))
+	if progressLine != "" {
+		fmt.Fprintf(os.Stderr, "%s", progressLine)
+	}
 }
 
 func logColorEnabled() bool {

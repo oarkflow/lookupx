@@ -1,6 +1,7 @@
 package pkg
 
 import (
+	"io"
 	"os"
 	"strings"
 	"time"
@@ -9,6 +10,7 @@ import (
 	"github.com/oarkflow/fh/mw/apikey"
 	"github.com/oarkflow/fh/mw/bodylimit"
 	"github.com/oarkflow/fh/mw/compress"
+	"github.com/oarkflow/fh/mw/logger"
 	fhmetrics "github.com/oarkflow/fh/mw/metrics"
 	"github.com/oarkflow/fh/mw/ratelimiter"
 	"github.com/oarkflow/fh/mw/realip"
@@ -56,6 +58,7 @@ func NewFHApp(handler any) *fh.App {
 		recover.New(recover.Config{EnableStackTrace: false}),
 		requestid.New(requestid.Config{}),
 		security.New(),
+		logger.New(logger.Config{FormatName: "tiny", Writers: []io.Writer{LogBroadcastWriter()}}),
 	)
 	if h, ok := handler.(*MultiServer); ok {
 		h.auth = newAdminAuth(h)
@@ -92,7 +95,9 @@ func NewFHApp(handler any) *fh.App {
 		app.Use(bodylimit.New(maxBodyBytes))
 	}
 	app.Use(
-		compress.New(compress.Config{}),
+		compress.New(compress.Config{Next: func(c fh.Ctx) bool {
+			return strings.HasSuffix(c.Path(), "/stream")
+		}}),
 	)
 	switch h := handler.(type) {
 	case *Server:

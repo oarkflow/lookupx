@@ -265,13 +265,14 @@ func (m *MultiIndexManager) List() []ManagedIndexInfo {
 }
 
 type ManagedIndexInfo struct {
-	ID         string       `json:"id"`
-	Generation uint64       `json:"generation"`
-	Reloading  bool         `json:"reloading"`
-	Stats      Stats        `json:"stats"`
-	TermsKnown bool         `json:"terms_known"`
-	Latency    IndexLatency `json:"latency"`
-	Progress   BulkProgress `json:"progress,omitempty"`
+	ID          string       `json:"id"`
+	Generation  uint64       `json:"generation"`
+	Reloading   bool         `json:"reloading"`
+	Stats       Stats        `json:"stats"`
+	TermsKnown  bool         `json:"terms_known"`
+	Partitioned bool         `json:"partitioned"`
+	Latency     IndexLatency `json:"latency"`
+	Progress    BulkProgress `json:"progress,omitempty"`
 }
 
 func (m *MultiIndexManager) Reload(ctx context.Context, id string) (BulkStats, error) {

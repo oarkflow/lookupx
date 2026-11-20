@@ -190,8 +190,9 @@ const App = (() => {
     }
     currentTab = tab;
     $$('.nav-btn').forEach(b => b.classList.toggle('active', b.dataset.tab === tab));
-    const titles = { search: 'Search', indexes: 'Indexes', integrations: 'Integrations' };
+    const titles = { search: 'Search', indexes: 'Indexes', integrations: 'Integrations', logs: 'Logs' };
     $('#page-title').textContent = titles[tab] || tab;
+    if (tab !== 'logs') stopLogStream();
     render();
   }
 
@@ -201,9 +202,37 @@ const App = (() => {
       if (currentTab === 'search') await renderSearch();
       else if (currentTab === 'indexes') await renderIndexes();
       else if (currentTab === 'integrations') await renderIntegrations();
+      else if (currentTab === 'logs') await renderLogs();
     } catch (e) {
       content().innerHTML = empty('Error: ' + e.message);
     }
+  }
+
+  // ── Logs ───────────────────────────────────────────────────────────────────
+  let logSource = null;
+  function stopLogStream() { if (logSource) { logSource.close(); logSource = null; } }
+  function renderLogs() {
+    content().innerHTML = `
+      <div class="page-heading">
+        <div><div class="eyebrow">OPERATIONS</div><h1>Server logs</h1><p>Live tail of this server's log output.</p></div>
+      </div>
+      <div class="card">
+        <div class="card-header" style="display:flex;align-items:center;justify-content:space-between">
+          <span>Live tail</span>
+          <span><button class="btn btn-secondary text-xs" onclick="document.getElementById('log-view').textContent=''">Clear</button></span>
+        </div>
+        <pre id="log-view" class="log-view"></pre>
+      </div>`;
+    stopLogStream();
+    logSource = new EventSource(apiBase() + '/admin/api/logs/stream');
+    logSource.addEventListener('log', (ev) => {
+      const view = $('#log-view');
+      if (!view) return;
+      const atBottom = view.scrollTop + view.clientHeight >= view.scrollHeight - 4;
+      view.textContent += ev.data + '\n';
+      while (view.textContent.length > 400000) view.textContent = view.textContent.slice(view.textContent.indexOf('\n') + 1);
+      if (atBottom) view.scrollTop = view.scrollHeight;
+    });
   }
 
   // ── Search ─────────────────────────────────────────────────────────────────
@@ -221,23 +250,25 @@ const App = (() => {
         <div><div class="eyebrow">QUERY WORKSPACE</div><h1>Search records</h1><p>Run a lookup across an index and inspect matching documents.</p></div>
         <div class="heading-note">API <code>/v1/indexes/{id}/lookup</code></div>
       </div>
-      <section class="search-panel" aria-label="Search controls">
-        <form class="search-bar" onsubmit="event.preventDefault(); App.doLookup()">
-          <div class="search-control search-index"><label class="control-label" for="lookup-index">INDEX</label>${indexSelect('lookup-index')}</div>
-          <div class="search-control term-control"><label class="control-label" for="lookup-term">SEARCH TERM</label><div class="term-input-row"><input id="lookup-term" type="search" placeholder="Search text" aria-label="Full-text search term" /><select id="lookup-term-field" aria-label="Search term field"><option value="">All searchable fields</option></select></div></div>
-          <label class="search-fuzzy"><input id="lookup-fuzzy" type="checkbox" /> Fuzzy</label>
-          <label class="search-fuzzy"><input id="lookup-verbose" type="checkbox" /> Verbose</label>
-          <label class="search-fuzzy"><input id="lookup-profile" type="checkbox" /> Profile</label>
-          <div class="search-control limit-control"><label class="control-label" for="lookup-limit">LIMIT</label><input id="lookup-limit" type="number" min="1" max="500" value="25" aria-label="Result limit" /></div>
-          <button class="btn btn-primary" type="submit">Search</button>
-        </form>
-        <div class="filter-toolbar"><span class="filter-toolbar-label">Refine with field filters</span><button class="btn btn-secondary" type="button" onclick="App.addFilter()">+ Add filter</button></div>
-        <div id="filter-rows" class="filter-rows"></div>
-        <div class="filter-toolbar"><span class="filter-toolbar-label">Field values (exact match or configured rule)</span><button class="btn btn-secondary" type="button" onclick="App.addFieldValue()">+ Add field value</button></div>
-        <datalist id="field-value-name-options"></datalist>
-        <div id="field-value-rows" class="filter-rows"></div>
-      </section>
-      <div id="search-results"><div class="empty-state"><p>Select an index and enter filters.</p></div></div>
+      <div class="search-layout">
+        <section class="search-panel" aria-label="Search controls">
+          <form class="search-bar" onsubmit="event.preventDefault(); App.doLookup()">
+            <div class="search-control search-index"><label class="control-label" for="lookup-index">INDEX</label>${indexSelect('lookup-index')}</div>
+            <div class="search-control term-control"><label class="control-label" for="lookup-term">SEARCH TERM</label><div class="term-input-row"><input id="lookup-term" type="search" placeholder="Search text" aria-label="Full-text search term" /><select id="lookup-term-field" aria-label="Search term field"><option value="">All searchable fields</option></select></div></div>
+            <label class="search-fuzzy"><input id="lookup-fuzzy" type="checkbox" /> Fuzzy</label>
+            <label class="search-fuzzy"><input id="lookup-verbose" type="checkbox" /> Verbose</label>
+            <label class="search-fuzzy"><input id="lookup-profile" type="checkbox" /> Profile</label>
+            <div class="search-control limit-control"><label class="control-label" for="lookup-limit">LIMIT</label><input id="lookup-limit" type="number" min="1" max="500" value="25" aria-label="Result limit" /></div>
+            <button class="btn btn-primary" type="submit">Search</button>
+          </form>
+          <div class="filter-toolbar"><span class="filter-toolbar-label">Refine with field filters</span><button class="btn btn-secondary" type="button" onclick="App.addFilter()">+ Add filter</button></div>
+          <div id="filter-rows" class="filter-rows"></div>
+          <div class="filter-toolbar"><span class="filter-toolbar-label">Field values (exact match or configured rule)</span><button class="btn btn-secondary" type="button" onclick="App.addFieldValue()">+ Add field value</button></div>
+          <datalist id="field-value-name-options"></datalist>
+          <div id="field-value-rows" class="filter-rows"></div>
+        </section>
+        <div id="search-results"><div class="empty-state"><p>Select an index and enter filters.</p></div></div>
+      </div>
     `;
     await populateIndexSelect('lookup-index');
     $('#lookup-index').addEventListener('change', loadSearchFields);
@@ -584,9 +615,11 @@ const App = (() => {
                 <span class="index-generation">Generation ${fmtNum(mi.generation)}</span>
               </div>
               <div class="index-actions">
-                <button class="btn btn-secondary" onclick="App.reloadIndex('${escHtml(mi.id)}')">Reload</button>
+                ${mi.partitioned
+                  ? `<button class="btn btn-primary" onclick="App.rebuildIndex('${escHtml(mi.id)}')">Rebuild</button>`
+                  : `<button class="btn btn-secondary" onclick="App.reloadIndex('${escHtml(mi.id)}')">Reload</button>
                 <button class="btn btn-secondary" onclick="App.freezeIndex('${escHtml(mi.id)}')">Freeze</button>
-                <button class="btn btn-secondary" onclick="App.persistIndex('${escHtml(mi.id)}')">Persist</button>
+                <button class="btn btn-secondary" onclick="App.persistIndex('${escHtml(mi.id)}')">Persist</button>`}
                 <button class="btn btn-secondary" onclick="App.toggleDetail('${escHtml(mi.id)}')">Details</button>
                 <button class="btn btn-danger" onclick="App.deleteIndex('${escHtml(mi.id)}')">Delete</button>
               </div>
@@ -671,6 +704,14 @@ const App = (() => {
       schemaFieldRows = 0;
       render();
     } catch (e) { toast('Create failed: ' + e.message, false); }
+  }
+
+  async function rebuildIndex(id) {
+    toast('Rebuilding ' + id + '… this streams the full dataset from source and may take a while.');
+    try {
+      await api('POST', `/v1/indexes/${encodeURIComponent(id)}/rebuild`);
+      render();
+    } catch (e) { toast('Rebuild failed: ' + e.message, false); }
   }
 
   async function reloadIndex(id) {
@@ -1093,7 +1134,7 @@ const App = (() => {
   const handlers = {
     refresh, render, logout,
     doLookup, addFilter, updateFilterOperators, removeFilter, addFieldValue, removeFieldValue, updateFieldValueType,
-    addSchemaFieldRow, createIndex, reloadIndex, freezeIndex, persistIndex, deleteIndex,
+    addSchemaFieldRow, createIndex, reloadIndex, freezeIndex, persistIndex, rebuildIndex, deleteIndex,
     toggleDetail, upsertDoc, deleteDoc, listGenerations, validateIndex, repairIndex, compactIndex,
     loadSQLQuery, loadSQLTable, loadJSONRecords, loadFile, chooseIntegrationSource,
   };

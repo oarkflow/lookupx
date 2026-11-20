@@ -381,8 +381,9 @@ func clearStaleIndexData(dataDir string, configuredIDs map[string]struct{}) ([]s
 	return removed, nil
 }
 
-// startIndexProgress renders a single updating terminal line. When output is
-// redirected, it emits periodic structured progress events instead.
+// startIndexProgress renders one updating terminal line and emits periodic
+// structured progress events for line-oriented consoles. LogKV clears and
+// redraws the terminal line around those events.
 func startIndexProgress(ctx context.Context, mgr *lookup.MultiIndexManager, id string) func() {
 	stop := make(chan struct{})
 	done := make(chan struct{})
@@ -394,18 +395,17 @@ func startIndexProgress(ctx context.Context, mgr *lookup.MultiIndexManager, id s
 		defer ticker.Stop()
 		spin := []string{"|", "/", "-", "\\"}
 		lastLog := time.Now()
-		drawn := false
 		observedReload := false
 		for {
 			select {
 			case <-ctx.Done():
-				if terminal && drawn {
-					fmt.Fprintln(os.Stderr)
+				if terminal {
+					lookup.ClearTerminalProgressLine()
 				}
 				return
 			case <-stop:
-				if terminal && drawn {
-					fmt.Fprintln(os.Stderr)
+				if terminal {
+					lookup.ClearTerminalProgressLine()
 				}
 				return
 			case now := <-ticker.C:
@@ -434,16 +434,20 @@ func startIndexProgress(ctx context.Context, mgr *lookup.MultiIndexManager, id s
 					partition = fmt.Sprintf("  partition %s (%s rows)", formatProgressNumber(uint64(progress.Partition)), formatProgressNumber(progress.CurrentPartitionRows))
 				}
 				if terminal {
-					fmt.Fprintf(os.Stderr, "\r\033[36m%s\033[0m  %-18s  %s rows seen  %s indexed  %s skipped  %s rows/s%s  %s elapsed\033[K",
+					line := fmt.Sprintf("\033[36m%s\033[0m  %-18s  %s rows seen  %s indexed  %s skipped  %s rows/s%s  %s elapsed",
 						spin[int(now.Unix())%len(spin)], id, formatProgressNumber(progress.Seen), formatProgressNumber(progress.Indexed), formatProgressNumber(progress.Skipped), formatProgressNumber(uint64(rate)), partition, formatProgressDuration(elapsed))
-					drawn = true
-				} else if now.Sub(lastLog) >= 5*time.Second {
+					lookup.SetTerminalProgressLine(line)
+				}
+				if now.Sub(lastLog) >= 5*time.Second {
 					lookup.LogKV("index_load_progress", "index", id, "rows_seen", progress.Seen, "rows_indexed", progress.Indexed, "rows_skipped", progress.Skipped, "partition", progress.Partition, "completed_partitions", progress.Partitions, "current_partition_rows", progress.CurrentPartitionRows, "rows_per_second", fmt.Sprintf("%.1f", rate), "elapsed", elapsed.Round(time.Second))
 					lastLog = now
 				}
 				if current.Reloading {
 					observedReload = true
 				} else if observedReload {
+					if terminal {
+						lookup.ClearTerminalProgressLine()
+					}
 					return
 				}
 			}

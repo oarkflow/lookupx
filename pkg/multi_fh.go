@@ -179,6 +179,7 @@ func (s *MultiServer) indexListWithCatalogStats() []ManagedIndexInfo {
 		infos[i].Stats.DeletedDocs = stats.DeletedDocs
 		infos[i].Stats.Terms = stats.Terms
 		infos[i].TermsKnown = termsKnown
+		infos[i].Partitioned = true
 	}
 	return infos
 }
@@ -492,6 +493,7 @@ func (s *MultiServer) indexRepairFH(c fh.Ctx) error {
 		return c.JSON(map[string]any{"manifest": manifest, "validation": report})
 	})
 }
+
 // indexCompactFH both prunes old persisted generations on disk and rebuilds
 // this index's in-memory vector ANN graphs, dropping nodes for deleted or
 // expired documents. Without the latter, vector deletes never shrink the
