@@ -671,11 +671,18 @@ func (ix *Index) Search(req SearchRequest) Result {
 		}
 		ws.touched = ws.touched[:0]
 		ix.globalBM25ScoresLocked(global, ws)
+		hasPrefixField := false
+		for _, field := range ix.globalTermFields(global) {
+			if ix.cfg.Schema.Fields[field].Prefix {
+				hasPrefixField = true
+				break
+			}
+		}
 		ranked := make([]scoredDoc, 0, bm.Count())
 		bm.Each(func(id DocID) bool {
 			if !ix.isDeletedOrExpiredLocked(id) {
 				score := ws.scores[id]
-				if score == 0 && global.Fuzzy {
+				if score == 0 && (global.Fuzzy || hasPrefixField) {
 					score = 0.1
 				}
 				ranked = append(ranked, scoredDoc{id: id, score: score})

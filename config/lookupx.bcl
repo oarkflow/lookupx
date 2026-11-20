@@ -59,6 +59,7 @@ schema_field_set "lookup_fields" {
     indexed true
     stored true
     lowercase true
+    prefix true
     term_search true
   }
   schema_field "fulltext" {
@@ -66,6 +67,7 @@ schema_field_set "lookup_fields" {
     indexed true
     stored true
     lowercase true
+    prefix true
     term_search true
   }
 }
@@ -94,6 +96,7 @@ schema_field_set "lookup_fields_with_alias" {
     stored true
     index_alias "fulltext"
     lowercase true
+    prefix true
     term_search true
   }
   schema_field "fulltext" {
@@ -101,6 +104,7 @@ schema_field_set "lookup_fields_with_alias" {
     indexed true
     stored true
     lowercase true
+    prefix true
     term_search true
   }
 }
@@ -131,7 +135,7 @@ datasource "cpt" {
   driver "mysql"
   dsn MYSQL_DSN
   id_column "record_id"
-  query "SELECT CONCAT_WS(':', work_item, charge_type, effective_date, cpt_code, SHA2(JSON_ARRAY(work_item, charge_type, effective_date, cpt_code, end_effective_date, patient_status, ld), 256)) AS record_id, cpt_code AS code, REPLACE(LOWER(cpt_code), '.', '') AS code_no_period, ld AS description, ld AS `fulltext`, work_item AS work_item_uid, work_item, effective_date, end_effective_date, patient_status, charge_type FROM vw_cpt_master"
+  query "SELECT CONCAT_WS(':', work_item, charge_type, effective_date, cpt_code, SHA2(JSON_ARRAY(work_item, charge_type, effective_date, cpt_code, end_effective_date, patient_status, ld), 256)) AS record_id, cpt_code AS code, REPLACE(LOWER(cpt_code), '.', '') AS code_no_period, ld AS description, ld AS `fulltext`, work_item AS work_item_uid, work_item, effective_date, end_effective_date, patient_status, charge_type FROM vw_cpt_master WHERE NOT (LENGTH(cpt_code) = 5 AND SUBSTRING(UPPER(cpt_code),1,1) BETWEEN 'A' AND 'Z' AND SUBSTRING(cpt_code,2,4) BETWEEN '0000' AND '9999')"
   column "work_item" {
     kind "keyword"
     normalized true
@@ -158,13 +162,16 @@ datasource "cpt" {
   }
 }
 
+# HCPCS Level II codes: vw_cpt_master has no is_cpt column in this environment, so the
+# split uses the same shape rule the rest of the system uses (one letter + four digits)
+# rather than inventing a non-existent column.
 datasource "hcpcs" {
   kind "sql_query"
   &column_set.lookup_code_columns
   driver "mysql"
   dsn MYSQL_DSN
   id_column "record_id"
-  query "SELECT CONCAT_WS(':', work_item, charge_type, effective_date, cpt_code, SHA2(JSON_ARRAY(work_item, charge_type, effective_date, cpt_code, end_effective_date, patient_status, ld), 256)) AS record_id, cpt_code AS code, REPLACE(LOWER(cpt_code), '.', '') AS code_no_period, ld AS description, ld AS `fulltext`, work_item AS work_item_uid, work_item, effective_date, end_effective_date, patient_status, charge_type FROM vw_cpt_master"
+  query "SELECT CONCAT_WS(':', work_item, charge_type, effective_date, cpt_code, SHA2(JSON_ARRAY(work_item, charge_type, effective_date, cpt_code, end_effective_date, patient_status, ld), 256)) AS record_id, cpt_code AS code, REPLACE(LOWER(cpt_code), '.', '') AS code_no_period, ld AS description, ld AS `fulltext`, work_item AS work_item_uid, work_item, effective_date, end_effective_date, patient_status, charge_type FROM vw_cpt_master WHERE LENGTH(cpt_code) = 5 AND SUBSTRING(UPPER(cpt_code),1,1) BETWEEN 'A' AND 'Z' AND SUBSTRING(cpt_code,2,4) BETWEEN '0000' AND '9999'"
   column "work_item" {
     kind "keyword"
     normalized true
@@ -197,7 +204,7 @@ datasource "cpt_reference" {
   driver "mysql"
   dsn MYSQL_DSN
   id_column "record_id"
-  query "SELECT cpt_code AS record_id, cpt_code AS code, REPLACE(LOWER(cpt_code), '.', '') AS code_no_period, ld AS description, COALESCE(fd, ld) AS `fulltext` FROM vw_cpt WHERE cpt_code NOT REGEXP '^[A-Za-z][0-9]{4}$'"
+  query "SELECT cpt_code AS record_id, cpt_code AS code, REPLACE(LOWER(cpt_code), '.', '') AS code_no_period, ld AS description, COALESCE(fd, ld) AS `fulltext` FROM vw_cpt"
 }
 
 datasource "dx_fac1" {
@@ -400,7 +407,7 @@ index "hcpcs" {
   }
 }
 
-index "cpt-hm" {
+index "cpt-reference" {
   datasource "cpt_reference"
   &index_defaults.record
   &schema_field_set.lookup_fields
@@ -410,7 +417,7 @@ index "cpt-hm" {
   }
 }
 
-index "dx-fac1" {
+index "dx-icd9-vol1" {
   datasource "dx_fac1"
   &index_defaults.record
   &schema_field_set.lookup_fields
@@ -419,7 +426,7 @@ index "dx-fac1" {
   }
 }
 
-index "dx-fac3" {
+index "dx-icd9-vol3" {
   datasource "dx_fac3"
   &index_defaults.record
   &schema_field_set.lookup_fields
@@ -428,7 +435,7 @@ index "dx-fac3" {
   }
 }
 
-index "dx-icd10" {
+index "dx-icd10-cm" {
   datasource "dx_icd10"
   &index_defaults.record
   &schema_field_set.lookup_fields

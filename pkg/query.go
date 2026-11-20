@@ -147,6 +147,9 @@ func (q GlobalTerm) eval(ix *Index) *Bitmap {
 				continue
 			}
 			perWord = perWord.OrInPlace(ix.termBitmap(field, word))
+			if opt.Prefix {
+				perWord = perWord.OrInPlace(ix.prefixBitmap(field, word))
+			}
 			if q.Fuzzy && opt.Fuzzy {
 				perWord = perWord.OrInPlace(ix.fuzzyBitmap(field, word, 1, 128))
 			}
